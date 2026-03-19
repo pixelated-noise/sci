@@ -17,7 +17,8 @@
    :effect  nil         ; when :effect, describes the requested side effect
    :current-ns 'user    ; current namespace symbol
    :permissions permissions
-   :bindings {}})       ; dynamic binding stack
+   :bindings {}         ; dynamic binding stack
+   :callstack []})      ; call tracking: [{:ns :name :line :column :file} ...]
 
 ;; ============================================================
 ;; Stack operations

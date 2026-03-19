@@ -383,7 +383,14 @@
     (:sci.impl/callstack data)))
 
 (defn format-stacktrace [st]
-  (clojure.string/join "\n" (map str st)))
+  (when st
+    (->> st
+         (filter :line) ;; only entries with source locations
+         (mapv (fn [{:keys [ns name line column file]}]
+                 (let [ns-str (str (or ns "user"))
+                       name-str (if name (str ns-str "/" name) (str ns-str))
+                       file-str (or file "NO_SOURCE_PATH")]
+                   (format "%-18s - %s:%s:%s" name-str file-str line column)))))))
 
 ;; ============================================================
 ;; set! for dynamic vars

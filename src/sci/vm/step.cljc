@@ -1,8 +1,9 @@
 (ns sci.vm.step
   "The step function — heart of the VM. Each step processes one frame."
-  (:require [sci.vm.machine :as m]))
+  (:require [sci.vm.machine :as m]
+            [clojure.string]))
 
-(declare match-arity bind-params run check-permission)
+(declare match-arity bind-params run check-permission form-location)
 
 ;; ============================================================
 ;; Helpers
@@ -19,7 +20,8 @@
 
 (def special-forms
   '#{if do let* fn* def quote var loop* recur try catch
-     finally throw set! new . defmacro case* import*})
+     finally throw set! new . defmacro case* import*
+     ns in-ns require})
 
 ;; ============================================================
 ;; Form classification
@@ -239,6 +241,7 @@
     (if (empty? remaining)
       (m/pop-frame machine)
       (-> machine
+          (assoc :top-loc nil) ;; reset for fresh location tracking per form
           (m/replace-frame (assoc frame :remaining (subvec remaining 1)))
           (m/push-frame {:op :eval :expr (nth remaining 0)})))))
 
@@ -325,7 +328,7 @@
   [closure-map machine]
   (let [f (fn callable-closure [& args]
             ;; Create a mini-machine and run the closure
-            (let [arity (match-arity (:arities closure-map) (count args))
+            (let [arity (match-arity (:arities closure-map) (count args) (:name closure-map))
                   bindings (bind-params (:params arity) args)
                   fn-env (merge (:env closure-map)
                                 bindings
@@ -358,12 +361,23 @@
 (defn step-eval-invoke [machine frame]
   (let [form (:expr frame)
         f-expr (first form)
-        arg-exprs (vec (rest form))]
+        arg-exprs (vec (rest form))
+        loc (form-location form)
+        ;; Push callstack entry for this call site
+        machine (if loc
+                  (update machine :callstack conj
+                          {:ns (:current-ns machine)
+                           :name (:current-fn-name machine)
+                           :line (:line loc)
+                           :column (:column loc)
+                           :file (:current-file machine)})
+                  machine)]
     (-> machine
         (m/replace-frame {:op :eval-args
                           :pending arg-exprs
                           :done []
-                          :phase :eval-f})
+                          :phase :eval-f
+                          :callstack-depth (count (:callstack machine))})
         (m/push-frame {:op :eval :expr f-expr}))))
 
 (defn step-eval-args [machine frame]
@@ -440,18 +454,28 @@
                                           :pending (subvec pending 1)))
             (m/push-frame {:op :eval :expr (nth pending 0)}))))))
 
-(defn match-arity [arities argc]
-  (or
-   (first (filter (fn [{:keys [params]}]
-                    (let [params-vec (vec params)
-                          amp-pos (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil))
-                                             nil params-vec)]
-                      (if amp-pos
-                        (>= argc amp-pos)
-                        (= argc (count params)))))
-                  arities))
-   (throw (ex-info (str "Wrong number of args (" argc ") passed")
-                   {:type :sci/error}))))
+(defn match-arity
+  ([arities argc] (match-arity arities argc nil))
+  ([arities argc fn-name]
+   (or
+    (first (filter (fn [{:keys [params]}]
+                     (let [params-vec (vec params)
+                           amp-pos (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil))
+                                              nil params-vec)]
+                       (if amp-pos
+                         (>= argc amp-pos)
+                         (= argc (count params)))))
+                   arities))
+    (let [arity-desc (if fn-name
+                       (str fn-name)
+                       (let [arity-counts (map (fn [{:keys [params]}]
+                                                 (let [pv (vec params)
+                                                       amp (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil)) nil pv)]
+                                                   (if amp amp (count params))))
+                                               arities)]
+                         (str "function of arity " (clojure.string/join ", " arity-counts))))]
+      (throw (ex-info (str "Wrong number of args (" argc ") passed to: " arity-desc)
+                      {:type :sci/error}))))))
 
 (defn bind-params [params args]
   (let [params-vec (vec params)
@@ -480,7 +504,7 @@
 
       ;; Closure
       (and (map? f) (= :closure (:type f)))
-      (let [arity (match-arity (:arities f) (count args))
+      (let [arity (match-arity (:arities f) (count args) (:name f))
             bindings (bind-params (:params arity) args)
             fn-env (merge (:env f)
                           bindings
@@ -490,10 +514,13 @@
             (m/replace-frame {:op :fn-body
                               :body (:body arity)
                               :saved-env (:env machine)
+                              :saved-fn-name (:current-fn-name machine)
+                              :saved-callstack-depth (count (:callstack machine))
                               :recur-target true
                               :params (:params arity)
                               :closure f})
-            (assoc :env fn-env)))
+            (assoc :env fn-env
+                   :current-fn-name (:name f))))
 
       ;; Keyword as function
       (keyword? f)
@@ -547,9 +574,13 @@
             (m/push-frame {:op :eval :expr (first body)}))))))
 
 (defn step-fn-body-return [machine frame]
-  (-> machine
-      (assoc :env (:saved-env frame))
-      (m/pop-frame)))
+  (let [depth (:saved-callstack-depth frame)]
+    (-> machine
+        (assoc :env (:saved-env frame)
+               :current-fn-name (:saved-fn-name frame))
+        ;; Trim callstack back to saved depth
+        (cond-> depth (update :callstack #(subvec (vec %) 0 (min depth (count %)))))
+        (m/pop-frame))))
 
 ;; ============================================================
 ;; def
@@ -812,6 +843,125 @@
        (throw (ex-info "import not supported in ClojureScript" {})))))
 
 ;; ============================================================
+;; defmacro
+;; ============================================================
+
+(defn step-eval-defmacro [machine frame]
+  ;; (defmacro name [params] body) → defines a macro in the heap
+  (let [form (:expr frame)
+        [_ macro-name & rest-form] form
+        ;; Parse like fn
+        parsed (parse-fn-form (list* 'fn* rest-form))
+        closure-map {:type :closure
+                     :name macro-name
+                     :arities (:arities parsed)
+                     :env (:env machine)}
+        ;; Create a callable that takes &form &env then the real args
+        callable (make-callable-closure closure-map machine)
+        ns-sym (:current-ns machine)
+        qualified (symbol (str ns-sym) (str macro-name))]
+    (-> machine
+        (assoc-in [:heap qualified] {:val callable
+                                     :meta {:macro true}
+                                     :macro? true})
+        (m/push-value (symbol (str ns-sym) (str macro-name))))))
+
+;; ============================================================
+;; ns / in-ns / require
+;; ============================================================
+
+(defn step-eval-in-ns [machine frame]
+  (let [[_ ns-sym-expr] (:expr frame)]
+    ;; Evaluate the ns symbol
+    (-> machine
+        (m/replace-frame {:op :in-ns-apply})
+        (m/push-frame {:op :eval :expr ns-sym-expr}))))
+
+(defn step-in-ns-apply [machine frame]
+  (let [ns-sym (:result machine)]
+    (-> machine
+        (assoc :current-ns ns-sym)
+        (update :ns #(if (get % ns-sym) % (assoc % ns-sym {:aliases {} :refers {} :imports {}})))
+        (m/push-value ns-sym))))
+
+(defn- process-require-spec
+  "Process a single require spec and update the machine's ns table."
+  [machine spec]
+  (let [current-ns (:current-ns machine)]
+    (cond
+      ;; Simple symbol: (require 'foo)
+      (symbol? spec)
+      (update-in machine [:ns current-ns :aliases] assoc spec spec)
+
+      ;; Vector spec: (require '[foo :as f :refer [x y]])
+      (vector? spec)
+      (let [ns-sym (first spec)
+            opts (apply hash-map (rest spec))
+            alias-sym (:as opts)
+            refers (:refer opts)]
+        (cond-> machine
+          alias-sym (update-in [:ns current-ns :aliases] assoc alias-sym ns-sym)
+          (= :all refers) (update-in [:ns current-ns :aliases] assoc ns-sym ns-sym)
+          (sequential? refers)
+          (as-> m
+            (reduce (fn [m sym]
+                      (let [qualified (symbol (str ns-sym) (str sym))]
+                        (if-let [entry (get (:heap m) qualified)]
+                          (assoc-in m [:heap (symbol (str current-ns) (str sym))] entry)
+                          m)))
+                    m
+                    refers))))
+
+      :else machine)))
+
+(defn step-eval-require [machine frame]
+  (let [specs (rest (:expr frame))
+        ;; Unquote specs — require args are quoted
+        specs (map (fn [s] (if (and (seq? s) (= 'quote (first s))) (second s) s)) specs)
+        machine (reduce process-require-spec machine specs)]
+    (m/push-value machine nil)))
+
+(defn step-eval-ns [machine frame]
+  ;; (ns name & references)
+  ;; Simplified: switch namespace + process :require, :import etc.
+  (let [[_ ns-sym & refs] (:expr frame)
+        machine (-> machine
+                    (assoc :current-ns ns-sym)
+                    (update :ns #(if (get % ns-sym) % (assoc % ns-sym {:aliases {} :refers {} :imports {}}))))]
+    ;; Process references like (:require ...) (:import ...)
+    (let [machine (reduce
+                   (fn [m ref]
+                     (if (seq? ref)
+                       (let [ref-type (first ref)
+                             ref-specs (rest ref)]
+                         (case ref-type
+                           :require (reduce process-require-spec m ref-specs)
+                           :import (reduce (fn [m' imp-spec]
+                                             (if (sequential? imp-spec)
+                                               (let [pkg (first imp-spec)
+                                                     classes (rest imp-spec)]
+                                                 (reduce (fn [m'' cls]
+                                                           (let [fqn (str pkg "." cls)]
+                                                             #?(:clj
+                                                                (try
+                                                                  (let [klass (Class/forName fqn)]
+                                                                    (update m'' :env assoc (symbol (str cls)) klass))
+                                                                  (catch ClassNotFoundException _
+                                                                    (throw (ex-info (str "Unable to resolve classname: " fqn)
+                                                                                    {:type :sci/error}))))
+                                                                :cljs m'')))
+                                                         m' classes))
+                                               m'))
+                                           m ref-specs)
+                           :refer-clojure m ;; TODO
+                           :use m ;; TODO
+                           m))
+                       m))
+                   machine
+                   refs)]
+      (m/push-value machine ns-sym))))
+
+;; ============================================================
 ;; case*
 ;; ============================================================
 
@@ -867,6 +1017,10 @@
       new      (step-eval-new machine frame)
       .        (step-eval-dot machine frame)
       import*  (step-eval-import machine frame)
+      ns       (step-eval-ns machine frame)
+      in-ns    (step-eval-in-ns machine frame)
+      require  (step-eval-require machine frame)
+      defmacro (step-eval-defmacro machine frame)
       (throw (ex-info (str "Special form not yet implemented: " head)
                       {:type :sci/error :form head})))))
 
@@ -899,8 +1053,14 @@
   (if-not (seq? form)
     [false form]
     (let [head (first form)]
-      (if-let [macro-var (try-resolve-macro machine head)]
-        (let [expanded (apply @macro-var form {} (rest form))]
+      (if-let [macro-val (try-resolve-macro machine head)]
+        (let [is-host-macro? (var? macro-val)
+              macro-fn (if is-host-macro? @macro-val macro-val)
+              expanded (if is-host-macro?
+                         ;; Host macros get &form and &env as first two args
+                         (apply macro-fn form {} (rest form))
+                         ;; SCI-defined macros just get the args directly
+                         (apply macro-fn (rest form)))]
           [true expanded])
         [false form]))))
 
@@ -935,8 +1095,24 @@
 ;; Main eval dispatch
 ;; ============================================================
 
+(defn- form-location
+  "Extract :line/:column from form metadata, or nil."
+  [form]
+  (when-let [m (meta form)]
+    (when (:line m)
+      {:line (:line m) :column (:column m)})))
+
 (defn step-eval [machine frame]
-  (let [form (:expr frame)]
+  (let [form (:expr frame)
+        ;; Track source locations for error reporting
+        ;; :last-loc = most recent form with location (innermost)
+        ;; :top-loc = outermost form with location (for error reporting)
+        loc (and (seq? form) (form-location form))
+        machine (if loc
+                  (-> machine
+                      (assoc :last-loc loc)
+                      (cond-> (nil? (:top-loc machine)) (assoc :top-loc loc)))
+                  machine)]
     (case (classify-form form)
       :literal (step-eval-literal machine frame)
       :symbol  (step-eval-symbol machine frame)
@@ -1009,12 +1185,27 @@
         :eval-recur-args (step-eval-recur-args machine frame)
         :try             (step-try machine frame)
         :case*           (step-case* machine frame)
-        :throw           (let [v (:result machine)]
+        :in-ns-apply     (step-in-ns-apply machine frame)
+        :throw           (let [v (:result machine)
+                               loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
                            (if (instance? #?(:clj Throwable :cljs js/Error) v)
-                             (throw v)
+                             ;; Wrap the original exception with location info
+                             (throw (ex-info (or (ex-message v) (str #?(:clj (.getName (class v)) :cljs "Error")))
+                                            (merge {:type :sci/error
+                                                    :message (ex-message v)
+                                                    :sci.impl/callstack (:callstack machine)}
+                                                   (when loc
+                                                     {:line (:line loc)
+                                                      :column (:column loc)
+                                                      :file (:file loc)}))
+                                            v))
                              (throw (ex-info (str v)
-                                            {:type :sci/error
-                                             :sci.impl/callstack (:stack machine)}))))
+                                            (merge {:type :sci/error
+                                                    :sci.impl/callstack (:callstack machine)}
+                                                   (when loc
+                                                     {:line (:line loc)
+                                                      :column (:column loc)
+                                                      :file (:file loc)}))))))
         (throw (ex-info (str "Unknown op: " (:op frame))
                         {:type :sci/error}))))))
 
@@ -1078,13 +1269,32 @@
                                        :finally (:finally try-frame)})
                   (m/push-frame {:op :eval :expr (cons 'do (rest (:finally try-frame)))}))
               (m/set-result m nil))))
-        ;; No matching catch — run finally if present and rethrow
-        (if (:finally try-frame)
-          ;; Run finally then rethrow
-          (throw ex) ;; TODO: proper finally-then-rethrow
-          (throw ex))))
-    ;; No try frame — rethrow
-    (throw ex)))
+        ;; No matching catch — pop try frame and continue unwinding
+        (let [new-stack (subvec (vec (:stack machine)) 0 idx)
+              machine-without-try (assoc machine :stack new-stack)]
+          (if (:finally try-frame)
+            ;; TODO: run finally then rethrow
+            (handle-exception machine-without-try ex)
+            (handle-exception machine-without-try ex)))))
+    ;; No try frame — wrap with location info and rethrow
+    ;; Prefer top-loc (outermost form) for the reported error location
+    (let [loc (or (:top-loc machine) (:last-loc machine) (first (:callstack machine)))
+          already-wrapped? (and (instance? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) ex)
+                                (= :sci/error (:type (ex-data ex))))]
+      (if (and already-wrapped? (:line (ex-data ex)))
+        ;; Already has location info
+        (throw ex)
+        ;; Wrap or re-wrap with location info
+        (throw (ex-info (or (ex-message ex) (str #?(:clj (.getName (class ex)) :cljs "Error")))
+                        (merge (when already-wrapped? (ex-data ex))
+                               {:type :sci/error
+                                :message (ex-message ex)
+                                :sci.impl/callstack (:callstack machine)}
+                               (when loc
+                                 {:line (:line loc)
+                                  :column (:column loc)
+                                  :file (:file loc)}))
+                        (if already-wrapped? (ex-cause ex) ex)))))))
 
 (defn run [machine]
   (loop [m machine]
