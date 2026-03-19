@@ -118,7 +118,8 @@
       (get env sym)
       (let [sym-ns (namespace sym)
             sym-name (name sym)
-            heap (:heap machine)]
+            ;; Use heap-atom for latest state (handles intern, defmacro etc.)
+            heap (if-let [a (:heap-atom machine)] @a (:heap machine))]
         (if sym-ns
           ;; Qualified symbol
           (let [ns-table (:ns machine)
