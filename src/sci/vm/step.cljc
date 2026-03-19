@@ -1,6 +1,7 @@
 (ns sci.vm.step
   "The step function — heart of the VM. Each step processes one frame."
   (:require [sci.vm.machine :as m]
+            [sci.lang]
             [clojure.string]))
 
 (declare match-arity bind-params run check-permission form-location do-extend)
@@ -637,11 +638,18 @@
 ;; ============================================================
 
 (defn step-eval-def [machine frame]
-  (let [[_ sym & init] (:expr frame)]
-    (if (empty? init)
+  (let [[_ sym & init] (:expr frame)
+        ;; Handle (def name docstring init-expr)
+        [doc-str init-expr meta-map]
+        (cond
+          (empty? init)       [nil nil (meta sym)]
+          (and (= 2 (count init)) (string? (first init)))
+          [(first init) (second init) (merge (meta sym) {:doc (first init)})]
+          :else               [nil (first init) (meta sym)])]
+    (if (nil? init-expr)
       (let [ns-sym (:current-ns machine)
             qualified (symbol (str ns-sym) (str sym))
-            entry {:val nil :meta (meta sym)}]
+            entry {:val nil :meta meta-map}]
         (when-let [a (:heap-atom machine)]
           (swap! a assoc qualified entry))
         (-> machine
@@ -650,8 +658,8 @@
       (-> machine
           (m/replace-frame {:op :def :sym sym
                             :ns-sym (:current-ns machine)
-                            :meta-map (meta sym)})
-          (m/push-frame {:op :eval :expr (first init)})))))
+                            :meta-map meta-map})
+          (m/push-frame {:op :eval :expr init-expr})))))
 
 (defn step-def [machine frame]
   (let [sym (:sym frame)
@@ -819,9 +827,23 @@
         ns-sym (:current-ns machine)
         qualified (if (qualified-symbol? sym)
                     sym
-                    (symbol (str ns-sym) (str sym)))]
-    ;; Return the var reference (for now, the value)
-    (m/push-value machine (get-in machine [:heap qualified :val]))))
+                    ;; Also check clojure.core
+                    (let [local-q (symbol (str ns-sym) (str sym))]
+                      (if (contains? (:heap machine) local-q)
+                        local-q
+                        (let [core-q (symbol "clojure.core" (str sym))]
+                          (if (contains? (:heap machine) core-q)
+                            core-q
+                            local-q)))))
+        entry (get (:heap machine) qualified)
+        ;; Create an SCI var-like object
+        var-obj (sci.lang/->Var qualified
+                               (:val entry)
+                               (merge (:meta entry)
+                                      {:name (symbol (name qualified))
+                                       :ns (symbol (namespace qualified))})
+                               (:dynamic? entry))]
+    (m/push-value machine var-obj)))
 
 ;; ============================================================
 ;; set!

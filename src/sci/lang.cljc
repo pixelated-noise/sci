@@ -18,10 +18,14 @@
 (deftype Var [sym val meta-map dynamic?]
   #?@(:clj [clojure.lang.IDeref
              (deref [_] val)
+             clojure.lang.IMeta
+             (meta [_] meta-map)
              Object
              (toString [_] (str "#'" sym))]
       :cljs [IDeref
              (-deref [_] val)
+             IMeta
+             (-meta [_] meta-map)
              IPrintWithWriter
              (-pr-writer [_ writer _] (-write writer (str "#'" sym)))]))
 

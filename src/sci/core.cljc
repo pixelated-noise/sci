@@ -122,15 +122,64 @@
 (defn- make-machine-from-ctx
   "Create a fresh machine from a context and a list of forms."
   [ctx forms]
-  (let [m (machine/make-machine
-           {:heap (:heap ctx)
+  (let [heap-atom (atom (:heap ctx))
+        ;; Inject VM-aware functions that need heap access
+        resolve-fn (fn sci-resolve
+                     ([sym] (sci-resolve 'user sym))
+                     ([ns-sym sym]
+                      (let [heap @heap-atom
+                            qualified (symbol (str ns-sym) (str sym))
+                            core-q (symbol "clojure.core" (str sym))
+                            entry (or (get heap qualified) (get heap core-q))]
+                        (when entry
+                          (sci.lang/->Var (or (when (get heap qualified) qualified) core-q)
+                                         (:val entry)
+                                         (merge (:meta entry) {:name sym :ns (symbol (str ns-sym))})
+                                         (:dynamic? entry))))))
+        eval-fn (fn sci-eval [form]
+                  (let [m2 (machine/make-machine {:heap @heap-atom
+                                                   :ns-table (:ns-table ctx)
+                                                   :permissions {:allow (:allow ctx)
+                                                                  :deny (:deny ctx)}})
+                        m2 (assoc m2 :heap-atom heap-atom)
+                        m2 (machine/push-frame m2 {:op :eval :expr form})]
+                    (step/run m2)))
+        extra-heap {(symbol "clojure.core" "resolve")
+                    {:val resolve-fn :meta {:name 'resolve}}
+                    (symbol "clojure.core" "ns-resolve")
+                    {:val (fn [ns-sym sym] (resolve-fn ns-sym sym)) :meta {:name 'ns-resolve}}
+                    (symbol "clojure.core" "eval")
+                    {:val eval-fn :meta {:name 'eval}}
+                    (symbol "clojure.core" "macroexpand-1")
+                    {:val (fn [form]
+                            (if (and (seq? form) (symbol? (first form)))
+                              (let [head (first form)
+                                    heap @heap-atom
+                                    sym-name (name head)
+                                    candidates [(symbol "clojure.core" sym-name)]
+                                    macro-entry (some #(let [e (get heap %)]
+                                                         (when (:macro? e) e))
+                                                      candidates)]
+                                (if macro-entry
+                                  (let [mv (:val macro-entry)
+                                        mf (if (var? mv) @mv mv)]
+                                    (if (var? mv)
+                                      (apply mf form {} (rest form))
+                                      (apply mf (rest form))))
+                                  form))
+                              form))
+                     :meta {:name 'macroexpand-1}}}
+        heap (merge (:heap ctx) extra-heap)
+        m (machine/make-machine
+           {:heap heap
             :ns-table (:ns-table ctx)
             :permissions {:allow (:allow ctx)
                           :deny (:deny ctx)}})]
-    ;; Push a single eval frame with the forms wrapped in do
     (let [expr (if (= 1 (count forms))
                  (first forms)
-                 (cons 'do forms))]
+                 (cons 'do forms))
+          m (assoc m :heap-atom heap-atom)]
+      (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
 (defn eval-string
