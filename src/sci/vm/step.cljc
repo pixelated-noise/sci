@@ -6,6 +6,9 @@
 
 (declare match-arity bind-params run check-permission form-location do-extend)
 
+;; Shared dynamic bindings for closures called from host code (e.g. via map)
+(def ^:private current-dynamic-bindings (atom nil))
+
 ;; ============================================================
 ;; Helpers
 ;; ============================================================
@@ -22,10 +25,10 @@
 (def special-forms
   '#{if do let* fn* def quote var loop* recur try catch
      finally throw set! new . defmacro case* import*
-     ns in-ns require letfn*
+     ns in-ns require letfn* binding
      defmulti defmethod remove-method prefer-method
      defprotocol extend extend-type extend-protocol
-     reify})
+     reify monitor-enter monitor-exit})
 
 ;; ============================================================
 ;; Form classification
@@ -137,20 +140,16 @@
                                  {:type :sci/error :sym sym})))))
           ;; Unqualified
           (let [ns-sym (:current-ns machine)
-                qualified (symbol (str ns-sym) sym-name)]
-            (if (contains? heap qualified)
-              (:val (get heap qualified))
-              (let [core-qualified (symbol "clojure.core" sym-name)]
-                (if (contains? heap core-qualified)
-                  (:val (get heap core-qualified))
-                  ;; Try Java class resolution
-                  #?(:clj
-                     (or (try-resolve-class sym-name)
-                         (throw (ex-info (str "Could not resolve symbol: " sym)
-                                        {:type :sci/error :sym sym})))
-                     :cljs
-                     (throw (ex-info (str "Could not resolve symbol: " sym)
-                                     {:type :sci/error :sym sym}))))))))))))
+                qualified (symbol (str ns-sym) sym-name)
+                core-q (symbol "clojure.core" sym-name)
+                dyn (:dynamic-bindings machine)]
+            (or (when (and dyn (contains? dyn qualified)) (get dyn qualified))
+                (when (and dyn (contains? dyn core-q)) (get dyn core-q))
+                (when (contains? heap qualified) (:val (get heap qualified)))
+                (when (contains? heap core-q) (:val (get heap core-q)))
+                #?(:clj (try-resolve-class sym-name) :cljs nil)
+                (throw (ex-info (str "Could not resolve symbol: " sym)
+                                {:type :sci/error :sym sym})))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
@@ -356,7 +355,8 @@
                              (assoc :env fn-env
                                     :current-ns (:current-ns machine)
                                     :current-fn-name (:name closure-map)
-                                    :heap-atom heap-atom))]
+                                    :heap-atom heap-atom
+                                    :dynamic-bindings @current-dynamic-bindings))]
               ;; Push fn-body frame with recur-target so recur works
               (let [body (:body arity)
                     m (-> mini-m
@@ -846,12 +846,86 @@
     (m/push-value machine var-obj)))
 
 ;; ============================================================
-;; set!
+;; Dynamic binding + set!
 ;; ============================================================
 
+(defn- resolve-var-qualified [machine sym]
+  (let [sym-name (name sym)
+        local-q (symbol (str (:current-ns machine)) sym-name)]
+    (if (contains? (:heap machine) local-q)
+      local-q
+      (symbol "clojure.core" sym-name))))
+
+(defn step-eval-binding [machine frame]
+  (let [[_ bindings & body] (:expr frame)
+        pairs (vec (partition 2 bindings))]
+    (-> machine
+        (m/replace-frame {:op :binding-init
+                          :pairs pairs
+                          :body (vec body)
+                          :saved-dynamic-bindings (:dynamic-bindings machine)
+                          :bind-idx 0}))))
+
+(defn step-binding-init [machine frame]
+  (let [idx (:bind-idx frame)
+        pairs (:pairs frame)]
+    (if (nil? idx)
+      (let [sym (:bind-sym frame)
+            qualified (resolve-var-qualified machine sym)
+            val (:result machine)]
+        (-> machine
+            (assoc-in [:dynamic-bindings qualified] val)
+            (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
+                                          :bind-sym nil :next-idx nil))))
+      (if (>= idx (count pairs))
+        (let [body (:body frame)]
+          (if (empty? body)
+            (-> machine
+                (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
+                (m/push-value nil))
+            (-> machine
+                (m/replace-frame {:op :binding-body
+                                  :body (vec body)
+                                  :saved-dynamic-bindings (:saved-dynamic-bindings frame)})
+                (m/push-frame {:op :eval :expr (first body)}))))
+        (let [[sym expr] (nth pairs idx)]
+          (-> machine
+              (m/replace-frame (assoc frame :bind-idx nil
+                                            :bind-sym sym
+                                            :next-idx (inc idx)))
+              (m/push-frame {:op :eval :expr expr})))))))
+
+(defn step-binding-body [machine frame]
+  (let [body (vec (rest (:body frame)))]
+    (if (empty? body)
+      (-> machine
+          (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
+          (m/pop-frame))
+      (-> machine
+          (m/replace-frame (assoc frame :body body))
+          (m/push-frame {:op :eval :expr (first body)})))))
+
 (defn step-eval-set! [machine frame]
-  ;; For now, just a stub
-  (throw (ex-info "set! not yet implemented" {:type :sci/error})))
+  (let [[_ target-sym val-expr] (:expr frame)]
+    (-> machine
+        (m/replace-frame {:op :set!-apply :target-sym target-sym})
+        (m/push-frame {:op :eval :expr val-expr}))))
+
+(defn step-set!-apply [machine frame]
+  (let [sym (:target-sym frame)
+        val (:result machine)
+        qualified (resolve-var-qualified machine sym)]
+    (if (and (:dynamic-bindings machine)
+             (contains? (:dynamic-bindings machine) qualified))
+      (-> machine
+          (assoc-in [:dynamic-bindings qualified] val)
+          (m/push-value val))
+      (let [entry (assoc (get (:heap machine) qualified) :val val)]
+        (when-let [a (:heap-atom machine)]
+          (swap! a assoc qualified entry))
+        (-> machine
+            (assoc-in [:heap qualified] entry)
+            (m/push-value val))))))
 
 ;; ============================================================
 ;; new
@@ -1350,6 +1424,9 @@
       extend   (step-eval-extend machine frame)
       extend-type (step-eval-extend-type machine frame)
       extend-protocol (step-eval-extend-protocol machine frame)
+      binding  (step-eval-binding machine frame)
+      monitor-enter (m/push-value machine nil)
+      monitor-exit  (m/push-value machine nil)
       (throw (ex-info (str "Special form not yet implemented: " head)
                       {:type :sci/error :form head})))))
 
@@ -1516,6 +1593,9 @@
         :case*           (step-case* machine frame)
         :in-ns-apply     (step-in-ns-apply machine frame)
         :defmulti-apply  (step-defmulti-apply machine frame)
+        :binding-init    (step-binding-init machine frame)
+        :binding-body    (step-binding-body machine frame)
+        :set!-apply      (step-set!-apply machine frame)
         :throw           (let [v (:result machine)
                                loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
                            (if (instance? #?(:clj Throwable :cljs js/Error) v)
@@ -1629,7 +1709,9 @@
 (defn run [machine]
   (loop [m machine]
     (case (:status m)
-      :running (let [next-m (try
+      :running (let [;; Keep thread-local dynamic bindings in sync
+                     _ (reset! current-dynamic-bindings (:dynamic-bindings m))
+                     next-m (try
                               (step m)
                               (catch #?(:clj Throwable :cljs :default) ex
                                 (handle-exception m ex)))]
