@@ -16,25 +16,31 @@
 ;; Reader
 ;; ============================================================
 
+(defn- make-reader-opts
+  "Create edamame reader options, optionally with a current namespace for ::keyword resolution."
+  ([] (make-reader-opts 'user))
+  ([current-ns]
+   {:all true
+    :row-key :line
+    :col-key :column
+    :end-row-key :end-line
+    :end-col-key :end-column
+    :location? seq?
+    :read-cond :allow
+    :features #{:clj}
+    :fn true
+    :quote true
+    :syntax-quote {:resolve-symbol (fn [sym] sym)}
+    :var true
+    :deref true
+    :regex true
+    :auto-resolve {:current (or current-ns 'user)}}))
+
 (defn read-all
   "Read all forms from a string."
-  [s]
-  (edamame/parse-string-all s {:all true
-                                :row-key :line
-                                :col-key :column
-                                :end-row-key :end-line
-                                :end-col-key :end-column
-                                :location? seq?
-                                :read-cond :allow
-                                :features #{:clj}
-                                :fn true
-                                :quote true
-                                :syntax-quote {:resolve-symbol
-                                               (fn [sym]
-                                                 sym)}
-                                :var true
-                                :deref true
-                                :regex true}))
+  ([s] (read-all s 'user))
+  ([s current-ns]
+   (edamame/parse-string-all s (make-reader-opts current-ns))))
 
 ;; ============================================================
 ;; Context / init
@@ -47,6 +53,25 @@
                 features load-fn readers deny allow]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
+        ;; Override satisfies? to handle SCI protocols
+        heap (assoc heap (symbol "clojure.core" "satisfies?")
+                    {:val (fn sci-satisfies? [protocol x]
+                            (if (and (map? protocol) (= :sci/protocol (:type protocol)))
+                              (let [impls @(:impls protocol)
+                                    target-type (type x)]
+                                (boolean
+                                 (or (get impls target-type)
+                                     (some (fn [[t _]]
+                                             (and (class? t)
+                                                  (instance? t x)))
+                                           impls)
+                                     (when (nil? x) (get impls nil))
+                                     (get impls Object)
+                                     (get impls :default))))
+                              ;; Fall back to clojure.core/satisfies? for real protocols
+                              (clojure.core/satisfies? protocol x)))
+                     :meta {:name 'satisfies?}
+                     :dynamic? false})
         ;; Install user bindings into heap as user/sym vars
         heap (reduce-kv
               (fn [h sym val]

@@ -3,7 +3,7 @@
   (:require [sci.vm.machine :as m]
             [clojure.string]))
 
-(declare match-arity bind-params run check-permission form-location)
+(declare match-arity bind-params run check-permission form-location do-extend)
 
 ;; ============================================================
 ;; Helpers
@@ -21,7 +21,10 @@
 (def special-forms
   '#{if do let* fn* def quote var loop* recur try catch
      finally throw set! new . defmacro case* import*
-     ns in-ns require letfn*})
+     ns in-ns require letfn*
+     defmulti defmethod remove-method prefer-method
+     defprotocol extend extend-type extend-protocol
+     reify})
 
 ;; ============================================================
 ;; Form classification
@@ -469,6 +472,31 @@
                 ^Class (:f frame) (to-array done)))
              :cljs
              (throw (ex-info "new not supported in CLJS" {})))
+          (:defmethod? frame)
+          ;; f = multimethod, done = [dispatch-val method-fn]
+          (let [mm (:f frame)
+                [dispatch-val method-fn] done
+                methods-atom (:methods (meta mm))]
+            (swap! methods-atom assoc dispatch-val method-fn)
+            (m/push-value machine mm))
+          (:remove-method? frame)
+          (let [mm (:f frame)
+                [dispatch-val] done
+                methods-atom (:methods (meta mm))]
+            (swap! methods-atom dissoc dispatch-val)
+            (m/push-value machine mm))
+          (:prefer-method? frame)
+          (let [mm (:f frame)
+                [preferred other] done
+                prefer-atom (:prefer-table (meta mm))]
+            (swap! prefer-atom assoc preferred other)
+            (m/push-value machine mm))
+          (:extend? frame)
+          ;; f = type, done = [protocol impl-map]
+          (let [target-type (:f frame)
+                [protocol impl-map] done]
+            (do-extend protocol target-type impl-map)
+            (m/push-value machine nil))
           :else
           (m/replace-frame machine {:op :apply :f (:f frame) :args done}))
         (-> machine
@@ -870,6 +898,230 @@
        (throw (ex-info "import not supported in ClojureScript" {})))))
 
 ;; ============================================================
+;; Multimethods
+;; ============================================================
+
+(defn- make-multimethod
+  "Create a multimethod: a callable fn that dispatches based on a dispatch-fn."
+  [mm-name dispatch-fn]
+  (let [methods-atom (atom {})
+        prefer-table (atom {})
+        mm (fn multimethod [& args]
+             (let [dispatch-val (apply dispatch-fn args)
+                   methods @methods-atom
+                   method (or (get methods dispatch-val)
+                              ;; Check hierarchy (isa?)
+                              (first (filter some?
+                                       (map (fn [[k v]]
+                                              (when (isa? dispatch-val k) v))
+                                            methods)))
+                              (get methods :default))]
+               (if method
+                 (apply method args)
+                 (throw (ex-info (str "No method in multimethod '" mm-name
+                                      "' for dispatch value: " (pr-str dispatch-val))
+                                 {:type :sci/error})))))]
+    (with-meta mm {:type :sci/multimethod
+                   :name mm-name
+                   :methods methods-atom
+                   :prefer-table prefer-table
+                   :dispatch-fn dispatch-fn})))
+
+(defn step-eval-defmulti [machine frame]
+  ;; (defmulti name dispatch-fn)
+  (let [[_ mm-name dispatch-fn-form] (:expr frame)]
+    (-> machine
+        (m/replace-frame {:op :defmulti-apply :mm-name mm-name})
+        (m/push-frame {:op :eval :expr dispatch-fn-form}))))
+
+(defn step-defmulti-apply [machine frame]
+  (let [dispatch-fn (:result machine)
+        mm-name (:mm-name frame)
+        mm (make-multimethod mm-name dispatch-fn)
+        ns-sym (:current-ns machine)
+        qualified (symbol (str ns-sym) (str mm-name))
+        entry {:val mm :meta {} :dynamic? false}]
+    (when-let [a (:heap-atom machine)]
+      (swap! a assoc qualified entry))
+    (-> machine
+        (assoc-in [:heap qualified] entry)
+        (update :env assoc mm-name mm)
+        (m/push-value mm))))
+
+(defn step-eval-defmethod [machine frame]
+  ;; (defmethod mm-name dispatch-val fn-form) or (defmethod mm-name dispatch-val [args] body)
+  (let [form (:expr frame)
+        [_ mm-ref dispatch-val & fn-parts] form
+        ;; Build the fn form
+        fn-form (if (vector? (first fn-parts))
+                  ;; Single arity: (defmethod foo :bar [x] body)
+                  (list* 'fn* fn-parts)
+                  ;; Multi-arity: (defmethod foo :bar ([x] body1) ([x y] body2))
+                  (list* 'fn* fn-parts))]
+    ;; Evaluate the multimethod reference and the method fn
+    (-> machine
+        (m/replace-frame {:op :eval-args
+                          :pending [(list 'quote dispatch-val) fn-form]
+                          :done []
+                          :phase :eval-f
+                          :defmethod? true})
+        (m/push-frame {:op :eval :expr mm-ref}))))
+
+(defn step-eval-remove-method [machine frame]
+  (let [[_ mm-ref dispatch-val] (:expr frame)]
+    (-> machine
+        (m/replace-frame {:op :eval-args
+                          :pending [(list 'quote dispatch-val)]
+                          :done []
+                          :phase :eval-f
+                          :remove-method? true})
+        (m/push-frame {:op :eval :expr mm-ref}))))
+
+(defn step-eval-prefer-method [machine frame]
+  (let [[_ mm-ref preferred other] (:expr frame)]
+    (-> machine
+        (m/replace-frame {:op :eval-args
+                          :pending [(list 'quote preferred) (list 'quote other)]
+                          :done []
+                          :phase :eval-f
+                          :prefer-method? true})
+        (m/push-frame {:op :eval :expr mm-ref}))))
+
+;; ============================================================
+;; Protocols
+;; ============================================================
+
+(defn- make-protocol
+  "Create a protocol record."
+  [proto-name method-sigs ns-sym]
+  {:type :sci/protocol
+   :name proto-name
+   :ns ns-sym
+   :methods method-sigs
+   :impls (atom {})}) ;; type -> {method-name -> fn}
+
+(defn step-eval-defprotocol [machine frame]
+  ;; (defprotocol Name (method1 [this]) (method2 [this x]))
+  (let [[_ proto-name & method-defs] (:expr frame)
+        ns-sym (:current-ns machine)
+        ;; Parse method signatures
+        method-sigs (into {} (keep (fn [md]
+                                     (when (seq? md)
+                                       (let [mname (first md)
+                                             arglists (rest md)
+                                             ;; Filter out docstrings
+                                             arglists (remove string? arglists)]
+                                         [mname {:arglists (vec arglists)}])))
+                                   method-defs))
+        protocol (make-protocol proto-name method-sigs ns-sym)
+        qualified (symbol (str ns-sym) (str proto-name))
+        ;; Create dispatch functions for each protocol method
+        machine (reduce
+                 (fn [m [mname {:keys [arglists]}]]
+                   (let [method-fn (fn protocol-dispatch [& args]
+                                     (let [target (first args)
+                                           target-type (type target)
+                                           impls @(:impls protocol)
+                                           ;; Look up implementation: exact type match first, then supers
+                                           impl (or (get impls target-type)
+                                                    (some (fn [[t impl]]
+                                                            (when (and (class? t) (instance? t target))
+                                                              impl))
+                                                          impls)
+                                                    ;; Try nil
+                                                    (when (nil? target) (get impls nil))
+                                                    ;; Try Object/:default
+                                                    (get impls Object)
+                                                    (get impls :default))]
+                                       (if-let [f (or (get impl mname)
+                                                       (get impl (keyword mname))
+                                                       (get impl (symbol mname)))]
+                                         (apply f args)
+                                         (throw (ex-info (str "No implementation of method: " mname
+                                                              " of protocol: " proto-name
+                                                              " found for: " (type target))
+                                                         {:type :sci/error})))))
+                         mq (symbol (str ns-sym) (str mname))
+                         entry {:val method-fn :meta {:protocol protocol} :dynamic? false}]
+                     (when-let [a (:heap-atom m)]
+                       (swap! a assoc mq entry))
+                     (-> m
+                         (assoc-in [:heap mq] entry)
+                         (update :env assoc mname method-fn))))
+                 machine
+                 method-sigs)
+        ;; Store the protocol itself
+        proto-entry {:val protocol :meta {} :dynamic? false}]
+    (when-let [a (:heap-atom machine)]
+      (swap! a assoc qualified proto-entry))
+    (-> machine
+        (assoc-in [:heap qualified] proto-entry)
+        (update :env assoc proto-name protocol)
+        (m/push-value protocol))))
+
+(defn step-eval-extend [machine frame]
+  ;; (extend Type Protocol {:method-name fn ...})
+  (let [[_ type-expr proto-expr impl-map-expr] (:expr frame)]
+    (-> machine
+        (m/replace-frame {:op :eval-args
+                          :pending [proto-expr impl-map-expr]
+                          :done []
+                          :phase :eval-f
+                          :extend? true})
+        (m/push-frame {:op :eval :expr type-expr}))))
+
+(defn- do-extend
+  "Register protocol implementations for a type."
+  [protocol target-type impl-map]
+  (swap! (:impls protocol) assoc target-type impl-map))
+
+(defn step-eval-extend-type [machine frame]
+  ;; (extend-type Type Protocol1 (method1 [this] ...) Protocol2 ...)
+  (let [[_ type-sym & specs] (:expr frame)
+        ;; Parse specs into protocol -> {method -> fn} pairs
+        ;; Group specs by protocol
+        groups (loop [specs specs groups []]
+                 (if (empty? specs)
+                   groups
+                   (let [proto-sym (first specs)
+                         methods (take-while seq? (rest specs))
+                         remaining (drop-while seq? (rest specs))]
+                     (recur remaining
+                            (conj groups {:proto proto-sym :methods methods})))))
+        ;; Build a do form that evaluates extend for each protocol
+        extend-forms (mapv (fn [{:keys [proto methods]}]
+                             (let [impl-map (into {}
+                                             (map (fn [method-form]
+                                                    (let [mname (first method-form)
+                                                          args-body (rest method-form)]
+                                                      [(list 'quote mname)
+                                                       (list* 'fn* args-body)]))
+                                                  methods))]
+                               (list 'extend type-sym proto impl-map)))
+                           groups)
+        do-form (cons 'do extend-forms)]
+    (m/replace-frame machine {:op :eval :expr do-form})))
+
+(defn step-eval-extend-protocol [machine frame]
+  ;; (extend-protocol Protocol Type1 (method [this] ...) Type2 (method [this] ...) ...)
+  (let [[_ proto-sym & specs] (:expr frame)
+        ;; Group specs by type
+        groups (loop [specs specs groups []]
+                 (if (empty? specs)
+                   groups
+                   (let [type-sym (first specs)
+                         methods (take-while seq? (rest specs))
+                         remaining (drop-while seq? (rest specs))]
+                     (recur remaining
+                            (conj groups {:type type-sym :methods methods})))))
+        ;; Build extend-type forms
+        extend-forms (mapv (fn [{:keys [type methods]}]
+                             (list* 'extend-type type proto-sym methods))
+                           groups)
+        do-form (cons 'do extend-forms)]
+    (m/replace-frame machine {:op :eval :expr do-form})))
+
+;; ============================================================
 ;; letfn*
 ;; ============================================================
 
@@ -1068,6 +1320,14 @@
       in-ns    (step-eval-in-ns machine frame)
       require  (step-eval-require machine frame)
       defmacro (step-eval-defmacro machine frame)
+      defmulti (step-eval-defmulti machine frame)
+      defmethod (step-eval-defmethod machine frame)
+      remove-method (step-eval-remove-method machine frame)
+      prefer-method (step-eval-prefer-method machine frame)
+      defprotocol (step-eval-defprotocol machine frame)
+      extend   (step-eval-extend machine frame)
+      extend-type (step-eval-extend-type machine frame)
+      extend-protocol (step-eval-extend-protocol machine frame)
       (throw (ex-info (str "Special form not yet implemented: " head)
                       {:type :sci/error :form head})))))
 
@@ -1233,6 +1493,7 @@
         :try             (step-try machine frame)
         :case*           (step-case* machine frame)
         :in-ns-apply     (step-in-ns-apply machine frame)
+        :defmulti-apply  (step-defmulti-apply machine frame)
         :throw           (let [v (:result machine)
                                loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
                            (if (instance? #?(:clj Throwable :cljs js/Error) v)
