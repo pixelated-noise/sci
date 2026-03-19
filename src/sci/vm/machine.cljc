@@ -12,6 +12,7 @@
    :env     (or env {}) ; current lexical env: symbol -> value
    :ns      (or ns-table {}) ; namespace table
    :heap    (or heap {})     ; interned vars: qualified-sym -> {:val :meta :dynamic?}
+   :heap-atom (atom (or heap {}))  ; shared mutable heap for closures
    :result  nil         ; most recently computed value
    :status  :running    ; :running | :done | :suspend | :effect
    :effect  nil         ; when :effect, describes the requested side effect

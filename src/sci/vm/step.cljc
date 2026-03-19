@@ -21,7 +21,7 @@
 (def special-forms
   '#{if do let* fn* def quote var loop* recur try catch
      finally throw set! new . defmacro case* import*
-     ns in-ns require})
+     ns in-ns require letfn*})
 
 ;; ============================================================
 ;; Form classification
@@ -161,41 +161,50 @@
     (m/push-value machine (resolve-symbol machine sym))))
 
 (defn step-eval-vector [machine frame]
-  (let [exprs (:expr frame)]
+  (let [exprs (:expr frame)
+        form-meta (meta (:expr frame))]
     (if (empty? exprs)
-      (m/push-value machine [])
+      (m/push-value machine (if form-meta (with-meta [] form-meta) []))
       (-> machine
           (m/replace-frame {:op :eval-coll :coll-type :vector
-                            :pending (subvec exprs 1) :done []})
+                            :pending (subvec exprs 1) :done []
+                            :form-meta form-meta})
           (m/push-frame {:op :eval :expr (nth exprs 0)})))))
 
 (defn step-eval-map [machine frame]
   (let [exprs (:expr frame)
+        form-meta (meta (:expr frame))
         flat (reduce-kv (fn [acc k v] (conj acc k v)) [] exprs)]
     (if (empty? flat)
-      (m/push-value machine {})
+      (m/push-value machine (if form-meta (with-meta {} form-meta) {}))
       (-> machine
           (m/replace-frame {:op :eval-coll :coll-type :map
-                            :pending (vec (rest flat)) :done []})
+                            :pending (vec (rest flat)) :done []
+                            :form-meta form-meta})
           (m/push-frame {:op :eval :expr (first flat)})))))
 
 (defn step-eval-set [machine frame]
-  (let [exprs (vec (:expr frame))]
+  (let [exprs (vec (:expr frame))
+        form-meta (meta (:expr frame))]
     (if (empty? exprs)
-      (m/push-value machine #{})
+      (m/push-value machine (if form-meta (with-meta #{} form-meta) #{}))
       (-> machine
           (m/replace-frame {:op :eval-coll :coll-type :set
-                            :pending (vec (rest exprs)) :done []})
+                            :pending (vec (rest exprs)) :done []
+                            :form-meta form-meta})
           (m/push-frame {:op :eval :expr (first exprs)})))))
 
 (defn step-eval-coll [machine frame]
   (let [done (conj (:done frame) (:result machine))
         pending (:pending frame)]
     (if (empty? pending)
-      (let [val (case (:coll-type frame)
+      (let [raw (case (:coll-type frame)
                   :vector (vec done)
                   :set    (set done)
-                  :map    (apply hash-map done))]
+                  :map    (apply hash-map done))
+            val (if-let [fm (:form-meta frame)]
+                  (with-meta raw fm)
+                  raw)]
         (m/push-value machine val))
       (-> machine
           (m/replace-frame (assoc frame :done done :pending (vec (rest pending))))
@@ -334,14 +343,27 @@
                                 bindings
                                 (when-let [fname (:name closure-map)]
                                   {fname callable-closure}))
-                  mini-m (-> (m/make-machine {:heap (:heap machine)
-                                              :ns-table (:ns machine)})
+                  ;; Use heap-atom for latest heap state (handles forward references)
+                  heap-atom (:heap-atom machine)
+                  latest-heap (if heap-atom @heap-atom (:heap machine))
+                  mini-m (-> (m/make-machine {:heap latest-heap
+                                              :ns-table (:ns machine)
+                                              :permissions (:permissions machine)})
                              (assoc :env fn-env
-                                    :current-ns (:current-ns machine)))]
-              ;; Push the body as a do block
+                                    :current-ns (:current-ns machine)
+                                    :current-fn-name (:name closure-map)
+                                    :heap-atom heap-atom))]
+              ;; Push fn-body frame with recur-target so recur works
               (let [body (:body arity)
-                    expr (if (= 1 (count body)) (first body) (cons 'do body))
-                    m (m/push-frame mini-m {:op :eval :expr expr})]
+                    m (-> mini-m
+                          (m/push-frame {:op :fn-body
+                                         :body body
+                                         :saved-env fn-env
+                                         :recur-target true
+                                         :params (:params arity)
+                                         :loop-body body
+                                         :closure closure-map})
+                          (m/push-frame {:op :eval :expr (first body)}))]
                 (run m))))]
     (with-meta f (assoc closure-map :sci/closure true))))
 
@@ -590,9 +612,12 @@
   (let [[_ sym & init] (:expr frame)]
     (if (empty? init)
       (let [ns-sym (:current-ns machine)
-            qualified (symbol (str ns-sym) (str sym))]
+            qualified (symbol (str ns-sym) (str sym))
+            entry {:val nil :meta (meta sym)}]
+        (when-let [a (:heap-atom machine)]
+          (swap! a assoc qualified entry))
         (-> machine
-            (assoc-in [:heap qualified] {:val nil :meta (meta sym)})
+            (assoc-in [:heap qualified] entry)
             (m/push-value (symbol (str ns-sym) (str sym)))))
       (-> machine
           (m/replace-frame {:op :def :sym sym
@@ -605,11 +630,13 @@
         ns-sym (:ns-sym frame)
         qualified (symbol (str ns-sym) (str sym))
         val (:result machine)
-        meta-map (:meta-map frame)]
+        meta-map (:meta-map frame)
+        entry {:val val :meta meta-map :dynamic? (:dynamic meta-map)}]
+    ;; Update both the immutable heap and the shared atom
+    (when-let [a (:heap-atom machine)]
+      (swap! a assoc qualified entry))
     (-> machine
-        (assoc-in [:heap qualified] {:val val
-                                     :meta meta-map
-                                     :dynamic? (:dynamic meta-map)})
+        (assoc-in [:heap qualified] entry)
         (m/push-value (symbol (str ns-sym) (str sym))))))
 
 ;; ============================================================
@@ -843,6 +870,24 @@
        (throw (ex-info "import not supported in ClojureScript" {})))))
 
 ;; ============================================================
+;; letfn*
+;; ============================================================
+
+(defn step-eval-letfn [machine frame]
+  ;; (letfn* [name1 (fn* name1 [args] body) ...] body...)
+  ;; Transform into: define each fn using def (so they go in heap for mutual recursion),
+  ;; then evaluate body in a scope where the names are bound.
+  (let [[_ bindings & body] (:expr frame)
+        pairs (vec (partition 2 bindings))
+        ;; Build a do form: (do (def name1 (fn* ...)) (def name2 (fn* ...)) ... body...)
+        defs (mapv (fn [[fname fn-form]] (list 'def fname fn-form)) pairs)
+        ;; Wrap names in let bindings after defs so they're in local scope
+        fn-names (mapv first pairs)
+        let-bindings (vec (mapcat (fn [n] [n n]) fn-names))
+        transformed (list* 'do (concat defs [(list* 'let* let-bindings body)]))]
+    (m/replace-frame machine {:op :eval :expr transformed})))
+
+;; ============================================================
 ;; defmacro
 ;; ============================================================
 
@@ -859,11 +904,12 @@
         ;; Create a callable that takes &form &env then the real args
         callable (make-callable-closure closure-map machine)
         ns-sym (:current-ns machine)
-        qualified (symbol (str ns-sym) (str macro-name))]
+        qualified (symbol (str ns-sym) (str macro-name))
+        entry {:val callable :meta {:macro true} :macro? true}]
+    (when-let [a (:heap-atom machine)]
+      (swap! a assoc qualified entry))
     (-> machine
-        (assoc-in [:heap qualified] {:val callable
-                                     :meta {:macro true}
-                                     :macro? true})
+        (assoc-in [:heap qualified] entry)
         (m/push-value (symbol (str ns-sym) (str macro-name))))))
 
 ;; ============================================================
@@ -1017,6 +1063,7 @@
       new      (step-eval-new machine frame)
       .        (step-eval-dot machine frame)
       import*  (step-eval-import machine frame)
+      letfn*   (step-eval-letfn machine frame)
       ns       (step-eval-ns machine frame)
       in-ns    (step-eval-in-ns machine frame)
       require  (step-eval-require machine frame)
