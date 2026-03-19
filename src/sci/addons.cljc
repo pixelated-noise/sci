@@ -1,9 +1,7 @@
 (ns sci.addons
-  {:no-doc true}
-  (:refer-clojure :exclude [future])
-  #?(:clj (:require [sci.addons.future :as f])))
+  "SCI addons.")
 
-;; For backward compatibility
-#?(:clj
-   (defn future [opts]
-     (f/install opts)))
+(defn future
+  "Install future support into a context."
+  [opts]
+  (merge opts {:allow-futures true}))

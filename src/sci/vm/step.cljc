@@ -1,0 +1,1003 @@
+(ns sci.vm.step
+  "The step function — heart of the VM. Each step processes one frame."
+  (:require [sci.vm.machine :as m]))
+
+(declare match-arity bind-params run check-permission)
+
+;; ============================================================
+;; Helpers
+;; ============================================================
+
+(defn- cond->*
+  "Like cond-> but evaluates the threading form."
+  [m pred f & args]
+  (if pred (apply f m args) m))
+
+;; ============================================================
+;; Special forms set
+;; ============================================================
+
+(def special-forms
+  '#{if do let* fn* def quote var loop* recur try catch
+     finally throw set! new . defmacro case*})
+
+;; ============================================================
+;; Form classification
+;; ============================================================
+
+(defn classify-form [form]
+  (cond
+    (nil? form)     :literal
+    (number? form)  :literal
+    (string? form)  :literal
+    (keyword? form) :literal
+    #?@(:clj  [(instance? Boolean form) :literal]
+        :cljs [(boolean? form) :literal])
+    #?@(:clj  [(char? form) :literal])
+    (symbol? form)  :symbol
+    (vector? form)  :vector
+    (map? form)     :map
+    (set? form)     :set
+    (seq? form)
+    (let [head (first form)]
+      (cond
+        (and (symbol? head) (contains? special-forms head)) :special
+        ;; .method instance calls
+        (and (symbol? head)
+             (let [n (name head)]
+               (and #?(:clj (.startsWith ^String n ".")
+                       :cljs (= "." (subs n 0 1)))
+                    (not= n "..")
+                    (> (count n) 1)))) :dot-call
+        ;; ClassName. constructor call
+        (and (symbol? head)
+             (let [n (name head)]
+               #?(:clj (.endsWith ^String n ".")
+                  :cljs (= "." (subs n (dec (count n))))))) :new-call
+        :else :invoke))
+    :else :literal))
+
+;; ============================================================
+;; Symbol resolution
+;; ============================================================
+
+(defn resolve-symbol [machine sym]
+  (let [env (:env machine)]
+    (if (contains? env sym)
+      (get env sym)
+      ;; Check if it's a qualified symbol
+      (let [sym-ns (namespace sym)
+            sym-name (name sym)
+            heap (:heap machine)]
+        (if sym-ns
+          ;; Qualified symbol — resolve namespace alias first
+          (let [ns-table (:ns machine)
+                current-ns (:current-ns machine)
+                current-ns-data (get ns-table current-ns)
+                resolved-ns (or (get (:aliases current-ns-data) (symbol sym-ns))
+                                (symbol sym-ns))
+                qualified (symbol (str resolved-ns) sym-name)]
+            (if (contains? heap qualified)
+              (:val (get heap qualified))
+              ;; Try as Java static field/method
+              #?(:clj
+                 (try
+                   (let [klass (Class/forName sym-ns)]
+                     (clojure.lang.Reflector/getStaticField klass sym-name))
+                   (catch ClassNotFoundException _
+                     (throw (ex-info (str "Could not resolve symbol: " sym)
+                                    {:type :sci/error :sym sym}))))
+                 :cljs
+                 (throw (ex-info (str "Could not resolve symbol: " sym)
+                                 {:type :sci/error :sym sym})))))
+          ;; Unqualified — try current ns, then clojure.core
+          (let [ns-sym (:current-ns machine)
+                qualified (symbol (str ns-sym) sym-name)]
+            (if (contains? heap qualified)
+              (:val (get heap qualified))
+              (let [core-qualified (symbol "clojure.core" sym-name)]
+                (if (contains? heap core-qualified)
+                  (:val (get heap core-qualified))
+                  ;; Try Java class resolution
+                  #?(:clj
+                     (try
+                       (Class/forName sym-name)
+                       (catch ClassNotFoundException _
+                         (try
+                           (Class/forName (str "java.lang." sym-name))
+                           (catch ClassNotFoundException _
+                             (throw (ex-info (str "Could not resolve symbol: " sym)
+                                            {:type :sci/error :sym sym}))))))
+                     :cljs
+                     (throw (ex-info (str "Could not resolve symbol: " sym)
+                                     {:type :sci/error :sym sym}))))))))))))
+
+;; ============================================================
+;; Literals, symbols, collections
+;; ============================================================
+
+(defn step-eval-literal [machine frame]
+  (m/push-value machine (:expr frame)))
+
+(defn step-eval-symbol [machine frame]
+  (let [sym (:expr frame)]
+    (check-permission machine sym)
+    (m/push-value machine (resolve-symbol machine sym))))
+
+(defn step-eval-vector [machine frame]
+  (let [exprs (:expr frame)]
+    (if (empty? exprs)
+      (m/push-value machine [])
+      (-> machine
+          (m/replace-frame {:op :eval-coll :coll-type :vector
+                            :pending (subvec exprs 1) :done []})
+          (m/push-frame {:op :eval :expr (nth exprs 0)})))))
+
+(defn step-eval-map [machine frame]
+  (let [exprs (:expr frame)
+        flat (reduce-kv (fn [acc k v] (conj acc k v)) [] exprs)]
+    (if (empty? flat)
+      (m/push-value machine {})
+      (-> machine
+          (m/replace-frame {:op :eval-coll :coll-type :map
+                            :pending (vec (rest flat)) :done []})
+          (m/push-frame {:op :eval :expr (first flat)})))))
+
+(defn step-eval-set [machine frame]
+  (let [exprs (vec (:expr frame))]
+    (if (empty? exprs)
+      (m/push-value machine #{})
+      (-> machine
+          (m/replace-frame {:op :eval-coll :coll-type :set
+                            :pending (vec (rest exprs)) :done []})
+          (m/push-frame {:op :eval :expr (first exprs)})))))
+
+(defn step-eval-coll [machine frame]
+  (let [done (conj (:done frame) (:result machine))
+        pending (:pending frame)]
+    (if (empty? pending)
+      (let [val (case (:coll-type frame)
+                  :vector (vec done)
+                  :set    (set done)
+                  :map    (apply hash-map done))]
+        (m/push-value machine val))
+      (-> machine
+          (m/replace-frame (assoc frame :done done :pending (vec (rest pending))))
+          (m/push-frame {:op :eval :expr (first pending)})))))
+
+;; ============================================================
+;; if
+;; ============================================================
+
+(defn step-eval-if [machine frame]
+  (let [form (:expr frame)
+        argc (dec (count form))
+        [_ test then else] form]
+    (when (< argc 2)
+      (throw (ex-info "Too few arguments to if" {:type :sci/error})))
+    (when (> argc 3)
+      (throw (ex-info "Too many arguments to if" {:type :sci/error})))
+    (-> machine
+        (m/replace-frame {:op :if :then then :else else})
+        (m/push-frame {:op :eval :expr test}))))
+
+(defn step-if [machine frame]
+  (if (:result machine)
+    (m/replace-frame machine {:op :eval :expr (:then frame)})
+    (if (contains? frame :else)
+      (m/replace-frame machine {:op :eval :expr (:else frame)})
+      (m/push-value machine nil))))
+
+;; ============================================================
+;; do
+;; ============================================================
+
+(defn step-eval-do [machine frame]
+  (let [body (vec (rest (:expr frame)))]
+    (if (empty? body)
+      (m/push-value machine nil)
+      (-> machine
+          (m/replace-frame {:op :do :remaining (subvec body 1)})
+          (m/push-frame {:op :eval :expr (nth body 0)})))))
+
+(defn step-do [machine frame]
+  (let [remaining (:remaining frame)]
+    (if (empty? remaining)
+      (m/pop-frame machine)
+      (-> machine
+          (m/replace-frame (assoc frame :remaining (subvec remaining 1)))
+          (m/push-frame {:op :eval :expr (nth remaining 0)})))))
+
+;; ============================================================
+;; let*
+;; ============================================================
+
+(defn step-eval-let [machine frame]
+  (let [[_ bindings & body] (:expr frame)
+        binding-pairs (vec (partition 2 bindings))]
+    (-> machine
+        (m/replace-frame {:op :let
+                          :bindings binding-pairs
+                          :body (vec body)
+                          :saved-env (:env machine)
+                          :bind-idx 0}))))
+
+(defn step-let [machine frame]
+  (let [idx (:bind-idx frame)
+        bindings (:bindings frame)]
+    (if (nil? idx)
+      ;; :bind-result phase — binding value just evaluated
+      (let [sym (:bind-sym frame)
+            val (:result machine)]
+        (-> machine
+            (update :env assoc sym val)
+            (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
+                                          :bind-sym nil
+                                          :next-idx nil))))
+      (if (>= idx (count bindings))
+        ;; All bindings done — evaluate body
+        (let [body (:body frame)]
+          (if (empty? body)
+            (-> machine
+                (assoc :env (:saved-env frame))
+                (m/push-value nil))
+            (-> machine
+                (m/replace-frame {:op :do-restore-env
+                                  :body body
+                                  :saved-env (:saved-env frame)})
+                (m/push-frame {:op :eval :expr (first body)}))))
+        ;; Evaluate next binding value
+        (let [[sym expr] (nth bindings idx)]
+          (-> machine
+              (m/replace-frame (assoc frame :bind-idx nil
+                                            :bind-sym sym
+                                            :next-idx (inc idx)))
+              (m/push-frame {:op :eval :expr expr})))))))
+
+;; do-restore-env: like do but restores env when done
+(defn step-do-restore-env [machine frame]
+  (let [body (:body frame)
+        remaining (vec (rest body))]
+    (if (empty? remaining)
+      ;; Last expression done — restore env
+      (-> machine
+          (assoc :env (:saved-env frame))
+          (m/pop-frame))
+      ;; More body expressions
+      (-> machine
+          (m/replace-frame (assoc frame :body remaining))
+          (m/push-frame {:op :eval :expr (first remaining)})))))
+
+;; ============================================================
+;; fn*
+;; ============================================================
+
+(defn parse-fn-form [form]
+  (let [args (rest form)
+        [fname args] (if (symbol? (first args))
+                       [(first args) (rest args)]
+                       [nil args])
+        arities (if (vector? (first args))
+                  [{:params (vec (first args)) :body (vec (rest args))}]
+                  (mapv (fn [arity-form]
+                          {:params (vec (first arity-form))
+                           :body (vec (rest arity-form))})
+                        args))]
+    {:name fname :arities arities}))
+
+(defn make-callable-closure
+  "Create a closure that is both an IFn (so host code like `map` can call it)
+   and carries closure metadata for the VM."
+  [closure-map machine]
+  (let [f (fn callable-closure [& args]
+            ;; Create a mini-machine and run the closure
+            (let [arity (match-arity (:arities closure-map) (count args))
+                  bindings (bind-params (:params arity) args)
+                  fn-env (merge (:env closure-map)
+                                bindings
+                                (when-let [fname (:name closure-map)]
+                                  {fname callable-closure}))
+                  mini-m (-> (m/make-machine {:heap (:heap machine)
+                                              :ns-table (:ns machine)})
+                             (assoc :env fn-env
+                                    :current-ns (:current-ns machine)))]
+              ;; Push the body as a do block
+              (let [body (:body arity)
+                    expr (if (= 1 (count body)) (first body) (cons 'do body))
+                    m (m/push-frame mini-m {:op :eval :expr expr})]
+                (run m))))]
+    (with-meta f (assoc closure-map :sci/closure true))))
+
+(defn step-eval-fn [machine frame]
+  (let [parsed (parse-fn-form (:expr frame))
+        closure-map {:type :closure
+                     :name (:name parsed)
+                     :arities (:arities parsed)
+                     :env (:env machine)}
+        callable (make-callable-closure closure-map machine)]
+    (m/push-value machine callable)))
+
+;; ============================================================
+;; Function application
+;; ============================================================
+
+(defn step-eval-invoke [machine frame]
+  (let [form (:expr frame)
+        f-expr (first form)
+        arg-exprs (vec (rest form))]
+    (-> machine
+        (m/replace-frame {:op :eval-args
+                          :pending arg-exprs
+                          :done []
+                          :phase :eval-f})
+        (m/push-frame {:op :eval :expr f-expr}))))
+
+(defn step-eval-args [machine frame]
+  (case (:phase frame)
+    :eval-f
+    (let [f (:result machine)
+          pending (:pending frame)]
+      (if (empty? pending)
+        (cond
+          (:dot? frame)
+          #?(:clj
+             (m/push-value machine
+               (clojure.lang.Reflector/invokeInstanceMethod
+                f (str (:method-name frame)) (to-array [])))
+             :cljs
+             (throw (ex-info "Interop not supported in CLJS" {})))
+          (:new? frame)
+          #?(:clj
+             (m/push-value machine
+               (clojure.lang.Reflector/invokeConstructor
+                ^Class f (to-array [])))
+             :cljs
+             (throw (ex-info "new not supported in CLJS" {})))
+          :else
+          (m/replace-frame machine {:op :apply :f f :args []}))
+        (-> machine
+            (m/replace-frame (assoc frame :f f :phase :eval-arg
+                                          :pending (subvec pending 1)))
+            (m/push-frame {:op :eval :expr (nth pending 0)}))))
+
+    :eval-arg
+    (let [done (conj (:done frame) (:result machine))
+          pending (:pending frame)]
+      (if (empty? pending)
+        (cond
+          (:dot? frame)
+          (let [obj (:f frame)
+                method-name (:method-name frame)
+                args done]
+            #?(:clj
+               (m/push-value machine
+                 (clojure.lang.Reflector/invokeInstanceMethod
+                  obj (str method-name) (to-array args)))
+               :cljs
+               (throw (ex-info "Interop not supported in CLJS" {}))))
+          (:new? frame)
+          #?(:clj
+             (m/push-value machine
+               (clojure.lang.Reflector/invokeConstructor
+                ^Class (:f frame) (to-array done)))
+             :cljs
+             (throw (ex-info "new not supported in CLJS" {})))
+          :else
+          (m/replace-frame machine {:op :apply :f (:f frame) :args done}))
+        (-> machine
+            (m/replace-frame (assoc frame :done done
+                                          :pending (subvec pending 1)))
+            (m/push-frame {:op :eval :expr (nth pending 0)}))))))
+
+(defn match-arity [arities argc]
+  (or
+   (first (filter (fn [{:keys [params]}]
+                    (let [params-vec (vec params)
+                          amp-pos (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil))
+                                             nil params-vec)]
+                      (if amp-pos
+                        (>= argc amp-pos)
+                        (= argc (count params)))))
+                  arities))
+   (throw (ex-info (str "Wrong number of args (" argc ") passed")
+                   {:type :sci/error}))))
+
+(defn bind-params [params args]
+  (let [params-vec (vec params)
+        amp-pos (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil))
+                           nil params-vec)]
+    (if (nil? amp-pos)
+      (zipmap params args)
+      (let [fixed-params (subvec params-vec 0 amp-pos)
+            rest-param (nth params-vec (inc amp-pos))
+            fixed-args (take amp-pos args)
+            rest-args (drop amp-pos args)]
+        (-> (zipmap fixed-params fixed-args)
+            (assoc rest-param (seq rest-args)))))))
+
+(defn step-apply [machine frame]
+  (let [f (:f frame)
+        args (:args frame)]
+    (cond
+      ;; Host function
+      (fn? f)
+      (m/push-value machine (apply f args))
+
+      ;; Host fn ref (for serialization)
+      (and (map? f) (= :host-fn (:type f)))
+      (m/push-value machine (apply (:fn f) args))
+
+      ;; Closure
+      (and (map? f) (= :closure (:type f)))
+      (let [arity (match-arity (:arities f) (count args))
+            bindings (bind-params (:params arity) args)
+            fn-env (merge (:env f)
+                          bindings
+                          (when-let [fname (:name f)]
+                            {fname f}))]
+        (-> machine
+            (m/replace-frame {:op :fn-body
+                              :body (:body arity)
+                              :saved-env (:env machine)
+                              :recur-target true
+                              :params (:params arity)
+                              :closure f})
+            (assoc :env fn-env)))
+
+      ;; Keyword as function
+      (keyword? f)
+      (m/push-value machine (get (first args) f (second args)))
+
+      ;; Map as function (but not closure/host-fn maps)
+      (and (map? f) (not (:type f)))
+      (m/push-value machine (get f (first args) (second args)))
+
+      ;; Set as function
+      (set? f)
+      (m/push-value machine (get f (first args)))
+
+      ;; Vector as function
+      (vector? f)
+      (m/push-value machine (nth f (first args)))
+
+      ;; Symbol — resolve and retry
+      (symbol? f)
+      (m/replace-frame machine {:op :apply :f (resolve-symbol machine f) :args args})
+
+      ;; Java class as constructor
+      #?@(:clj
+          [(instance? Class f)
+           (m/push-value machine
+             (clojure.lang.Reflector/invokeConstructor
+              ^Class f (to-array args)))])
+
+      :else
+      (throw (ex-info (str "Cannot call " (pr-str f) " as a function")
+                      {:type :sci/error})))))
+
+;; ============================================================
+;; fn-body
+;; ============================================================
+
+(defn step-fn-body [machine frame]
+  (let [body (:body frame)]
+    (if (empty? body)
+      (-> machine
+          (assoc :env (:saved-env frame))
+          (m/push-value nil))
+      (if (= 1 (count body))
+        ;; Single expression — tail position
+        (-> machine
+            (m/replace-frame (assoc frame :body [] :phase :return))
+            (m/push-frame {:op :eval :expr (first body)}))
+        ;; Multiple — eval first, keep rest
+        (-> machine
+            (m/replace-frame (assoc frame :body (vec (rest body))))
+            (m/push-frame {:op :eval :expr (first body)}))))))
+
+(defn step-fn-body-return [machine frame]
+  (-> machine
+      (assoc :env (:saved-env frame))
+      (m/pop-frame)))
+
+;; ============================================================
+;; def
+;; ============================================================
+
+(defn step-eval-def [machine frame]
+  (let [[_ sym & init] (:expr frame)]
+    (if (empty? init)
+      (let [ns-sym (:current-ns machine)
+            qualified (symbol (str ns-sym) (str sym))]
+        (-> machine
+            (assoc-in [:heap qualified] {:val nil :meta (meta sym)})
+            (m/push-value (symbol (str ns-sym) (str sym)))))
+      (-> machine
+          (m/replace-frame {:op :def :sym sym
+                            :ns-sym (:current-ns machine)
+                            :meta-map (meta sym)})
+          (m/push-frame {:op :eval :expr (first init)})))))
+
+(defn step-def [machine frame]
+  (let [sym (:sym frame)
+        ns-sym (:ns-sym frame)
+        qualified (symbol (str ns-sym) (str sym))
+        val (:result machine)
+        meta-map (:meta-map frame)]
+    (-> machine
+        (assoc-in [:heap qualified] {:val val
+                                     :meta meta-map
+                                     :dynamic? (:dynamic meta-map)})
+        (m/push-value (symbol (str ns-sym) (str sym))))))
+
+;; ============================================================
+;; quote
+;; ============================================================
+
+(defn step-eval-quote [machine frame]
+  (m/push-value machine (second (:expr frame))))
+
+;; ============================================================
+;; loop* / recur
+;; ============================================================
+
+(defn step-eval-loop [machine frame]
+  (let [[_ bindings & body] (:expr frame)
+        binding-pairs (vec (partition 2 bindings))]
+    (m/replace-frame machine {:op :loop-init
+                              :bindings binding-pairs
+                              :body (vec body)
+                              :saved-env (:env machine)
+                              :bind-idx 0})))
+
+(defn step-loop-init [machine frame]
+  (let [idx (:bind-idx frame)
+        bindings (:bindings frame)]
+    (if (nil? idx)
+      ;; bind-result phase
+      (let [sym (:bind-sym frame)
+            val (:result machine)]
+        (-> machine
+            (update :env assoc sym val)
+            (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
+                                          :bind-sym nil :next-idx nil))))
+      (if (>= idx (count bindings))
+        ;; All bound — start body
+        (let [body (:body frame)
+              params (mapv first bindings)]
+          (if (empty? body)
+            (-> machine
+                (assoc :env (:saved-env frame))
+                (m/push-value nil))
+            (-> machine
+                (m/replace-frame {:op :fn-body
+                                  :body body
+                                  :saved-env (:saved-env frame)
+                                  :recur-target true
+                                  :params params
+                                  :loop? true
+                                  :loop-body body
+                                  :closure nil})
+                (m/push-frame {:op :eval :expr (first body)}))))
+        ;; Eval next binding
+        (let [[sym expr] (nth bindings idx)]
+          (-> machine
+              (m/replace-frame (assoc frame :bind-idx nil
+                                            :bind-sym sym
+                                            :next-idx (inc idx)))
+              (m/push-frame {:op :eval :expr expr})))))))
+
+(defn step-eval-recur [machine frame]
+  (let [args (vec (rest (:expr frame)))]
+    (if (empty? args)
+      (m/replace-frame machine {:op :recur :args []})
+      (-> machine
+          (m/replace-frame {:op :eval-recur-args
+                            :pending (subvec args 1)
+                            :done []})
+          (m/push-frame {:op :eval :expr (nth args 0)})))))
+
+(defn step-eval-recur-args [machine frame]
+  (let [done (conj (:done frame) (:result machine))
+        pending (:pending frame)]
+    (if (empty? pending)
+      (m/replace-frame machine {:op :recur :args done})
+      (-> machine
+          (m/replace-frame (assoc frame :done done
+                                        :pending (subvec pending 1)))
+          (m/push-frame {:op :eval :expr (nth pending 0)})))))
+
+(defn step-recur [machine frame]
+  (let [stack (:stack machine)]
+    (loop [i (- (count stack) 2)]
+      (if (neg? i)
+        (throw (ex-info "recur without matching target" {:type :sci/error}))
+        (let [target (nth stack i)]
+          (if (:recur-target target)
+            (let [params (:params target)
+                  new-args (:args frame)
+                  bindings (zipmap (remove #{'&} params) new-args)
+                  new-stack (subvec (vec stack) 0 (inc i))
+                  body (or (:loop-body target) (:body target))]
+              (-> machine
+                  (assoc :stack new-stack)
+                  (update :env merge bindings)
+                  (m/replace-frame (assoc target :body (vec body)))
+                  (m/push-frame {:op :eval :expr (first body)})))
+            (recur (dec i))))))))
+
+;; ============================================================
+;; try / catch / throw
+;; ============================================================
+
+(defn step-eval-try [machine frame]
+  (let [form (:expr frame)
+        clauses (rest form)
+        body (vec (remove #(and (seq? %) (contains? #{'catch 'finally} (first %))) clauses))
+        catches (vec (filter #(and (seq? %) (= 'catch (first %))) clauses))
+        finally-form (first (filter #(and (seq? %) (= 'finally (first %))) clauses))]
+    (let [m (m/replace-frame machine {:op :try
+                                       :catches catches
+                                       :finally finally-form
+                                       :body body
+                                       :phase :body})]
+      (if (seq body)
+        (m/push-frame m {:op :eval :expr (first body)})
+        m))))
+
+(defn step-try [machine frame]
+  (case (:phase frame)
+    :body
+    (let [body (vec (rest (:body frame)))]
+      (if (empty? body)
+        (if (:finally frame)
+          (-> machine
+              (m/replace-frame (assoc frame :phase :finally
+                                            :body-result (:result machine)))
+              (m/push-frame {:op :eval :expr (cons 'do (rest (:finally frame)))}))
+          (m/pop-frame machine))
+        (-> machine
+            (m/replace-frame (assoc frame :body body))
+            (m/push-frame {:op :eval :expr (first body)}))))
+
+    :finally
+    (-> machine
+        (assoc :result (:body-result frame))
+        (m/pop-frame))
+
+    :catch-body
+    (if (:finally frame)
+      (-> machine
+          (m/replace-frame (assoc frame :phase :finally
+                                        :body-result (:result machine)))
+          (m/push-frame {:op :eval :expr (cons 'do (rest (:finally frame)))}))
+      (m/pop-frame machine))))
+
+;; ============================================================
+;; var special form
+;; ============================================================
+
+(defn step-eval-var [machine frame]
+  (let [[_ sym] (:expr frame)
+        ns-sym (:current-ns machine)
+        qualified (if (qualified-symbol? sym)
+                    sym
+                    (symbol (str ns-sym) (str sym)))]
+    ;; Return the var reference (for now, the value)
+    (m/push-value machine (get-in machine [:heap qualified :val]))))
+
+;; ============================================================
+;; set!
+;; ============================================================
+
+(defn step-eval-set! [machine frame]
+  ;; For now, just a stub
+  (throw (ex-info "set! not yet implemented" {:type :sci/error})))
+
+;; ============================================================
+;; new
+;; ============================================================
+
+(defn step-eval-new [machine frame]
+  ;; (new ClassName args...)
+  (let [[_ class-sym & arg-exprs] (:expr frame)]
+    ;; Evaluate the class symbol first, then args
+    (-> machine
+        (m/replace-frame {:op :eval-args
+                          :pending (vec arg-exprs)
+                          :done []
+                          :phase :eval-f
+                          :new? true})
+        (m/push-frame {:op :eval :expr class-sym}))))
+
+;; ============================================================
+;; . (dot) — Java interop
+;; ============================================================
+
+#?(:clj
+   (defn step-eval-dot [machine frame]
+     ;; (. obj method args...) or (. obj (method args...))
+     (let [form (:expr frame)
+           [_ obj-expr method-or-call & args] form
+           [method-name method-args]
+           (if (seq? method-or-call)
+             [(first method-or-call) (rest method-or-call)]
+             [method-or-call args])]
+       (-> machine
+           (m/replace-frame {:op :eval-args
+                             :pending (vec method-args)
+                             :done []
+                             :phase :eval-f
+                             :dot? true
+                             :method-name method-name})
+           (m/push-frame {:op :eval :expr obj-expr}))))
+   :cljs
+   (defn step-eval-dot [machine frame]
+     (throw (ex-info ". interop not implemented for ClojureScript" {}))))
+
+;; ============================================================
+;; case*
+;; ============================================================
+
+(defn step-eval-case [machine frame]
+  ;; (case* expr shift mask default map mode keys)
+  (let [[_ expr shift mask default case-map mode keys-type] (:expr frame)]
+    (-> machine
+        (m/replace-frame {:op :case*
+                          :default default
+                          :case-map case-map})
+        (m/push-frame {:op :eval :expr expr}))))
+
+(defn step-case* [machine frame]
+  (let [val (:result machine)
+        case-map (:case-map frame)
+        default (:default frame)]
+    ;; case-map is {hash [test-val result-expr], ...}
+    ;; Find matching entry
+    (let [match (some (fn [[_ [test-val result-expr]]]
+                        (when (= val test-val)
+                          result-expr))
+                      case-map)]
+      (if match
+        (m/replace-frame machine {:op :eval :expr match})
+        (m/replace-frame machine {:op :eval :expr default})))))
+
+;; ============================================================
+;; Special form dispatch
+;; ============================================================
+
+(defn step-eval-special [machine frame]
+  (let [head (first (:expr frame))]
+    (check-permission machine head)
+    (case head
+      if       (step-eval-if machine frame)
+      do       (step-eval-do machine frame)
+      let*     (step-eval-let machine frame)
+      fn*      (step-eval-fn machine frame)
+      def      (step-eval-def machine frame)
+      quote    (step-eval-quote machine frame)
+      loop*    (step-eval-loop machine frame)
+      recur    (step-eval-recur machine frame)
+      try      (step-eval-try machine frame)
+      throw    (-> machine
+                   (m/replace-frame {:op :throw})
+                   (m/push-frame {:op :eval :expr (second (:expr frame))}))
+      var      (step-eval-var machine frame)
+      case*    (step-eval-case machine frame)
+      set!     (step-eval-set! machine frame)
+      new      (step-eval-new machine frame)
+      .        (step-eval-dot machine frame)
+      (throw (ex-info (str "Special form not yet implemented: " head)
+                      {:type :sci/error :form head})))))
+
+;; ============================================================
+;; Macro expansion
+;; ============================================================
+
+(defn try-resolve-macro
+  "If the head of a list form is a symbol that resolves to a Clojure macro,
+   return the macro var. Otherwise nil."
+  [machine sym]
+  (when (symbol? sym)
+    (let [sym-ns (clojure.core/namespace sym)
+          sym-name (name sym)
+          heap (:heap machine)
+          candidates (if sym-ns
+                       [(symbol sym-ns sym-name)]
+                       [(symbol (str (:current-ns machine)) sym-name)
+                        (symbol "clojure.core" sym-name)])]
+      (some (fn [qualified]
+              (when-let [entry (get heap qualified)]
+                (when (:macro? entry)
+                  (:val entry))))
+            candidates))))
+
+(defn macroexpand-form
+  "If form is a list whose head resolves to a host macro, expand it.
+   Returns [expanded? new-form]."
+  [machine form]
+  (if-not (seq? form)
+    [false form]
+    (let [head (first form)]
+      (if-let [macro-var (try-resolve-macro machine head)]
+        (let [expanded (apply @macro-var form {} (rest form))]
+          [true expanded])
+        [false form]))))
+
+;; ============================================================
+;; Permission checking
+;; ============================================================
+
+(defn check-permission [machine sym]
+  (let [perms (:permissions machine)
+        allow (:allow perms)
+        deny (:deny perms)]
+    (when (and allow (seq allow))
+      (let [sym-name (name sym)
+            sym-ns (clojure.core/namespace sym)
+            qualified (when sym-ns (symbol sym-ns sym-name))
+            core-qualified (symbol "clojure.core" sym-name)
+            allowed? (or (contains? (set allow) sym)
+                         (contains? (set allow) core-qualified)
+                         (when qualified (contains? (set allow) qualified)))]
+        (when-not allowed?
+          (throw (ex-info (str sym " is not allowed!")
+                          {:type :sci/error})))))
+    (when (and deny (seq deny))
+      (let [sym-name (name sym)
+            core-qualified (symbol "clojure.core" sym-name)]
+        (when (or (contains? (set deny) sym)
+                  (contains? (set deny) core-qualified))
+          (throw (ex-info (str sym " is not allowed!")
+                          {:type :sci/error})))))))
+
+;; ============================================================
+;; Main eval dispatch
+;; ============================================================
+
+(defn step-eval [machine frame]
+  (let [form (:expr frame)]
+    (case (classify-form form)
+      :literal (step-eval-literal machine frame)
+      :symbol  (step-eval-symbol machine frame)
+      :vector  (step-eval-vector machine frame)
+      :map     (step-eval-map machine frame)
+      :set     (step-eval-set machine frame)
+      :special (step-eval-special machine frame)
+      :dot-call
+      ;; (.method obj args...) → (. obj method args...)
+      (let [head (first form)
+            method-name (symbol (subs (name head) 1))
+            obj-expr (second form)
+            args (drop 2 form)
+            dot-form (list* '. obj-expr method-name args)]
+        (m/replace-frame machine {:op :eval :expr dot-form}))
+
+      :new-call
+      ;; (ClassName. args...) → (new ClassName args...)
+      (let [head (first form)
+            class-name (let [n (name head)] (subs n 0 (dec (count n))))
+            new-form (list* 'new (symbol class-name) (rest form))]
+        (m/replace-frame machine {:op :eval :expr new-form}))
+
+      :invoke
+      ;; Before invoking, check if head is a macro
+      (let [[expanded? new-form] (macroexpand-form machine form)]
+        (if expanded?
+          (m/replace-frame machine {:op :eval :expr new-form})
+          (step-eval-invoke machine frame))))))
+
+;; ============================================================
+;; Main step function
+;; ============================================================
+
+(defn step [machine]
+  (let [frame (m/peek-frame machine)]
+    (if (nil? frame)
+      (assoc machine :status :done)
+      (case (:op frame)
+        :eval            (step-eval machine frame)
+        :apply           (step-apply machine frame)
+        :eval-args       (step-eval-args machine frame)
+        :eval-coll       (step-eval-coll machine frame)
+        :if              (step-if machine frame)
+        :do              (step-do machine frame)
+        :let             (step-let machine frame)
+        :do-restore-env  (step-do-restore-env machine frame)
+        :def             (step-def machine frame)
+        :fn-body         (if (= :return (:phase frame))
+                           (step-fn-body-return machine frame)
+                           (step-fn-body machine frame))
+        :loop-init       (step-loop-init machine frame)
+        :recur           (step-recur machine frame)
+        :eval-recur-args (step-eval-recur-args machine frame)
+        :try             (step-try machine frame)
+        :case*           (step-case* machine frame)
+        :throw           (let [v (:result machine)]
+                           (if (instance? #?(:clj Throwable :cljs js/Error) v)
+                             (throw v)
+                             (throw (ex-info (str v)
+                                            {:type :sci/error
+                                             :sci.impl/callstack (:stack machine)}))))
+        (throw (ex-info (str "Unknown op: " (:op frame))
+                        {:type :sci/error}))))))
+
+;; ============================================================
+;; Run loop
+;; ============================================================
+
+(defn- find-try-frame
+  "Walk the stack looking for a :try frame. Returns [stack-index frame] or nil."
+  [stack]
+  (loop [i (dec (count stack))]
+    (when (>= i 0)
+      (let [frame (nth stack i)]
+        (if (= :try (:op frame))
+          [i frame]
+          (recur (dec i)))))))
+
+(defn- handle-exception
+  "Handle an exception by looking for a matching catch clause on the stack."
+  [machine ^Throwable ex]
+  (if-let [[idx try-frame] (find-try-frame (:stack machine))]
+    ;; Found a try frame — look for matching catch
+    (let [catches (:catches try-frame)
+          match (first
+                 (filter (fn [catch-form]
+                           (let [[_ class-sym _binding & _body] catch-form]
+                             ;; Resolve the class
+                             #?(:clj
+                                (try
+                                  (let [klass (if (= 'Exception class-sym)
+                                                Exception
+                                                (Class/forName (str class-sym)))]
+                                    (instance? klass ex))
+                                  (catch ClassNotFoundException _ false))
+                                :cljs true)))
+                         catches))]
+      (if match
+        (let [[_ _class-sym binding-sym & body] match
+              ;; Truncate stack to the try frame
+              new-stack (subvec (vec (:stack machine)) 0 idx)
+              ;; Restore env and bind exception
+              m (-> machine
+                    (assoc :stack new-stack
+                           :status :running)
+                    (update :env assoc binding-sym ex))]
+          ;; Evaluate catch body
+          (if (seq body)
+            (let [catch-body-frame {:op :try
+                                    :catches []
+                                    :finally (:finally try-frame)
+                                    :body (vec body)
+                                    :phase :catch-body}]
+              (-> m
+                  (update :stack conj catch-body-frame)
+                  (m/push-frame {:op :eval :expr (first body)})))
+            (if (:finally try-frame)
+              (-> m
+                  (update :stack conj {:op :try
+                                       :phase :finally
+                                       :body-result nil
+                                       :finally (:finally try-frame)})
+                  (m/push-frame {:op :eval :expr (cons 'do (rest (:finally try-frame)))}))
+              (m/set-result m nil))))
+        ;; No matching catch — run finally if present and rethrow
+        (if (:finally try-frame)
+          ;; Run finally then rethrow
+          (throw ex) ;; TODO: proper finally-then-rethrow
+          (throw ex))))
+    ;; No try frame — rethrow
+    (throw ex)))
+
+(defn run [machine]
+  (loop [m machine]
+    (case (:status m)
+      :running (let [next-m (try
+                              (step m)
+                              (catch #?(:clj Throwable :cljs :default) ex
+                                (handle-exception m ex)))]
+                 (recur next-m))
+      :done    (:result m)
+      :suspend m
+      :effect  m)))

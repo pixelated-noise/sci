@@ -1,4 +1,4 @@
 (ns sci.impl.unrestrict
-  {:no-doc true})
+  "Unrestricted mode support.")
 
 (def ^:dynamic *unrestricted* false)

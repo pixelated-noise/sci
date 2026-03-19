@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(for file:*)",
+      "Bash(do echo:*)",
+      "Bash(grep -oE \"sci/\\(add|alter|assert|binding|built|copy|create|eof|err|error|eval|file|fork|format|future|get|init|intern|in|macro|merge|new|ns|out|parse|pmap|print|read|reader|resolve|set!|source|stacktrace|var|with|print-fn\\)\" /Users/sideris/devel/third-party/sci/test/sci/*.cljc /Users/sideris/devel/third-party/sci/test/sci/*.clj /Users/sideris/devel/third-party/sci/test/sci/*.cljs /Users/sideris/devel/third-party/sci/test/sci/impl/*.cljc)",
+      "Bash(grep -rh \"sci/\" /Users/sideris/devel/third-party/sci/test/sci/*.cljc /Users/sideris/devel/third-party/sci/test/sci/*.clj /Users/sideris/devel/third-party/sci/test/sci/*.cljs)",
+      "Bash(grep -rh \"sci/\" /Users/sideris/devel/third-party/sci/test/sci/impl/*.cljc)",
+      "Bash(lein with-profile:*)",
+      "Bash(clojure -M:test:clj-test-runner)",
+      "Bash(tee /tmp/sci-test-vm.txt)",
+      "Read(//private/tmp/**)"
+    ]
+  }
+}

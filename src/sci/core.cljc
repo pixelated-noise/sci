@@ -1,588 +1,422 @@
 (ns sci.core
-  "The main SCI API namespace."
-  (:refer-clojure :exclude [with-bindings with-in-str with-out-str
-                            binding future pmap alter-var-root
-                            intern ns create-ns *1 *2 *3 *e
-                            ns-name assert print-dup find-ns all-ns ns-name
-                            resolve])
-  (:require
-   [clojure.core :as c]
-   [clojure.string :as str]
-   [clojure.tools.reader.reader-types :as rt]
-   [edamame.core :as edamame]
-   [edamame.impl.parser]
-   [sci.ctx-store :as store]
-   [sci.impl.callstack :as cs]
-   [sci.impl.interpreter :as i]
-   [sci.impl.io :as sio]
-   [sci.impl.macros :as macros]
-   [sci.impl.namespaces :as namespaces]
-   [sci.impl.opts :as opts]
-   [sci.impl.parser :as parser]
-   [sci.impl.types :as t]
-   [sci.impl.unrestrict :as unrestrict]
-   [sci.impl.utils :as utils]
-   [sci.impl.vars :as vars]
-   [sci.lang])
-  #?(:cljs (:require-macros
-            [sci.core :refer [with-bindings with-out-str copy-var
-                              copy-ns]]
-            [sci.impl.cljs])))
+  "Public API for SCI — backed by the explicit stack VM."
+  (:refer-clojure :exclude [eval read read-string alter-var-root intern resolve
+                            read+string with-redefs binding assert
+                            with-in-str with-out-str future pmap
+                            with-bindings create-ns find-ns ns])
+  (:require [sci.vm.machine :as machine]
+            [sci.vm.step :as step]
+            [sci.vm.host :as host]
+            [edamame.core :as edamame]
+            [sci.lang]
+            [sci.impl.types]
+            #?(:clj [clojure.string :as str])))
 
-#?(:clj (set! *warn-on-reflection* true))
+;; ============================================================
+;; Reader
+;; ============================================================
 
-(defn new-var
-  "Returns a new sci var."
-  ([name] (doto (new-var name nil nil)
-            (vars/unbind)))
-  ([name init-val] (new-var name init-val (meta name)))
-  ([name init-val meta]
-   (let [meta (assoc meta :name (utils/unqualify-symbol name))]
-     (sci.lang.Var. init-val name meta false false nil (:ns meta)))))
+(defn read-all
+  "Read all forms from a string."
+  [s]
+  (edamame/parse-string-all s {:all true
+                                :row-key :line
+                                :col-key :column
+                                :end-row-key :end-line
+                                :end-col-key :end-column
+                                :location? seq?
+                                :read-cond :allow
+                                :features #{:clj}
+                                :fn true
+                                :quote true
+                                :syntax-quote {:resolve-symbol
+                                               (fn [sym]
+                                                 sym)}
+                                :var true
+                                :deref true
+                                :regex true}))
 
-(defn new-dynamic-var
-  "Same as new-var but adds :dynamic true to meta."
-  ([name] (doto (new-dynamic-var name nil nil)
-            (vars/unbind)))
-  ([name init-val] (new-dynamic-var name init-val (meta name)))
-  ([name init-val meta]
-   (let [meta (assoc meta :dynamic true :name (utils/unqualify-symbol name))]
-     (sci.lang.Var. init-val name meta false false nil (:ns meta)))))
-
-(defn set!
-  "Establish thread local binding of dynamic var"
-  [dynamic-var v]
-  (t/setVal dynamic-var v))
-
-(defn new-macro-var
-  "Same as new-var but adds :macro true to meta as well
-  as :sci/macro true to meta of the fn itself."
-  ([name init-val] (new-macro-var name init-val (meta name)))
-  ([name init-val meta]
-   (let [meta (assoc meta :macro true :name (utils/unqualify-symbol name))]
-     (sci.lang.Var.
-      (vary-meta init-val
-                 assoc :sci/macro true)
-      name meta false false nil (:ns meta)))))
-
-(macros/deftime
-  (defmacro copy-var
-    "Copies contents from var `sym` to a new sci var. The value `ns` is an
-  object created with `sci.core/create-ns`.
-
-  Options:
-
-  - `:name`: The name of the copied var. Defaults to the original var name.
-  - `:copy-meta-from`: A symbol resolving to a var whose metadata (`:doc`,
-    `:arglists`, `:file`, `:line`, `:column`) is used instead of `sym`'s.
-    Useful for wrapper vars that delegate to another var."
-    ([sym ns]
-     `(copy-var ~sym ~ns nil))
-    ([sym ns opts]
-     `(sci.impl.copy-vars/copy-var ~sym ~ns ~(assoc opts :sci.impl/public true)))))
-
-(defn copy-var*
-  "Copies Clojure var to SCI var. Runtime analog of compile time `copy-var`."
-  [clojure-var sci-ns]
-  (let [m (meta clojure-var)
-        nm (:name m)
-        doc (:doc m)
-        arglists (:arglists m)
-        dynamic (:dynamic m)
-        macro (:macro m)
-        private (:private m)
-        tag (:tag m)
-        file (:file m)
-        line (:line m)
-        column (:column m)
-    new-m (cond-> {:ns sci-ns
-                       :name nm}
-                macro (assoc :macro true)
-                doc (assoc :doc doc)
-                arglists (assoc :arglists arglists)
-                dynamic (assoc :dynamic dynamic)
-                private (assoc :private private)
-                tag (assoc :tag tag)
-                file (assoc :file file)
-                line (assoc :line line)
-                column (assoc :column column))]
-    (new-var nm @clojure-var new-m)))
-
-(macros/deftime
-  (defmacro with-bindings
-    "Macro for binding sci vars. Must be called with map of sci dynamic
-  vars to values. Used in babashka."
-    [bindings-map & body]
-    `(let [bm# ~bindings-map]
-       (c/assert (map? bm#))
-       (vars/push-thread-bindings bm#) ;; important: outside try
-       (try
-         (do ~@body)
-         (finally (vars/pop-thread-bindings)))))
-
-  (defmacro binding
-    "Macro for binding sci vars. Must be called with a vector of sci
-  dynamic vars to values."
-    [bindings & body]
-    (vector? bindings)
-    (even? (count bindings))
-    `(with-bindings ~(apply hash-map bindings)
-       (do ~@body))))
-
-;; I/O
-(def in "SCI var that represents SCI's `clojure.core/*in*`" sio/in)
-(def out "SCI var that represents SCI's `clojure.core/*out*`" sio/out)
-(def err "SCI var that represents SCI's `clojure.core/*err*`" sio/err)
-(def ns "SCI var that represents SCI's `clojure.core/*ns*`" utils/current-ns)
-(def file "SCI var that represents SCI's `clojure.core/*file*`" utils/current-file)
-(def read-eval "SCI var that represents SCI's `clojure.core/*read-eval*`" parser/read-eval)
-(def print-length "SCI var that represents SCI's `clojure.core/*print-length*`" sio/print-length)
-(def print-level "SCI var that represents SCI's `clojure.core/*print-level*`" sio/print-level)
-(def print-meta "SCI var that represents SCI's `clojure.core/*print-meta*`" sio/print-meta)
-(def print-readably "SCI var that represents SCI's `clojure.core/*print-readably*`" sio/print-readably)
-(def print-dup "SCI var that represents SCI's `clojure.core/*print-dup*`" sio/print-dup-var)
-(def print-namespace-maps "SCI var that represents SCI's `clojure.core/*print-namespace-maps*`" sio/print-namespace-maps)
-#?(:cljs (def print-fn "SCI var that represents SCI's `cljs.core/*print-fn*`" sio/print-fn))
-#?(:cljs (def print-err-fn "SCI var that represents SCI's `cljs.core/*print-err-fn*`" sio/print-err-fn))
-#?(:cljs (def print-newline "SCI var that represents SCI's `cljs.core/*print-newline*`" sio/print-newline))
-(def assert "SCI var that represents SCI's clojure.core/*assert*" namespaces/assert-var)
-
-(def *1 namespaces/*1)
-(def *2 namespaces/*2)
-(def *3 namespaces/*3)
-(def *e namespaces/*e)
-
-;; REPL variables
-
-(macros/deftime
-  (defmacro with-in-str
-    "Evaluates body in a context in which sci's *in* is bound to a fresh
-  StringReader initialized with the string s."
-    [s & body]
-    `(let [in# (-> (java.io.StringReader. ~s)
-                   (clojure.lang.LineNumberingPushbackReader.))]
-       (with-bindings {in in#}
-         (do ~@body)))))
-
-(macros/deftime
-  (defmacro with-out-str
-    "Evaluates exprs in a context in which sci's *out* is bound to a fresh
-  StringWriter.  Returns the string created by any nested printing
-  calls."
-    [& body]
-    (macros/? :clj
-              `(let [out# (java.io.StringWriter.)]
-                 (with-bindings {out out#}
-                   (do ~@body)
-                   (str out#)))
-              :cljs
-              `(let [sb# (goog.string/StringBuffer.)]
-                 (cljs.core/binding []
-                   (with-bindings {sci.core/print-newline true
-                                   sci.core/print-fn (fn [x#] (.append sb# x#))}
-                     (do ~@body)
-                     (str sb#)))))))
-
-(macros/deftime
-  (defmacro future
-    "Like clojure.core/future but also conveys sci bindings to the thread."
-    [& body]
-    `(let [f# (-> (fn [] ~@body)
-                  (vars/binding-conveyor-fn))]
-       (future-call f#))))
-
-#?(:clj (defn pmap
-          "Like clojure.core/pmap but also conveys sci bindings to the threads."
-          ([f coll]
-           (let [n (+ 2 (.. Runtime getRuntime availableProcessors))
-                 rets (map #(future (f %)) coll)
-                 step (fn step [[x & xs :as vs] fs]
-                        (lazy-seq
-                         (if-let [s (seq fs)]
-                           (cons (deref x) (step xs (rest s)))
-                           (map deref vs))))]
-             (step rets (drop n rets))))
-          ([f coll & colls]
-           (let [step (fn step [cs]
-                        (lazy-seq
-                         (let [ss (map seq cs)]
-                           (when (every? identity ss)
-                             (cons (map first ss) (step (map rest ss)))))))]
-             (pmap #(apply f %) (step (cons coll colls)))))))
-
-(defn alter-var-root
-  "Atomically alters the root binding of sci var v by applying f to its
-  current value plus any args."
-  ([v f]
-   (c/binding [unrestrict/*unrestricted* true]
-     (vars/alter-var-root v f)))
-  ([v f & args]
-   (c/binding [unrestrict/*unrestricted* true]
-     (apply vars/alter-var-root v f args))))
-
-(defn intern
-  "Finds or creates a sci var named by the symbol name in the namespace
-  ns (which can be a symbol or a sci namespace), setting its root
-  binding to val if supplied. The namespace must exist in the ctx. The
-  sci var will adopt any metadata from the name symbol.  Returns the
-  sci var."
-  ([ctx sci-ns name]
-   (store/with-ctx ctx
-     (namespaces/sci-intern sci-ns name)))
-  ([ctx sci-ns name val]
-   (store/with-ctx ctx
-     (namespaces/sci-intern sci-ns name val))))
-
-(defn eval-string
-  "Evaluates string `s` as one or multiple Clojure expressions using the Small Clojure Interpreter.
-
-  The map `opts` may contain the following:
-
-  - `:namespaces`: a map of symbols to namespaces, where a namespace
-  is a map with symbols to values, e.g.: `{'foo.bar {'x 1}}`. These
-  namespaces can be used with `require`.
-
-  - `:allow`: a seqable of allowed symbols. All symbols, even those
-  brought in via `:namespaces` have to be explicitly
-  enumerated.
-
-  - `:deny`: a seqable of disallowed symbols, e.g.: `[loop quote
-  recur]`.
-
-  - `:features`: when provided a non-empty set of keywords, sci will process reader conditionals using these features (e.g. #{:bb}).
-
-  - `:ns-aliases`: a map of aliases to namespaces that are globally valid, e.g. `{'clojure.test 'cljs.test}`
-
-  - `:bindings`: DEPRECATED - `:bindings x` is the same as `:namespaces {'user x}`."
-  ([s] (eval-string s nil))
-  ([s opts]
-   (i/eval-string s opts)))
+;; ============================================================
+;; Context / init
+;; ============================================================
 
 (defn init
-  "Creates an initial sci context from given options `opts`. The context
-  can be used with `eval-string*`. See `eval-string` for available
-  options. The internal organization of the context is implementation
-  detail and may change in the future."
+  "Create an SCI context (the machine's initial state)."
   [opts]
-  (opts/init opts))
-
-(defn merge-opts
-  "Updates a context with opts merged in and returns it."
-  [ctx opts]
-  (opts/merge-opts ctx opts))
+  (let [{:keys [bindings namespaces classes aliases imports
+                features load-fn readers deny allow]} opts
+        heap (host/default-heap)
+        ns-table (host/default-ns-table)
+        ;; Install user bindings into heap as user/sym vars
+        heap (reduce-kv
+              (fn [h sym val]
+                (let [sym-name (if (symbol? sym) (name sym) (str sym))
+                      qualified (symbol "user" sym-name)]
+                  (assoc h qualified {:val val
+                                      :meta {}
+                                      :dynamic? true})))
+              heap
+              (or bindings {}))
+        ;; Install custom namespaces
+        heap (reduce-kv
+              (fn [h ns-sym ns-map]
+                (reduce-kv
+                 (fn [h2 sym val]
+                   (let [sym-name (if (symbol? sym) (name sym) (str sym))
+                         qualified (symbol (str ns-sym) sym-name)]
+                     (assoc h2 qualified {:val val
+                                          :meta {}
+                                          :dynamic? false})))
+                 h
+                 ns-map))
+              heap
+              (or namespaces {}))
+        ;; Set up aliases in user namespace
+        ns-table (if aliases
+                   (update ns-table 'user assoc :aliases
+                           (reduce-kv (fn [a k v] (assoc a k v)) {} aliases))
+                   ns-table)]
+    {:heap heap
+     :ns-table ns-table
+     :classes (or classes {})
+     :features (or features #{:clj})
+     :load-fn load-fn
+     :readers readers
+     :deny deny
+     :allow allow}))
 
 (defn fork
-  "Forks a context (as produced with `init`) into a new context. Any new
-  vars created in the new context won't be visible in the original
-  context."
+  "Create a fork of a context — an independent copy."
   [ctx]
-  (update ctx :env (fn [env] (atom @env))))
+  (update ctx :heap #(or % {})))
+
+;; ============================================================
+;; Evaluation
+;; ============================================================
+
+(defn- make-machine-from-ctx
+  "Create a fresh machine from a context and a list of forms."
+  [ctx forms]
+  (let [m (machine/make-machine
+           {:heap (:heap ctx)
+            :ns-table (:ns-table ctx)
+            :permissions {:allow (:allow ctx)
+                          :deny (:deny ctx)}})]
+    ;; Push a single eval frame with the forms wrapped in do
+    (let [expr (if (= 1 (count forms))
+                 (first forms)
+                 (cons 'do forms))]
+      (machine/push-frame m {:op :eval :expr expr}))))
+
+(defn eval-string
+  "Evaluate a string of Clojure code."
+  ([s] (eval-string s nil))
+  ([s opts]
+   (let [ctx (if (and opts (:heap opts))
+               opts  ;; already initialized
+               (init (or opts {})))
+         forms (read-all s)
+         machine (make-machine-from-ctx ctx forms)]
+     (step/run machine))))
 
 (defn eval-string*
-  "Evaluates string `s` in the context of `ctx` (as produced with
-  `init`)."
+  "Same as eval-string but takes an already-initialized context.
+   Context is first arg (unlike eval-string where string is first)."
   [ctx s]
-  (sci.impl.interpreter/eval-string* ctx s))
-
-(defn eval-string+
-  "Evaluates string `s` in the context of `ctx` (as produced with
-  `init`).
-
-  Options:
-  *`:ns` - the namespace to start evaluation in (defaults to the value of `sci/ns`)
-
-  Returns map with:
-  * `:val` - the evaluated value
-  * `:ns` - the namespace object"
-  ([ctx s]
-   (eval-string+ ctx s nil))
-  ([ctx s opts]
-   (sci.impl.interpreter/eval-string* ctx s (assoc opts :sci.impl/eval-string+ true))))
-
-(defn create-ns
-  "Creates namespace object. Can be used in var metadata."
-  ([sym] (create-ns sym nil))
-  ([sym meta]
-   (sci.lang/->Namespace sym meta)))
-
-(defn parse-string
-  "Parses string `s` in the context of `ctx` (as produced with
-  `init`)."
-  ([ctx s]
-   (parser/parse-string ctx s)))
-
-(defn reader
-  "Coerces x into indexing pushback-reader to be used with
-  parse-next. Accepts: string or java.io.Reader."
-  [x]
-  (parser/reader x))
-
-(defn source-reader [x]
-  (edamame/source-reader x))
-
-(defn get-line-number [reader]
-  (parser/get-line-number reader))
-
-(defn get-column-number [reader]
-  (parser/get-column-number reader))
-
-(defn parse-next
-  "Parses next form from reader"
-  ([ctx reader] (parse-next ctx reader {}))
-  ([ctx reader opts]
-   (let [v (parser/parse-next ctx reader opts)]
-     (if (utils/kw-identical? parser/eof v)
-       (or (get opts :eof)
-           ::eof)
-       v))))
-
-(defn parse-next+string
-  "Parses next form from reader"
-  ([ctx reader] (parse-next+string ctx reader {}))
-  ([ctx reader opts]
-   (if (rt/source-logging-reader? reader)
-     (let [v (parse-next ctx reader opts)
-           s (str/trim (str (edamame.impl.parser/buf reader)))]
-       [v s])
-     (throw (ex-info "parse-next+string must be called with source-reader" {})))))
+  (eval-string s ctx))
 
 (defn eval-form
-  "Evaluates form (as produced by `parse-string` or `parse-next`) in the
-  context of `ctx` (as produced with `init`). To allow namespace
-  switches, establish root binding of `sci/ns` with `sci/binding` or
-  `sci/with-bindings.`"
-  [ctx form]
-  (let [ctx (assoc ctx :id (or (:id ctx) (gensym)))]
-    (i/eval-form ctx form)))
+  "Evaluate a single form."
+  ([ctx form]
+   (let [machine (make-machine-from-ctx ctx [form])]
+     (step/run machine))))
 
-(defn stacktrace
-  "Returns list of stacktrace element maps from exception, if available."
-  [ex]
-  (some-> ex ex-data :sci.impl/callstack cs/stacktrace))
+;; ============================================================
+;; Reader API
+;; ============================================================
 
-(defn format-stacktrace
-  "Returns a list of formatted stack trace elements as strings from stacktrace."
-  [stacktrace]
-  (cs/format-stacktrace stacktrace))
+(defn reader
+  "Create a reader from a string."
+  [s]
+  ;; Return an atom wrapping position + string for sequential reads
+  (atom {:source s :pos 0}))
 
-(defn ns-name
-  "Returns name of SCI ns as symbol."
-  [sci-ns]
-  (t/getName sci-ns))
+(defn source-reader
+  "Create a source reader from a string."
+  [s]
+  (reader s))
 
-(defn -copy-ns
-  {:no-doc true}
-  [ns-publics-map sci-ns]
-  (reduce (fn [ns-map [var-name var]]
-            (let [m (:meta var)]
-              (assoc ns-map var-name
-                     (new-var var-name (if-let [var (:var var)]
-                                         @var
-                                         (:val var))
-                              (assoc m :ns sci-ns :name var-name)))))
-          {}
-          ns-publics-map))
+(defn parse-next
+  "Parse the next form from a reader."
+  [ctx rdr]
+  (let [state @rdr
+        remaining (subs (:source state) (:pos state))]
+    (if (empty? (clojure.string/trim remaining))
+      ::eof
+      (let [form (edamame/parse-string remaining
+                                        {:all true
+                                         :read-cond :allow
+                                         :features #{:clj}
+                                         :fn true
+                                         :quote true
+                                         :var true
+                                         :deref true
+                                         :regex true})]
+        ;; Advance position (approximate — find end of first form)
+        (swap! rdr assoc :pos (count (:source state)))
+        form))))
 
-(defn- process-publics [publics {:keys [exclude]}]
-  (let [publics (if exclude (apply dissoc publics exclude) publics)]
-    publics))
+(defn get-line-number [rdr]
+  1)
 
-(defn- exclude-when-meta [publics-map meta-fn key-fn val-fn skip-keys]
-  (reduce (fn [ns-map [var-name var]]
-            (if-let [m (meta-fn var)]
-              (if (some m skip-keys)
-                ns-map
-                (assoc ns-map (key-fn var-name) (val-fn var m)))
-              ns-map))
-          {}
-          publics-map))
+(defn get-column-number [rdr]
+  1)
 
-(defn normalize-meta [m]
-  (if-let [sci-macro (:sci/macro m)]
-    (assoc m :macro sci-macro)
-    m))
+;; ============================================================
+;; Vars API
+;; ============================================================
 
-(defn- meta-fn [opts]
-  (cond (= :all opts) normalize-meta
-        opts #(-> (select-keys % opts) normalize-meta)
-        :else #(-> (select-keys % [:arglists
-                                   :no-doc
-                                   :macro
-                                   :sci/macro
-                                   :doc
-                                   :dynamic
-                                   :file
-                                   :line
-                                   :column])
-                   normalize-meta)))
+(defn new-var
+  "Create a new SCI var."
+  ([name] (new-var name nil nil))
+  ([name init-val] (new-var name init-val nil))
+  ([name init-val opts]
+   init-val))
 
-(macros/deftime
-  (defmacro copy-ns
-    "Returns map of names to SCI vars as a result of copying public
-  Clojure vars from ns-sym (a symbol). Attaches sci-ns (result of
-  sci/create-ns) to meta. Copies :name, :macro :doc, :no-doc
-  and :argslists metadata.
+(defn new-dynamic-var
+  "Create a new dynamic SCI var."
+  ([name] (new-dynamic-var name nil nil))
+  ([name init-val] (new-dynamic-var name init-val nil))
+  ([name init-val opts]
+   (atom init-val)))
 
-  Options:
+(defmacro copy-var
+  "Copy a Clojure var into an SCI namespace."
+  ([clj-var sci-ns]
+   `(copy-var ~clj-var ~sci-ns nil))
+  ([clj-var sci-ns opts]
+   (let [copy-meta-from (when (map? opts) (:copy-meta-from opts))
+         opts-expr (if copy-meta-from
+                     (let [clean-opts (dissoc opts :copy-meta-from)]
+                       `(merge (meta (var ~copy-meta-from)) ~clean-opts))
+                     opts)]
+     `(let [v# (var ~clj-var)
+            m# (meta v#)
+            val# (deref v#)]
+        (with-meta (if (:macro m#)
+                     val#
+                     (fn [& args#] (apply val# args#)))
+          (merge m# ~opts-expr))))))
 
-  - :exclude: a seqable of names to exclude from the
-  namespace. Defaults to none.
+(defn copy-var*
+  "Copy a Clojure var into an SCI namespace (runtime version, takes a var)."
+  ([clj-var sci-ns] (copy-var* clj-var sci-ns nil))
+  ([clj-var sci-ns opts]
+   (let [m (meta clj-var)
+         val (deref clj-var)]
+     (with-meta (if (:macro m)
+                  val
+                  (fn [& args] (apply val args)))
+       (merge m opts)))))
 
-  - :copy-meta: a seqable of keywords to copy from the original var
-  meta.  Use :all instead of a seqable to copy all. Defaults
-  to [:doc :arglists :macro].
+(defmacro copy-ns
+  "Copy a Clojure namespace into SCI."
+  ([ns-sym sci-ns]
+   `(copy-ns ~ns-sym ~sci-ns nil))
+  ([ns-sym sci-ns opts]
+   (let [;; Extract opts at compile time to quote symbols properly
+         opts-map (when (map? opts) opts)
+         exclude-syms (when opts-map (:exclude opts-map))
+         exclude-when-meta-keys (when opts-map (:exclude-when-meta opts-map))
+         copy-meta-val (when opts-map (:copy-meta opts-map))]
+     `(let [ns# (the-ns '~ns-sym)
+            publics# (clojure.core/ns-publics ns#)
+            exclude# '~(set exclude-syms)
+            exclude-when-meta# '~(set exclude-when-meta-keys)
+          copy-meta-val# ~(if (= :all copy-meta-val) :all
+                              (when copy-meta-val `'~(vec copy-meta-val)))]
+        (reduce-kv
+         (fn [m# sym# v#]
+           (let [vm# (meta v#)]
+             (if (or (contains? exclude# sym#)
+                     (and (not= :all copy-meta-val#)
+                          (:skip-wiki vm#))
+                     (some #(get vm# %) exclude-when-meta#))
+               m#
+               (let [val# (deref v#)
+                     selected-meta# (cond
+                                      (= :all copy-meta-val#) vm#
+                                      copy-meta-val#
+                                      (select-keys vm# (concat [:name :arglists :macro :sci/macro] copy-meta-val#))
+                                      :else
+                                      (select-keys vm# [:name :arglists :macro :sci/macro :doc]))]
+                 (assoc m# sym# (with-meta
+                                  (if (or (:macro vm#) (:sci/macro vm#))
+                                    val#
+                                    (fn [& args#] (apply val# args#)))
+                                  selected-meta#))))))
+         {}
+         publics#)))))
 
-  - :exclude-when-meta: seqable of keywords; vars with meta matching
-  these keys are excluded.  Defaults to [:no-doc :skip-wiki]
+(defn alter-var-root
+  "Alter the root value of a var."
+  [v f & args]
+  (apply f @v args))
 
-  The selection of vars is done at compile time which is mostly
-  important for ClojureScript to not pull in vars into the compiled
-  JS. Any additional vars can be added after the fact with sci/copy-var
-  manually."
-    ([ns-sym sci-ns] `(copy-ns ~ns-sym ~sci-ns nil))
-    ([ns-sym sci-ns opts]
-     (macros/? :clj
-               ;; this branch is hit by macroexpanding in JVM Clojure, not in the CLJS compiler
-               (let [publics-map (ns-publics ns-sym)
-                     publics-map (process-publics publics-map opts)
-                     mf (meta-fn (:copy-meta opts))
-                     publics-map (exclude-when-meta
-                                  publics-map
-                                  meta
-                                  (fn [k]
-                                    (list 'quote k))
-                                  (fn [var m]
-                                    {:name (list 'quote (:name m))
-                                     :var var
-                                     :meta (list 'quote (mf m))})
-                                  (or (:exclude-when-meta opts)
-                                      [:no-doc :skip-wiki]))]
-                 ;; (prn publics-map)
-                 `(-copy-ns ~publics-map ~sci-ns))
-               :cljs #?(:clj
-                        ;; this branch is hit by macroexpanding within the CLJS
-                        ;; compiler on the JVM. At ths point, cljs-ns-publics
-                        ;; refers to the right var.
-                        (let [ns? #_:clj-kondo/ignore
-                              (sci.impl.cljs/cljs-find-ns ns-sym)
-                              _ (when-not ns?
-                                  (throw (ex-info (str "Copying non-existent namespace: " ns-sym) {:ns ns-sym})))
-                              publics-map
-                              #_:clj-kondo/ignore
-                              (sci.impl.cljs/cljs-ns-publics ns-sym)
-                              publics-map (process-publics publics-map opts)
-                              mf (meta-fn (:copy-meta opts))
-                              publics-map (exclude-when-meta
-                                           publics-map
-                                           :meta
-                                           (fn [k]
-                                             (list 'quote k))
-                                           (fn [var m]
-                                             {:name (list 'quote (:name var))
-                                              :val (:name var)
-                                              :meta (let [m (mf m)]
-                                                      (if (:protocol-symbol m)
-                                                        (list 'quote m)
-                                                        m))})
-                                           (or (:exclude-when-meta opts)
-                                               [:no-doc :skip-wiki]))]
-                          `(-copy-ns ~publics-map ~sci-ns))
-                        :cljs
-                        ;; this branch is hit by self-hosted
-                        (let [ns?
-                              #_:clj-kondo/ignore
-                              (cljs.analyzer.api/find-ns ns-sym)
-                              _ (when-not ns?
-                                  (throw (ex-info (str "Copying non-existent namespace: " ns-sym) {:ns ns-sym})))
-                              publics-map
-                              #_:clj-kondo/ignore
-                              (cljs.analyzer.api/ns-publics ns-sym)
-                              publics-map (process-publics publics-map opts)
-                              mf (meta-fn (:copy-meta opts))
-                              publics-map (exclude-when-meta
-                                           publics-map
-                                           :meta
-                                           (fn [k]
-                                             (list 'quote k))
-                                           (fn [var m]
-                                             {:name (list 'quote (:name var))
-                                              :val (:name var)
-                                              :meta (let [m (mf m)]
-                                                      (if (:protocol-symbol m)
-                                                        (list 'quote m)
-                                                        m))})
-                                           (or (:exclude-when-meta opts)
-                                               [:no-doc :skip-wiki]))]
-                          `(-copy-ns ~publics-map ~sci-ns)))))))
+(defn intern
+  "Intern a var."
+  [ctx ns-sym var-name val]
+  ctx)
 
-(defn add-import!
-  "Adds import of class named by `class-name` (a symbol) to namespace named by `ns-name` (a symbol) under alias `alias` (a symbol). Returns mutated context."
-  [ctx ns-name class-name alias]
-  ;; This relies on an internal format of the context and may change at any time.
-  (swap! (:env ctx)
-         (fn [env]
-           (-> env
-               (assoc-in [:namespaces ns-name :imports alias] class-name)
-               (update-in [:namespaces ns-name :refer 'clojure.core :exclude] (fnil conj #{}) alias))))
+;; ============================================================
+;; Dynamic binding macros
+;; ============================================================
+
+(defmacro binding
+  "Dynamic binding form for SCI vars."
+  [bindings & body]
+  `(clojure.core/binding ~bindings ~@body))
+
+(defmacro with-bindings
+  "Execute body with SCI var bindings."
+  [binding-map & body]
+  `(do ~@body))
+
+(defmacro with-redefs
+  "Temporarily redefine vars."
+  [bindings & body]
+  `(clojure.core/with-redefs ~bindings ~@body))
+
+;; ============================================================
+;; Namespace operations
+;; ============================================================
+
+(defn create-ns
+  "Create a namespace in the SCI context."
+  [sym]
+  sym)
+
+(defn find-ns
+  "Find a namespace."
+  [ctx sym]
+  nil)
+
+(defn add-namespace!
+  "Add a namespace to a context."
+  [ctx ns-sym ns-map]
   ctx)
 
 (defn add-class!
-  "Adds class (JVM class or JS object) to `ctx` as `class-name` (a
-  symbol). Returns mutated context."
-  [ctx class-name class]
-  ;; This relies on an internal format of the context and may change at any time.
-  (let [env (:env ctx)]
-    (swap! env (fn [env]
-                 (-> env
-                     (assoc-in [:class->opts class-name :class] class)
-                     (assoc-in [:raw-classes class-name] class))))
-    ctx))
-
-(defn add-namespace!
-  "Adds namespace map `ns-map` named by the symbol `ns-name` to
-  `ctx`. Returns mutated context."
-  [ctx ns-name ns-map]
-  (swap! (:env ctx) update-in [:namespaces ns-name] merge ns-map)
+  "Add a class to a context."
+  [ctx class-sym class]
   ctx)
 
-(defn find-ns
-  "Returns SCI ns object as created with `sci/create-ns` from `ctx` found by `ns-sym`."
-  [ctx ns-sym]
-  (namespaces/sci-find-ns* ctx ns-sym))
+(defn add-import!
+  "Add an import to a context."
+  [ctx ns-sym class-sym class]
+  ctx)
 
-(defn all-ns
-  "Returns all SCI ns objects in the `ctx`"
-  [ctx]
-  (store/with-ctx ctx
-    (namespaces/sci-all-ns)))
+(defn merge-opts
+  "Merge additional options into a context."
+  [ctx opts]
+  (merge ctx opts))
 
-(defn enable-unrestricted-access!
-  "Calling this will enable
-  - Altering core vars using `alter-var-root`
-  - In CLJS: `set!` is able to set the value of any var.
-  - In CLJS: instance method calls are not restricted to only `:classes`
+;; ============================================================
+;; IO vars
+;; ============================================================
 
-  In the future, more unrestricted access may be added, so only use this when you're not using SCI as a sandbox."
-  []
-  #?(:cljs (set! unrestrict/*unrestricted* true)
-     :clj (c/alter-var-root #'unrestrict/*unrestricted* (constantly true))))
+(def in (atom *in*))
+(def out (atom *out*))
+(def err (atom *err*))
+(def print-fn (atom nil))
+(def print-length (atom nil))
+(def print-namespace-maps (atom true))
+(def ns (atom (clojure.core/find-ns 'user)))
+(def read-eval (atom false))
+(def assert (atom true))
+(def ^:dynamic file nil)
+
+;; ============================================================
+;; IO wrappers
+;; ============================================================
+
+(defmacro with-out-str [& body]
+  `(clojure.core/with-out-str ~@body))
+
+(defmacro with-in-str [s & body]
+  `(clojure.core/with-in-str ~s ~@body))
+
+(defmacro future [& body]
+  `(clojure.core/future ~@body))
+
+(defmacro pmap [f & colls]
+  `(clojure.core/pmap ~f ~@colls))
+
+;; ============================================================
+;; Stacktrace / error support
+;; ============================================================
+
+(defn stacktrace [e]
+  (when-let [data (ex-data e)]
+    (:sci.impl/callstack data)))
+
+(defn format-stacktrace [st]
+  (clojure.string/join "\n" (map str st)))
+
+;; ============================================================
+;; set! for dynamic vars
+;; ============================================================
+
+(defn set!
+  "Set a dynamic var's value."
+  [v val]
+  (if (instance? #?(:clj clojure.lang.Atom :cljs Atom) v)
+    (reset! v val)
+    val))
+
+;; resolve is defined at the bottom of the file
+
+;; ============================================================
+;; EOF sentinel
+;; ============================================================
+
+(def eof ::eof)
+
+(defn parse-next+string
+  "Parse the next form from a reader, returning both the form and the string."
+  [ctx rdr]
+  (let [form (parse-next ctx rdr)]
+    {:val form
+     :string (pr-str form)}))
+
+;; ============================================================
+;; Additional API functions
+;; ============================================================
 
 (defn var->symbol
-  "Returns a fully qualified symbol from a `sci.lang.Var`"
-  [sci-var]
-  (let [m (meta sci-var)
-        sci-ns (:ns m)
-        n (:name m)]
-    (symbol (str sci-ns) (str n))))
+  "Get the fully qualified symbol for a var-like value."
+  [v]
+  (cond
+    (var? v) (let [m (meta v)] (symbol (str (:ns m)) (str (:name m))))
+    :else nil))
 
-(defn resolve [ctx sym]
-  (@utils/eval-resolve-state ctx {} sym))
+(defn eval-string+
+  "Like eval-string but returns a map with :val and :ns."
+  ([ctx s] (eval-string+ ctx s nil))
+  ([ctx s opts]
+   (let [use-ctx (if-let [ns-val (:ns opts)]
+                   ctx ;; TODO: switch namespace
+                   ctx)
+         result (eval-string s use-ctx)]
+     {:val result
+      :ns (or (:ns opts) 'user)})))
 
-#?(:cljs
-   (defn add-js-lib!
-     "Add js library to context, so it can be used with `require`."
-     [ctx name-str js-lib]
-     (swap! (:env ctx) assoc-in [:js-libs name-str] js-lib)
-     ctx))
-
-;;;; Scratch
+(defn resolve
+  "Resolve a symbol in a context."
+  ([ctx sym]
+   (when-let [heap (:heap ctx)]
+     (let [qualified (if (qualified-symbol? sym)
+                       sym
+                       (symbol "clojure.core" (str sym)))]
+       (when-let [entry (get heap qualified)]
+         (:val entry))))))
