@@ -273,9 +273,31 @@
 ;; ============================================================
 
 (defmacro binding
-  "Dynamic binding form for SCI vars."
+  "Dynamic binding form for SCI vars.
+   Supports both real Clojure vars and SCI dynamic vars (atoms)."
   [bindings & body]
-  `(clojure.core/binding ~bindings ~@body))
+  (let [pairs (partition 2 bindings)
+        ;; Check at compile time if the binding targets are vars
+        all-vars? (every? (fn [[target _]]
+                            (and (symbol? target)
+                                 (clojure.core/resolve target)
+                                 (var? (clojure.core/resolve target))))
+                          pairs)]
+    (if all-vars?
+      `(clojure.core/binding ~bindings ~@body)
+      ;; For SCI dynamic vars (atoms), save/restore manually
+      (let [sym-pairs (mapv (fn [[target val-expr]]
+                              [(gensym "old") target val-expr])
+                            pairs)
+            save-bindings (mapv (fn [[old-sym target _]] `(def ~old-sym (deref ~target))) sym-pairs)
+            set-bindings (mapv (fn [[_ target val-expr]] `(reset! ~target ~val-expr)) sym-pairs)
+            restore-bindings (mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs)]
+        `(let [~@(mapcat (fn [[old-sym target _]] [old-sym `(deref ~target)]) sym-pairs)]
+           ~@set-bindings
+           (try
+             (do ~@body)
+             (finally
+               ~@restore-bindings)))))))
 
 (defmacro with-bindings
   "Execute body with SCI var bindings."

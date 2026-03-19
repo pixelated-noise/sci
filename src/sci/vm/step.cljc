@@ -19,7 +19,7 @@
 
 (def special-forms
   '#{if do let* fn* def quote var loop* recur try catch
-     finally throw set! new . defmacro case*})
+     finally throw set! new . defmacro case* import*})
 
 ;; ============================================================
 ;; Form classification
@@ -41,7 +41,10 @@
     (seq? form)
     (let [head (first form)]
       (cond
-        (and (symbol? head) (contains? special-forms head)) :special
+        (and (symbol? head)
+             (or (contains? special-forms head)
+                 ;; Handle qualified special forms like clojure.core/import*
+                 (contains? special-forms (symbol (name head))))) :special
         ;; .method instance calls
         (and (symbol? head)
              (let [n (name head)]
@@ -61,16 +64,54 @@
 ;; Symbol resolution
 ;; ============================================================
 
+#?(:clj
+   (defn- try-resolve-class
+     "Try to resolve a class name string. Returns the Class or nil."
+     [class-name]
+     (try
+       (Class/forName class-name)
+       (catch ClassNotFoundException _
+         (try
+           (Class/forName (str "java.lang." class-name))
+           (catch ClassNotFoundException _ nil))))))
+
+#?(:clj
+   (defn- resolve-static-member
+     "Resolve ClassName/member — returns the static field value or a wrapper fn for static methods.
+      Also handles Clojure 1.12 ClassName/.method and ClassName/new."
+     [klass member-name]
+     (cond
+       ;; Clojure 1.12: ClassName/.method — returns instance method as fn
+       (.startsWith ^String member-name ".")
+       (let [method-name (subs member-name 1)]
+         (fn [target & args]
+           (clojure.lang.Reflector/invokeInstanceMethod
+            target method-name (to-array args))))
+
+       ;; Clojure 1.12: ClassName/new — returns constructor as fn
+       (= "new" member-name)
+       (fn [& args]
+         (clojure.lang.Reflector/invokeConstructor klass (to-array args)))
+
+       :else
+       ;; Try static field first
+       (try
+         (clojure.lang.Reflector/getStaticField klass member-name)
+         (catch Exception _
+           ;; Try as static method — return a wrapper function
+           (fn [& args]
+             (clojure.lang.Reflector/invokeStaticMethod
+              klass member-name (to-array args))))))))
+
 (defn resolve-symbol [machine sym]
   (let [env (:env machine)]
     (if (contains? env sym)
       (get env sym)
-      ;; Check if it's a qualified symbol
       (let [sym-ns (namespace sym)
             sym-name (name sym)
             heap (:heap machine)]
         (if sym-ns
-          ;; Qualified symbol — resolve namespace alias first
+          ;; Qualified symbol
           (let [ns-table (:ns machine)
                 current-ns (:current-ns machine)
                 current-ns-data (get ns-table current-ns)
@@ -81,16 +122,14 @@
               (:val (get heap qualified))
               ;; Try as Java static field/method
               #?(:clj
-                 (try
-                   (let [klass (Class/forName sym-ns)]
-                     (clojure.lang.Reflector/getStaticField klass sym-name))
-                   (catch ClassNotFoundException _
-                     (throw (ex-info (str "Could not resolve symbol: " sym)
-                                    {:type :sci/error :sym sym}))))
+                 (if-let [klass (try-resolve-class sym-ns)]
+                   (resolve-static-member klass sym-name)
+                   (throw (ex-info (str "Could not resolve symbol: " sym)
+                                  {:type :sci/error :sym sym})))
                  :cljs
                  (throw (ex-info (str "Could not resolve symbol: " sym)
                                  {:type :sci/error :sym sym})))))
-          ;; Unqualified — try current ns, then clojure.core
+          ;; Unqualified
           (let [ns-sym (:current-ns machine)
                 qualified (symbol (str ns-sym) sym-name)]
             (if (contains? heap qualified)
@@ -100,14 +139,9 @@
                   (:val (get heap core-qualified))
                   ;; Try Java class resolution
                   #?(:clj
-                     (try
-                       (Class/forName sym-name)
-                       (catch ClassNotFoundException _
-                         (try
-                           (Class/forName (str "java.lang." sym-name))
-                           (catch ClassNotFoundException _
-                             (throw (ex-info (str "Could not resolve symbol: " sym)
-                                            {:type :sci/error :sym sym}))))))
+                     (or (try-resolve-class sym-name)
+                         (throw (ex-info (str "Could not resolve symbol: " sym)
+                                        {:type :sci/error :sym sym})))
                      :cljs
                      (throw (ex-info (str "Could not resolve symbol: " sym)
                                      {:type :sci/error :sym sym}))))))))))))
@@ -341,9 +375,22 @@
         (cond
           (:dot? frame)
           #?(:clj
-             (m/push-value machine
-               (clojure.lang.Reflector/invokeInstanceMethod
-                f (str (:method-name frame)) (to-array [])))
+             (let [method-str (str (:method-name frame))]
+               (if (instance? Class f)
+                 ;; Static access
+                 (if (:field? frame)
+                   (m/push-value machine (clojure.lang.Reflector/getStaticField ^Class f method-str))
+                   ;; Try static field first, then no-arg static method
+                   (m/push-value machine
+                     (try
+                       (clojure.lang.Reflector/getStaticField ^Class f method-str)
+                       (catch Exception _
+                         (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))))))
+                 ;; Instance access
+                 (if (:field? frame)
+                   (m/push-value machine (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))
+                   (m/push-value machine
+                     (clojure.lang.Reflector/invokeInstanceMethod f method-str (to-array []))))))
              :cljs
              (throw (ex-info "Interop not supported in CLJS" {})))
           (:new? frame)
@@ -367,12 +414,16 @@
         (cond
           (:dot? frame)
           (let [obj (:f frame)
-                method-name (:method-name frame)
+                method-str (str (:method-name frame))
                 args done]
             #?(:clj
-               (m/push-value machine
-                 (clojure.lang.Reflector/invokeInstanceMethod
-                  obj (str method-name) (to-array args)))
+               (if (instance? Class obj)
+                 ;; Static method call
+                 (m/push-value machine
+                   (clojure.lang.Reflector/invokeStaticMethod ^Class obj method-str (to-array args)))
+                 ;; Instance method call
+                 (m/push-value machine
+                   (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))))
                :cljs
                (throw (ex-info "Interop not supported in CLJS" {}))))
           (:new? frame)
@@ -716,24 +767,49 @@
 
 #?(:clj
    (defn step-eval-dot [machine frame]
-     ;; (. obj method args...) or (. obj (method args...))
+     ;; (. obj method args...) or (. obj (method args...)) or (. obj -field)
      (let [form (:expr frame)
            [_ obj-expr method-or-call & args] form
            [method-name method-args]
            (if (seq? method-or-call)
              [(first method-or-call) (rest method-or-call)]
-             [method-or-call args])]
+             [method-or-call args])
+           method-str (str method-name)
+           is-field? (.startsWith ^String method-str "-")]
        (-> machine
            (m/replace-frame {:op :eval-args
                              :pending (vec method-args)
                              :done []
                              :phase :eval-f
                              :dot? true
-                             :method-name method-name})
+                             :method-name (if is-field?
+                                            (symbol (subs method-str 1))
+                                            method-name)
+                             :field? is-field?})
            (m/push-frame {:op :eval :expr obj-expr}))))
    :cljs
    (defn step-eval-dot [machine frame]
      (throw (ex-info ". interop not implemented for ClojureScript" {}))))
+
+;; ============================================================
+;; import*
+;; ============================================================
+
+(defn step-eval-import [machine frame]
+  ;; (import* "fully.qualified.ClassName")
+  (let [[_ class-str] (:expr frame)]
+    #?(:clj
+       (let [klass (try (Class/forName class-str)
+                        (catch ClassNotFoundException _
+                          (throw (ex-info (str "Unable to resolve classname: " class-str)
+                                         {:type :sci/error}))))
+             short-name (symbol (.getSimpleName ^Class klass))]
+         ;; Register the short name in the current env so it resolves
+         (-> machine
+             (update :env assoc short-name klass)
+             (m/push-value klass)))
+       :cljs
+       (throw (ex-info "import not supported in ClojureScript" {})))))
 
 ;; ============================================================
 ;; case*
@@ -767,7 +843,10 @@
 ;; ============================================================
 
 (defn step-eval-special [machine frame]
-  (let [head (first (:expr frame))]
+  (let [raw-head (first (:expr frame))
+        head (if (qualified-symbol? raw-head)
+               (symbol (name raw-head))
+               raw-head)]
     (check-permission machine head)
     (case head
       if       (step-eval-if machine frame)
@@ -787,6 +866,7 @@
       set!     (step-eval-set! machine frame)
       new      (step-eval-new machine frame)
       .        (step-eval-dot machine frame)
+      import*  (step-eval-import machine frame)
       (throw (ex-info (str "Special form not yet implemented: " head)
                       {:type :sci/error :form head})))))
 
@@ -865,12 +945,17 @@
       :set     (step-eval-set machine frame)
       :special (step-eval-special machine frame)
       :dot-call
-      ;; (.method obj args...) → (. obj method args...)
+      ;; (.method obj args...) or (.-field obj) → (. obj method args...) or (. obj -field)
       (let [head (first form)
-            method-name (symbol (subs (name head) 1))
+            raw-name (subs (name head) 1)
+            is-field? #?(:clj (.startsWith ^String raw-name "-")
+                         :cljs (= "-" (subs raw-name 0 1)))
+            member-name (if is-field?
+                          (symbol (str "-" (subs raw-name 1))) ;; keep the dash for (. obj -field)
+                          (symbol raw-name))
             obj-expr (second form)
             args (drop 2 form)
-            dot-form (list* '. obj-expr method-name args)]
+            dot-form (list* '. obj-expr member-name args)]
         (m/replace-frame machine {:op :eval :expr dot-form}))
 
       :new-call
@@ -885,7 +970,18 @@
       (let [[expanded? new-form] (macroexpand-form machine form)]
         (if expanded?
           (m/replace-frame machine {:op :eval :expr new-form})
-          (step-eval-invoke machine frame))))))
+          ;; Check for (Integer/SIZE) — static field access with parens but no args
+          #?(:clj
+             (let [head (first form)]
+               (if (and (symbol? head)
+                        (namespace head)
+                        (empty? (rest form))
+                        (try-resolve-class (namespace head)))
+                 ;; Looks like (ClassName/field) — just evaluate head
+                 (m/replace-frame machine {:op :eval :expr head})
+                 (step-eval-invoke machine frame)))
+             :cljs
+             (step-eval-invoke machine frame)))))))
 
 ;; ============================================================
 ;; Main step function

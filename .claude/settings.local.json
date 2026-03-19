@@ -9,7 +9,9 @@
       "Bash(lein with-profile:*)",
       "Bash(clojure -M:test:clj-test-runner)",
       "Bash(tee /tmp/sci-test-vm.txt)",
-      "Read(//private/tmp/**)"
+      "Read(//private/tmp/**)",
+      "Bash(SCI_FAIL_FAST=false lein with-profile +test test)",
+      "Bash(SCI_FAIL_FAST=false lein with-profile +test run -m clojure.main /tmp/run-sci-tests.clj)"
     ]
   }
 }
