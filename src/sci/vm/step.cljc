@@ -1352,23 +1352,54 @@
       (update-in machine [:ns current-ns :aliases] assoc spec spec)
 
       ;; Vector spec: (require '[foo :as f :refer [x y]])
+      ;; Or nested: (require '[clojure [set :refer [union]] [string :as str]])
       (vector? spec)
-      (let [ns-sym (first spec)
-            opts (apply hash-map (rest spec))
-            alias-sym (:as opts)
-            refers (:refer opts)]
-        (cond-> machine
-          alias-sym (update-in [:ns current-ns :aliases] assoc alias-sym ns-sym)
-          (= :all refers) (update-in [:ns current-ns :aliases] assoc ns-sym ns-sym)
-          (sequential? refers)
-          (as-> m
-            (reduce (fn [m sym]
-                      (let [qualified (symbol (str ns-sym) (str sym))]
-                        (if-let [entry (get (:heap m) qualified)]
-                          (assoc-in m [:heap (symbol (str current-ns) (str sym))] entry)
-                          m)))
-                    m
-                    refers))))
+      (let [first-elem (first spec)
+            nested? (and (symbol? first-elem)
+                         (> (count spec) 1)
+                         (vector? (second spec)))]
+        (if nested?
+          ;; Nested: expand prefix and process each sub-spec
+          (let [prefix first-elem]
+            (reduce (fn [m sub-spec]
+                      (let [expanded (if (symbol? sub-spec)
+                                       [(symbol (str prefix "." sub-spec))]
+                                       (vec (cons (symbol (str prefix "." (first sub-spec)))
+                                                  (rest sub-spec))))]
+                        (process-require-spec m expanded)))
+                    machine
+                    (rest spec)))
+          ;; Normal: [ns-sym :as alias :refer [syms]]
+          (let [ns-sym first-elem
+                opts (apply hash-map (rest spec))
+                alias-sym (:as opts)
+                refers (:refer opts)]
+            (cond-> machine
+              alias-sym (update-in [:ns current-ns :aliases] assoc alias-sym ns-sym)
+              (= :all refers)
+              (as-> m
+                (let [heap (if-let [a (:heap-atom m)] @a (:heap m))
+                      ns-str (str ns-sym)
+                      entries (filter (fn [[k _]] (= ns-str (namespace k))) heap)]
+                  (reduce (fn [m [k entry]]
+                            (let [target-sym (symbol (str current-ns) (name k))]
+                              (when-let [a (:heap-atom m)]
+                                (swap! a assoc target-sym entry))
+                              (assoc-in m [:heap target-sym] entry)))
+                          m entries)))
+              (sequential? refers)
+              (as-> m
+                (reduce (fn [m sym]
+                          (let [qualified (symbol (str ns-sym) (str sym))
+                                heap (if-let [a (:heap-atom m)] @a (:heap m))]
+                            (if-let [entry (get heap qualified)]
+                              (let [target-sym (symbol (str current-ns) (str sym))]
+                                (when-let [a (:heap-atom m)]
+                                  (swap! a assoc target-sym entry))
+                                (assoc-in m [:heap target-sym] entry))
+                              m)))
+                        m
+                        refers))))))
 
       :else machine)))
 

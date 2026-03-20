@@ -298,6 +298,44 @@
                                              m))
                                          {} heap)))
                      :meta {:name 'ns-map}}
+                    (symbol "clojure.core" "ns-unmap")
+                    {:val (fn [ns-sym sym]
+                            (let [qualified (symbol (str ns-sym) (str sym))]
+                              (swap! heap-atom dissoc qualified)
+                              nil))
+                     :meta {:name 'ns-unmap}}
+                    (symbol "clojure.core" "ns-imports")
+                    {:val (fn [ns-sym]
+                            {}) ;; TODO: track imports properly
+                     :meta {:name 'ns-imports}}
+                    (symbol "clojure.core" "find-var")
+                    {:val (fn [sym]
+                            (when-not (qualified-symbol? sym)
+                              (throw (ex-info "Symbol must be namespace-qualified"
+                                              {:type :sci/error})))
+                            (let [entry (get @heap-atom sym)]
+                              (when entry
+                                (sci.lang/->Var sym (:val entry) (:meta entry) (:dynamic? entry)))))
+                     :meta {:name 'find-var}}
+                    (symbol "clojure.core" "refer")
+                    {:val (fn sci-refer
+                            ([ns-sym] (sci-refer ns-sym :only nil))
+                            ([ns-sym & filters]
+                             (let [opts (apply hash-map filters)
+                                   only-syms (:only opts)
+                                   exclude-syms (set (:exclude opts))
+                                   heap @heap-atom
+                                   ns-str (str ns-sym)
+                                   entries (filter (fn [[k _]] (= ns-str (namespace k))) heap)
+                                   current-ns 'user] ;; TODO: track current-ns
+                               (doseq [[k entry] entries]
+                                 (let [sym-name (symbol (name k))]
+                                   (when (and (or (nil? only-syms) (contains? (set only-syms) sym-name))
+                                              (not (contains? exclude-syms sym-name)))
+                                     (let [target (symbol (str current-ns) (str sym-name))]
+                                       (swap! heap-atom assoc target entry)))))
+                               nil)))
+                     :meta {:name 'refer}}
                     (symbol "clojure.core" "load-string")
                     {:val (fn sci-load-string [s]
                             (let [forms (read-all s)
