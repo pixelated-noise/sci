@@ -20,12 +20,27 @@
              (deref [_] val)
              clojure.lang.IMeta
              (meta [_] meta-map)
+             clojure.lang.IFn
+             (invoke [_] (val))
+             (invoke [_ a] (val a))
+             (invoke [_ a b] (val a b))
+             (invoke [_ a b c] (val a b c))
+             (invoke [_ a b c d] (val a b c d))
+             (invoke [_ a b c d e] (val a b c d e))
+             (invoke [_ a b c d e f] (val a b c d e f))
+             (invoke [_ a b c d e f g] (val a b c d e f g))
+             (applyTo [_ args] (clojure.lang.AFn/applyToHelper val args))
              Object
              (toString [_] (str "#'" sym))]
       :cljs [IDeref
              (-deref [_] val)
              IMeta
              (-meta [_] meta-map)
+             IFn
+             (-invoke [_] (val))
+             (-invoke [_ a] (val a))
+             (-invoke [_ a b] (val a b))
+             (-invoke [_ a b c] (val a b c))
              IPrintWithWriter
              (-pr-writer [_ writer _] (-write writer (str "#'" sym)))]))
 

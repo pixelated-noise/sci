@@ -569,6 +569,10 @@
   (let [f (:f frame)
         args (:args frame)]
     (cond
+      ;; SCI Var — deref and re-apply with the var's value
+      (instance? sci.lang.Var f)
+      (m/replace-frame machine {:op :apply :f (.-val ^sci.lang.Var f) :args args})
+
       ;; SCI closure wrapped as IFn — unwrap and use VM stack path
       (and (fn? f) (:sci/closure (meta f)))
       (let [closure-map (dissoc (meta f) :sci/closure)]

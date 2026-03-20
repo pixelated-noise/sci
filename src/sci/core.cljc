@@ -164,6 +164,21 @@
                     {:val (fn sci-var? [x]
                             (or (var? x) (instance? sci.lang.Var x)))
                      :meta {:name 'var?}}
+                    (symbol "clojure.core" "var-get")
+                    {:val (fn sci-var-get [v]
+                            (if (instance? sci.lang.Var v)
+                              (.-val ^sci.lang.Var v)
+                              (var-get v)))
+                     :meta {:name 'var-get}}
+                    (symbol "clojure.core" "var-set")
+                    {:val (fn sci-var-set [v val]
+                            (if (instance? sci.lang.Var v)
+                              (let [sym (.-sym ^sci.lang.Var v)
+                                    entry (assoc (get @heap-atom sym) :val val)]
+                                (swap! heap-atom assoc sym entry)
+                                val)
+                              (var-set v val)))
+                     :meta {:name 'var-set}}
                     (symbol "clojure.core" "alter-var-root")
                     {:val (fn sci-alter-var-root [v f & args]
                             (if (instance? sci.lang.Var v)
