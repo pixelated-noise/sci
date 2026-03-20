@@ -75,15 +75,24 @@
 ;; ============================================================
 
 #?(:clj
+   (def ^:private class-prefixes
+     ["java.lang." "java.math." "java.util." "java.io." "java.net."
+      "java.util.concurrent." "java.util.regex." "clojure.lang."])
+
+   :cljs nil)
+
+#?(:clj
    (defn- try-resolve-class
      "Try to resolve a class name string. Returns the Class or nil."
      [class-name]
      (try
        (Class/forName class-name)
        (catch ClassNotFoundException _
-         (try
-           (Class/forName (str "java.lang." class-name))
-           (catch ClassNotFoundException _ nil))))))
+         (loop [prefixes class-prefixes]
+           (when (seq prefixes)
+             (or (try (Class/forName (str (first prefixes) class-name))
+                      (catch ClassNotFoundException _ nil))
+                 (recur (rest prefixes)))))))))
 
 #?(:clj
    (defn- resolve-static-member

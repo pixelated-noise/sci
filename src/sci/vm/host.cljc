@@ -4,7 +4,8 @@
   (:require [clojure.string :as str]
             [clojure.set]
             [clojure.walk]
-            [clojure.edn]))
+            [clojure.edn]
+            [clojure.repl]))
 
 (defn- make-ns-registry
   "Generate a registry of all public vars from a namespace."
@@ -26,7 +27,7 @@
      :cljs {}))
 
 (def default-namespaces
-  '[clojure.core clojure.string clojure.set clojure.walk clojure.edn])
+  '[clojure.core clojure.string clojure.set clojure.walk clojure.edn clojure.repl])
 
 (defn default-heap
   "Build the default heap with all host functions."
