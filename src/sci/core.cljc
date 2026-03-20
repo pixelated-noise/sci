@@ -167,9 +167,23 @@
                     (symbol "clojure.core" "var-get")
                     {:val (fn sci-var-get [v]
                             (if (instance? sci.lang.Var v)
-                              (.-val ^sci.lang.Var v)
+                              ;; Get latest value from heap-atom
+                              (let [sym (.-sym ^sci.lang.Var v)
+                                    entry (get @heap-atom sym)]
+                                (if entry (:val entry) (.-val ^sci.lang.Var v)))
                               (var-get v)))
                      :meta {:name 'var-get}}
+                    (symbol "clojure.core" "thread-bound?")
+                    {:val (fn sci-thread-bound? [& vars]
+                            ;; For SCI vars, check if they have dynamic bindings in the VM
+                            ;; This is a best-effort since we don't have the machine context
+                            (every? (fn [v]
+                                      (if (instance? sci.lang.Var v)
+                                        ;; SCI vars are considered bound if they have a value
+                                        (some? (.-val ^sci.lang.Var v))
+                                        (clojure.core/thread-bound? v)))
+                                    vars))
+                     :meta {:name 'thread-bound?}}
                     (symbol "clojure.core" "var-set")
                     {:val (fn sci-var-set [v val]
                             (if (instance? sci.lang.Var v)
@@ -179,6 +193,30 @@
                                 val)
                               (var-set v val)))
                      :meta {:name 'var-set}}
+                    (symbol "clojure.core" "with-redefs-fn")
+                    {:val (fn sci-with-redefs-fn [binding-map func]
+                            (let [sci-bindings (filter (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
+                                  clj-bindings (remove (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
+                                  ;; Save old values for SCI vars
+                                  old-vals (into {} (map (fn [[v _]]
+                                                           (let [sym (.-sym ^sci.lang.Var v)]
+                                                             [sym (:val (get @heap-atom sym))]))
+                                                         sci-bindings))]
+                              ;; Set new values
+                              (doseq [[v new-val] sci-bindings]
+                                (let [sym (.-sym ^sci.lang.Var v)
+                                      entry (assoc (get @heap-atom sym) :val new-val)]
+                                  (swap! heap-atom assoc sym entry)))
+                              (try
+                                (if (seq clj-bindings)
+                                  (with-redefs-fn (into {} clj-bindings) func)
+                                  (func))
+                                (finally
+                                  ;; Restore old values
+                                  (doseq [[sym old-val] old-vals]
+                                    (let [entry (assoc (get @heap-atom sym) :val old-val)]
+                                      (swap! heap-atom assoc sym entry)))))))
+                     :meta {:name 'with-redefs-fn}}
                     (symbol "clojure.core" "alter-var-root")
                     {:val (fn sci-alter-var-root [v f & args]
                             (if (instance? sci.lang.Var v)

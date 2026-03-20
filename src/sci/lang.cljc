@@ -45,6 +45,10 @@
              (-pr-writer [_ writer _] (-write writer (str "#'" sym)))]))
 
 #?(:clj
+   (defmethod print-method Var [^Var v ^java.io.Writer w]
+     (.write w (str "#'" (.-sym v)))))
+
+#?(:clj
    (defn ^:static cloneThreadBindings
      "Clone the current thread bindings."
      []
