@@ -336,6 +336,18 @@
                                              m))
                                          {} heap)))
                      :meta {:name 'ns-publics}}
+                    (symbol "clojure.core" "*clojure-version*")
+                    {:val {:major (:major *clojure-version*)
+                           :minor (:minor *clojure-version*)
+                           :incremental (:incremental *clojure-version*)
+                           :qualifier "SCI"}
+                     :meta {:name '*clojure-version*}
+                     :dynamic? true}
+                    (symbol "clojure.core" "clojure-version")
+                    {:val (fn [] (str (:major *clojure-version*) "."
+                                      (:minor *clojure-version*) "."
+                                      (:incremental *clojure-version*) "-SCI"))
+                     :meta {:name 'clojure-version}}
                     (symbol "clojure.core" "ns-map")
                     {:val (fn [ns-sym]
                             (let [heap @heap-atom

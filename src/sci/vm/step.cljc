@@ -623,9 +623,9 @@
       (vector? f)
       (m/push-value machine (nth f (first args)))
 
-      ;; Symbol — resolve and retry
+      ;; Symbol — used as function: looks up in map (like keyword)
       (symbol? f)
-      (m/replace-frame machine {:op :apply :f (resolve-symbol machine f) :args args})
+      (m/push-value machine (get (first args) f (second args)))
 
       ;; Java class as constructor
       #?@(:clj
