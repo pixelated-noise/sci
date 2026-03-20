@@ -35,6 +35,21 @@
           {}
           default-namespaces))
 
+#?(:clj
+   (defn inverse-registry
+     "Build an identity-based lookup from fn/var objects to qualified symbols.
+      Returns a java.util.IdentityHashMap for O(1) identity-based lookups."
+     [heap]
+     (let [m (java.util.IdentityHashMap.)]
+       (doseq [[qualified-sym entry] heap]
+         (let [v (:val entry)]
+           (if (:macro? entry)
+             ;; For macros, map the var object
+             (when (var? v) (.put m v qualified-sym))
+             ;; For regular fns, map the fn value
+             (when (fn? v) (.put m v qualified-sym)))))
+       m)))
+
 (defn default-ns-table
   "Build the default namespace table."
   []

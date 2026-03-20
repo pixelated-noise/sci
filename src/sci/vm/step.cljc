@@ -28,7 +28,8 @@
      ns in-ns require letfn* binding
      defmulti defmethod remove-method prefer-method
      defprotocol extend extend-type extend-protocol
-     reify monitor-enter monitor-exit})
+     reify monitor-enter monitor-exit
+     suspend!})
 
 ;; ============================================================
 ;; Form classification
@@ -1384,6 +1385,27 @@
         (m/replace-frame machine {:op :eval :expr default})))))
 
 ;; ============================================================
+;; suspend!
+;; ============================================================
+
+(defn step-eval-suspend [machine frame]
+  (let [args (rest (:expr frame))]
+    (if (empty? args)
+      ;; (suspend!) — no data, suspend immediately
+      (-> machine
+          (m/pop-frame)
+          (assoc :status :suspend :suspend-data nil))
+      ;; (suspend! expr) — evaluate the expression first, then suspend
+      (-> machine
+          (m/replace-frame {:op :suspend-apply})
+          (m/push-frame {:op :eval :expr (first args)})))))
+
+(defn step-suspend-apply [machine _frame]
+  (-> machine
+      (m/pop-frame)
+      (assoc :status :suspend :suspend-data (:result machine))))
+
+;; ============================================================
 ;; Special form dispatch
 ;; ============================================================
 
@@ -1428,6 +1450,7 @@
       binding  (step-eval-binding machine frame)
       monitor-enter (m/push-value machine nil)
       monitor-exit  (m/push-value machine nil)
+      suspend! (step-eval-suspend machine frame)
       (throw (ex-info (str "Special form not yet implemented: " head)
                       {:type :sci/error :form head})))))
 
@@ -1597,6 +1620,7 @@
         :binding-init    (step-binding-init machine frame)
         :binding-body    (step-binding-body machine frame)
         :set!-apply      (step-set!-apply machine frame)
+        :suspend-apply   (step-suspend-apply machine frame)
         :throw           (let [v (:result machine)
                                loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
                            (if (instance? #?(:clj Throwable :cljs js/Error) v)

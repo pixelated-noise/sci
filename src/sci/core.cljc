@@ -7,6 +7,7 @@
   (:require [sci.vm.machine :as machine]
             [sci.vm.step :as step]
             [sci.vm.host :as host]
+            [sci.vm.freeze :as vm-freeze]
             [edamame.core :as edamame]
             [sci.lang]
             [sci.impl.types]
@@ -602,3 +603,24 @@
                        (symbol "clojure.core" (str sym)))]
        (when-let [entry (get heap qualified)]
          (:val entry))))))
+
+;; ============================================================
+;; Suspend / Freeze / Thaw / Resume
+;; ============================================================
+
+(defn resume
+  "Resume a suspended machine, optionally providing a return value for (suspend!).
+   Returns the final result if the computation completes, or a new suspended machine."
+  ([machine] (resume machine nil))
+  ([machine value]
+   (step/run (machine/resume machine value))))
+
+(defn freeze
+  "Serialize a suspended machine to an EDN string."
+  [machine]
+  (vm-freeze/freeze machine))
+
+(defn thaw
+  "Deserialize an EDN string back into a live (suspended) machine."
+  [edn-str]
+  (vm-freeze/thaw edn-str))

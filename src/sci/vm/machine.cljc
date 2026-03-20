@@ -16,6 +16,7 @@
    :result  nil         ; most recently computed value
    :status  :running    ; :running | :done | :suspend | :effect
    :effect  nil         ; when :effect, describes the requested side effect
+   :suspend-data nil    ; when :suspend, optional data from (suspend! data)
    :current-ns 'user    ; current namespace symbol
    :permissions permissions
    :bindings {}         ; dynamic binding stack
@@ -54,3 +55,15 @@
   "Pop top frame and set result to value."
   [machine value]
   (-> machine pop-frame (set-result value)))
+
+;; ============================================================
+;; Resume
+;; ============================================================
+
+(defn resume
+  "Resume a suspended machine, optionally providing a value for (suspend!)."
+  [machine & [value]]
+  (-> machine
+      (assoc :status :running
+             :suspend-data nil)
+      (set-result value)))
