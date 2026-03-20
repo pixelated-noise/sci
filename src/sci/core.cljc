@@ -430,12 +430,37 @@
                     (symbol "clojure.core" "read-string")
                     {:val (fn sci-read-string
                             ([s]
-                             (edamame/parse-string s (assoc (make-reader-opts)
-                                                            :location? (constantly false))))
+                             (let [default-fn (or (when *suppress-read*
+                                                    (fn [tag val] (tagged-literal tag val)))
+                                                  (when-let [f *default-data-reader-fn*]
+                                                    (fn [tag val] (f tag val))))
+                                   opts (cond-> (assoc (make-reader-opts)
+                                                       :location? (constantly false))
+                                          default-fn (assoc :default default-fn))]
+                               (edamame/parse-string s opts)))
                             ([opts s]
-                             (edamame/parse-string s (merge (assoc (make-reader-opts)
-                                                                   :location? (constantly false))
-                                                            opts))))
+                             (let [eof-val (:eof opts ::none)
+                                   ;; Pick up dynamic vars from thread bindings
+                                   default-fn (or (when *suppress-read*
+                                                    (fn [tag val] (tagged-literal tag val)))
+                                                  (when-let [f *default-data-reader-fn*]
+                                                    (fn [tag val] (f tag val))))
+                                   reader-opts (cond-> (merge (assoc (make-reader-opts)
+                                                                     :location? (constantly false))
+                                                              (dissoc opts :eof))
+                                                 default-fn (assoc :default default-fn))
+                                   result (try
+                                            (edamame/parse-string s reader-opts)
+                                            (catch Exception e
+                                              (if (and (not= eof-val ::none)
+                                                       (re-find #"EOF" (str (ex-message e))))
+                                                eof-val
+                                                (throw e))))]
+                               (if (and (nil? result)
+                                        (not= eof-val ::none)
+                                        (clojure.string/blank? s))
+                                 eof-val
+                                 result))))
                      :meta {:name 'read-string}}}
         ns-atom (atom (:ns-table ctx))
         ;; Override ns-aliases to read from ns-atom
