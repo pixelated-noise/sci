@@ -886,6 +886,16 @@
                           :saved-dynamic-bindings (:dynamic-bindings machine)
                           :bind-idx 0}))))
 
+#?(:clj
+   (defn- try-resolve-real-var
+     "If sym resolves to a real Clojure dynamic var, return it. Otherwise nil."
+     [qualified]
+     (try
+       (let [v (clojure.core/resolve qualified)]
+         (when (and (var? v) (.isDynamic ^clojure.lang.Var v))
+           v))
+       (catch Exception _ nil))))
+
 (defn step-binding-init [machine frame]
   (let [idx (:bind-idx frame)
         pairs (:pairs frame)]
@@ -898,15 +908,31 @@
             (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
                                           :bind-sym nil :next-idx nil))))
       (if (>= idx (count pairs))
-        (let [body (:body frame)]
+        (let [body (:body frame)
+              ;; Push real JVM thread bindings for vars like *print-length*
+              thread-bindings
+              #?(:clj (reduce-kv
+                       (fn [acc qualified val]
+                         (if-let [real-var (try-resolve-real-var qualified)]
+                           (assoc acc real-var val)
+                           acc))
+                       {}
+                       (:dynamic-bindings machine))
+                 :cljs nil)
+              has-thread-bindings? #?(:clj (seq thread-bindings) :cljs false)]
+          (when has-thread-bindings?
+            #?(:clj (clojure.core/push-thread-bindings thread-bindings)))
           (if (empty? body)
-            (-> machine
-                (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
-                (m/push-value nil))
+            (do (when has-thread-bindings?
+                  #?(:clj (clojure.core/pop-thread-bindings)))
+                (-> machine
+                    (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
+                    (m/push-value nil)))
             (-> machine
                 (m/replace-frame {:op :binding-body
                                   :body (vec body)
-                                  :saved-dynamic-bindings (:saved-dynamic-bindings frame)})
+                                  :saved-dynamic-bindings (:saved-dynamic-bindings frame)
+                                  :has-thread-bindings? has-thread-bindings?})
                 (m/push-frame {:op :eval :expr (first body)}))))
         (let [[sym expr] (nth pairs idx)]
           (-> machine
@@ -918,9 +944,11 @@
 (defn step-binding-body [machine frame]
   (let [body (vec (rest (:body frame)))]
     (if (empty? body)
-      (-> machine
-          (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
-          (m/pop-frame))
+      (do (when (:has-thread-bindings? frame)
+            #?(:clj (clojure.core/pop-thread-bindings)))
+          (-> machine
+              (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
+              (m/pop-frame)))
       (-> machine
           (m/replace-frame (assoc frame :body body))
           (m/push-frame {:op :eval :expr (first body)})))))
@@ -1590,22 +1618,24 @@
         (m/replace-frame machine {:op :eval :expr new-form}))
 
       :invoke
-      ;; Before invoking, check if head is a macro
-      (let [[expanded? new-form] (macroexpand-form machine form)]
-        (if expanded?
-          (m/replace-frame machine {:op :eval :expr new-form})
-          ;; Check for (Integer/SIZE) — static field access with parens but no args
-          #?(:clj
-             (let [head (first form)]
-               (if (and (symbol? head)
-                        (namespace head)
-                        (empty? (rest form))
-                        (try-resolve-class (namespace head)))
-                 ;; Looks like (ClassName/field) — just evaluate head
-                 (m/replace-frame machine {:op :eval :expr head})
-                 (step-eval-invoke machine frame)))
-             :cljs
-             (step-eval-invoke machine frame)))))))
+      ;; Check permission on the symbol before macro expansion
+      (do (when (symbol? (first form))
+            (check-permission machine (first form)))
+          (let [[expanded? new-form] (macroexpand-form machine form)]
+            (if expanded?
+              (m/replace-frame machine {:op :eval :expr new-form})
+              ;; Check for (Integer/SIZE) — static field access with parens but no args
+              #?(:clj
+                 (let [head (first form)]
+                   (if (and (symbol? head)
+                            (namespace head)
+                            (empty? (rest form))
+                            (try-resolve-class (namespace head)))
+                     ;; Looks like (ClassName/field) — just evaluate head
+                     (m/replace-frame machine {:op :eval :expr head})
+                     (step-eval-invoke machine frame)))
+                 :cljs
+                 (step-eval-invoke machine frame))))))))
 
 ;; ============================================================
 ;; Main step function

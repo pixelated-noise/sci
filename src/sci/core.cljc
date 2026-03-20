@@ -245,7 +245,28 @@
                                                     (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
                                              m))
                                          {} heap)))
-                     :meta {:name 'ns-map}}}
+                     :meta {:name 'ns-map}}
+                    (symbol "clojure.core" "load-string")
+                    {:val (fn sci-load-string [s]
+                            (let [forms (read-all s)
+                                  m2 (machine/make-machine
+                                      {:heap @heap-atom
+                                       :ns-table (:ns-table ctx)
+                                       :permissions {:allow (:allow ctx)
+                                                     :deny (:deny ctx)}})
+                                  expr (if (= 1 (count forms))
+                                         (first forms)
+                                         (cons 'do forms))
+                                  m2 (-> m2
+                                         (assoc :heap-atom heap-atom)
+                                         (machine/push-frame {:op :eval :expr expr}))]
+                              (step/run m2)))
+                     :meta {:name 'load-string}}
+                    (symbol "clojure.core" "read-string")
+                    {:val (fn sci-read-string [s]
+                            (edamame/parse-string s (assoc (make-reader-opts)
+                                                           :location? (constantly false))))
+                     :meta {:name 'read-string}}}
         heap (merge (:heap ctx) extra-heap)
         m (machine/make-machine
            {:heap heap
