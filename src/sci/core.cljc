@@ -257,23 +257,30 @@
                     (symbol "clojure.core" "eval")
                     {:val eval-fn :meta {:name 'eval}}
                     (symbol "clojure.core" "macroexpand-1")
-                    {:val (fn [form]
-                            (if (and (seq? form) (symbol? (first form)))
-                              (let [head (first form)
-                                    heap @heap-atom
-                                    sym-name (name head)
-                                    candidates [(symbol "clojure.core" sym-name)]
-                                    macro-entry (some #(let [e (get heap %)]
-                                                         (when (:macro? e) e))
-                                                      candidates)]
-                                (if macro-entry
-                                  (let [mv (:val macro-entry)
-                                        mf (if (var? mv) @mv mv)]
-                                    (if (var? mv)
-                                      (apply mf form {} (rest form))
-                                      (apply mf (rest form))))
-                                  form))
-                              form))
+                    {:val (fn sci-macroexpand-1
+                            ([form]
+                             (if (and (seq? form) (symbol? (first form)))
+                               (let [head (first form)
+                                     heap @heap-atom
+                                     sym-name (name head)
+                                     sym-ns (clojure.core/namespace head)
+                                     candidates (if sym-ns
+                                                  [(symbol sym-ns sym-name)]
+                                                  [(symbol "user" sym-name)
+                                                   (symbol "clojure.core" sym-name)])
+                                     macro-entry (some #(let [e (get heap %)]
+                                                          (when (:macro? e) e))
+                                                       candidates)]
+                                 (if macro-entry
+                                   (let [mv (:val macro-entry)
+                                         mf (if (var? mv) @mv mv)]
+                                     (if (var? mv)
+                                       (apply mf form {} (rest form))
+                                       (apply mf (rest form))))
+                                   form))
+                               form))
+                            ([env form]
+                             (sci-macroexpand-1 form)))
                      :meta {:name 'macroexpand-1}}
                     (symbol "clojure.core" "bound?")
                     {:val (fn [& vars]
