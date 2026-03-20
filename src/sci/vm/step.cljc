@@ -145,13 +145,16 @@
                 qualified (symbol (str ns-sym) sym-name)
                 core-q (symbol "clojure.core" sym-name)
                 dyn (:dynamic-bindings machine)]
-            (or (when (and dyn (contains? dyn qualified)) (get dyn qualified))
-                (when (and dyn (contains? dyn core-q)) (get dyn core-q))
-                (when (contains? heap qualified) (:val (get heap qualified)))
-                (when (contains? heap core-q) (:val (get heap core-q)))
-                #?(:clj (try-resolve-class sym-name) :cljs nil)
-                (throw (ex-info (str "Could not resolve symbol: " sym)
-                                {:type :sci/error :sym sym})))))))))
+            ;; Use if-let chain instead of or — or treats false/nil as "not found"
+            (if (and dyn (contains? dyn qualified)) (get dyn qualified)
+              (if (and dyn (contains? dyn core-q)) (get dyn core-q)
+                (if (contains? heap qualified) (:val (get heap qualified))
+                  (if (contains? heap core-q) (:val (get heap core-q))
+                    #?(:clj (or (try-resolve-class sym-name)
+                                (throw (ex-info (str "Could not resolve symbol: " sym)
+                                                {:type :sci/error :sym sym})))
+                       :cljs (throw (ex-info (str "Could not resolve symbol: " sym)
+                                             {:type :sci/error :sym sym})))))))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
@@ -205,8 +208,18 @@
     (if (empty? pending)
       (let [raw (case (:coll-type frame)
                   :vector (vec done)
-                  :set    (set done)
-                  :map    (apply hash-map done))
+                  :set    (let [s (set done)]
+                            (when (not= (count s) (count done))
+                              (throw (ex-info (str "Duplicate key: "
+                                                   (pr-str (first (filter #(> (count (filter #{%} done)) 1) done))))
+                                              {:type :sci/error})))
+                            s)
+                  :map    (let [ks (take-nth 2 done)]
+                            (when (not= (count (set ks)) (count ks))
+                              (throw (ex-info (str "Duplicate key: "
+                                                   (pr-str (first (filter #(> (count (filter #{%} ks)) 1) ks))))
+                                              {:type :sci/error})))
+                            (apply hash-map done)))
             val (if-let [fm (:form-meta frame)]
                   (with-meta raw fm)
                   raw)]
@@ -547,6 +560,11 @@
   (let [f (:f frame)
         args (:args frame)]
     (cond
+      ;; SCI closure wrapped as IFn — unwrap and use VM stack path
+      (and (fn? f) (:sci/closure (meta f)))
+      (let [closure-map (dissoc (meta f) :sci/closure)]
+        (m/replace-frame machine {:op :apply :f closure-map :args args}))
+
       ;; Host function
       (fn? f)
       (m/push-value machine (apply f args))
