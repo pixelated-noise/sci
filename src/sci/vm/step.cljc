@@ -1328,6 +1328,13 @@
 ;; ns / in-ns / require
 ;; ============================================================
 
+(defn- sync-ns-atom!
+  "Sync the machine's :ns map to the :ns-atom if present."
+  [machine]
+  (when-let [a (:ns-atom machine)]
+    (reset! a (:ns machine)))
+  machine)
+
 (defn step-eval-in-ns [machine frame]
   (let [[_ ns-sym-expr] (:expr frame)]
     ;; Evaluate the ns symbol
@@ -1340,6 +1347,7 @@
     (-> machine
         (assoc :current-ns ns-sym)
         (update :ns #(if (get % ns-sym) % (assoc % ns-sym {:aliases {} :refers {} :imports {}})))
+        sync-ns-atom!
         (m/push-value ns-sym))))
 
 (defn- process-require-spec
@@ -1408,7 +1416,7 @@
         ;; Unquote specs — require args are quoted
         specs (map (fn [s] (if (and (seq? s) (= 'quote (first s))) (second s) s)) specs)
         machine (reduce process-require-spec machine specs)]
-    (m/push-value machine nil)))
+    (m/push-value (sync-ns-atom! machine) nil)))
 
 (defn step-eval-ns [machine frame]
   ;; (ns name & references)
@@ -1448,7 +1456,7 @@
                        m))
                    machine
                    refs)]
-      (m/push-value machine ns-sym))))
+      (m/push-value (sync-ns-atom! machine) ns-sym))))
 
 ;; ============================================================
 ;; case*

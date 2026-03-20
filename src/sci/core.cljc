@@ -336,6 +336,20 @@
                                        (swap! heap-atom assoc target entry)))))
                                nil)))
                      :meta {:name 'refer}}
+                    (symbol "clojure.core" "ns-aliases")
+                    {:val (fn [ns-sym]
+                            (let [ns-data (get (:ns-table ctx) ns-sym)]
+                              (or (:aliases ns-data) {})))
+                     :meta {:name 'ns-aliases}}
+                    ;; defonce — override host macro that uses .hasRoot
+                    (symbol "clojure.core" "defonce")
+                    {:val (fn sci-defonce [name expr]
+                            (list 'do
+                                  (list 'when-not (list 'resolve (list 'quote name))
+                                        (list 'def name expr))
+                                  (list 'var name)))
+                     :meta {:macro true :name 'defonce}
+                     :macro? true}
                     (symbol "clojure.core" "load-string")
                     {:val (fn sci-load-string [s]
                             (let [forms (read-all s)
@@ -362,7 +376,12 @@
                                                                    :location? (constantly false))
                                                             opts))))
                      :meta {:name 'read-string}}}
-        heap (merge (:heap ctx) extra-heap)
+        ns-atom (atom (:ns-table ctx))
+        ;; Override ns-aliases to read from ns-atom
+        heap (assoc (merge (:heap ctx) extra-heap)
+                    (symbol "clojure.core" "ns-aliases")
+                    {:val (fn [ns-sym] (or (:aliases (get @ns-atom ns-sym)) {}))
+                     :meta {:name 'ns-aliases}})
         m (machine/make-machine
            {:heap heap
             :ns-table (:ns-table ctx)
@@ -371,7 +390,7 @@
     (let [expr (if (= 1 (count forms))
                  (first forms)
                  (cons 'do forms))
-          m (assoc m :heap-atom heap-atom)]
+          m (assoc m :heap-atom heap-atom :ns-atom ns-atom)]
       (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
