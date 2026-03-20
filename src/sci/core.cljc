@@ -160,7 +160,44 @@
                         m2 (assoc m2 :heap-atom heap-atom)
                         m2 (machine/push-frame m2 {:op :eval :expr form})]
                     (step/run m2)))
-        extra-heap {(symbol "clojure.core" "resolve")
+        extra-heap {(symbol "clojure.core" "var?")
+                    {:val (fn sci-var? [x]
+                            (or (var? x) (instance? sci.lang.Var x)))
+                     :meta {:name 'var?}}
+                    (symbol "clojure.core" "alter-var-root")
+                    {:val (fn sci-alter-var-root [v f & args]
+                            (if (instance? sci.lang.Var v)
+                              (let [sym (.-sym ^sci.lang.Var v)
+                                    old-val (.-val ^sci.lang.Var v)
+                                    new-val (apply f old-val args)
+                                    entry {:val new-val
+                                           :meta (.-meta-map ^sci.lang.Var v)
+                                           :dynamic? (.-dynamic? ^sci.lang.Var v)}]
+                                (swap! heap-atom assoc sym entry)
+                                new-val)
+                              (apply clojure.core/alter-var-root v f args)))
+                     :meta {:name 'alter-var-root}}
+                    (symbol "clojure.core" "alter-meta!")
+                    {:val (fn sci-alter-meta! [ref f & args]
+                            (if (instance? sci.lang.Var ref)
+                              (let [sym (.-sym ^sci.lang.Var ref)
+                                    old-meta (.-meta-map ^sci.lang.Var ref)
+                                    new-meta (apply f old-meta args)
+                                    entry (get @heap-atom sym)]
+                                (swap! heap-atom assoc sym (assoc entry :meta new-meta))
+                                new-meta)
+                              (apply clojure.core/alter-meta! ref f args)))
+                     :meta {:name 'alter-meta!}}
+                    (symbol "clojure.core" "reset-meta!")
+                    {:val (fn sci-reset-meta! [ref m]
+                            (if (instance? sci.lang.Var ref)
+                              (let [sym (.-sym ^sci.lang.Var ref)
+                                    entry (get @heap-atom sym)]
+                                (swap! heap-atom assoc sym (assoc entry :meta m))
+                                m)
+                              (clojure.core/reset-meta! ref m)))
+                     :meta {:name 'reset-meta!}}
+                    (symbol "clojure.core" "resolve")
                     {:val resolve-fn :meta {:name 'resolve}}
                     (symbol "clojure.core" "ns-resolve")
                     {:val (fn [ns-sym sym] (resolve-fn ns-sym sym)) :meta {:name 'ns-resolve}}

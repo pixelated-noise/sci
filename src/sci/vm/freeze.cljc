@@ -46,6 +46,10 @@
             ;; Unknown fn — try to preserve as best we can
             {:type :unknown-fn :class (str (class x))})
 
+          ;; SCI Var
+          (instance? sci.lang.Var x)
+          {:type :sci-var-ref :sym (str (.-sym ^sci.lang.Var x))}
+
           ;; Var (host Clojure var)
           (var? x)
           (if-let [sym (.get ^java.util.IdentityHashMap inverse-reg x)]
@@ -108,6 +112,14 @@
                 (:val entry)
                 (throw (ex-info (str "Cannot resolve var: " (:id x))
                                 {:type :sci/error}))))
+
+            :sci-var-ref
+            (let [sym (symbol (:sym x))
+                  entry (get full-heap sym)]
+              (sci.lang/->Var sym
+                              (:val entry)
+                              (:meta entry)
+                              (:dynamic? entry)))
 
             :class-ref
             (Class/forName (:name x))

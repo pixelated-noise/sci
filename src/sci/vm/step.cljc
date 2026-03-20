@@ -674,7 +674,7 @@
           (swap! a assoc qualified entry))
         (-> machine
             (assoc-in [:heap qualified] entry)
-            (m/push-value (symbol (str ns-sym) (str sym)))))
+            (m/push-value (sci.lang/->Var qualified nil meta-map (:dynamic meta-map)))))
       (-> machine
           (m/replace-frame {:op :def :sym sym
                             :ns-sym (:current-ns machine)
@@ -693,7 +693,7 @@
       (swap! a assoc qualified entry))
     (-> machine
         (assoc-in [:heap qualified] entry)
-        (m/push-value (symbol (str ns-sym) (str sym))))))
+        (m/push-value (sci.lang/->Var qualified val meta-map (:dynamic meta-map))))))
 
 ;; ============================================================
 ;; quote
@@ -845,17 +845,18 @@
 (defn step-eval-var [machine frame]
   (let [[_ sym] (:expr frame)
         ns-sym (:current-ns machine)
+        heap (if-let [a (:heap-atom machine)] @a (:heap machine))
         qualified (if (qualified-symbol? sym)
                     sym
                     ;; Also check clojure.core
                     (let [local-q (symbol (str ns-sym) (str sym))]
-                      (if (contains? (:heap machine) local-q)
+                      (if (contains? heap local-q)
                         local-q
                         (let [core-q (symbol "clojure.core" (str sym))]
-                          (if (contains? (:heap machine) core-q)
+                          (if (contains? heap core-q)
                             core-q
                             local-q)))))
-        entry (get (:heap machine) qualified)
+        entry (get heap qualified)
         ;; Create an SCI var-like object
         var-obj (sci.lang/->Var qualified
                                (:val entry)
