@@ -174,9 +174,8 @@
 
 (defn step-eval-symbol [machine frame]
   (let [sym (:expr frame)]
-    ;; Only check permissions for non-local symbols
-    (when-not (contains? (:env machine) sym)
-      (check-permission machine sym))
+    ;; Permission check is done at call sites (step-eval-special, invoke),
+    ;; not for symbol resolution (variables, values)
     (m/push-value machine (resolve-symbol machine sym))))
 
 (defn step-eval-vector [machine frame]
@@ -681,10 +680,10 @@
           (and (= 2 (count init)) (string? (first init)))
           [(first init) (second init) (merge (meta sym) {:doc (first init)})]
           :else               [nil (first init) (meta sym)])]
-    (if (nil? init-expr)
+    (if (and (nil? init-expr) (empty? init))
       (let [ns-sym (:current-ns machine)
             qualified (symbol (str ns-sym) (str sym))
-            entry {:val nil :meta meta-map}]
+            entry {:val nil :meta meta-map :bound? false}]
         (when-let [a (:heap-atom machine)]
           (swap! a assoc qualified entry))
         (-> machine
@@ -702,7 +701,7 @@
         qualified (symbol (str ns-sym) (str sym))
         val (:result machine)
         meta-map (:meta-map frame)
-        entry {:val val :meta meta-map :dynamic? (:dynamic meta-map)}]
+        entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true}]
     ;; Update both the immutable heap and the shared atom
     (when-let [a (:heap-atom machine)]
       (swap! a assoc qualified entry))
@@ -1599,21 +1598,31 @@
 ;; Permission checking
 ;; ============================================================
 
+(def ^:private always-allowed-for-allow-list
+  "Structural forms that are implicitly allowed when an allow-list is set.
+   These are internal forms needed for basic execution (but NOT user-facing
+   forms like def, defmacro, ns, require)."
+  '#{do if let* fn* quote var loop* recur try catch finally throw
+     new . set! case* binding monitor-enter monitor-exit suspend!})
+
 (defn check-permission [machine sym]
   (let [perms (:permissions machine)
         allow (:allow perms)
         deny (:deny perms)]
     (when (and allow (seq allow))
       (let [sym-name (name sym)
-            sym-ns (clojure.core/namespace sym)
-            qualified (when sym-ns (symbol sym-ns sym-name))
-            core-qualified (symbol "clojure.core" sym-name)
-            allowed? (or (contains? (set allow) sym)
-                         (contains? (set allow) core-qualified)
-                         (when qualified (contains? (set allow) qualified)))]
-        (when-not allowed?
-          (throw (ex-info (str sym " is not allowed!")
-                          {:type :sci/error})))))
+            bare-sym (symbol sym-name)]
+        ;; Skip allow-list check for structural forms that are always needed
+        (when-not (contains? always-allowed-for-allow-list bare-sym)
+          (let [sym-ns (clojure.core/namespace sym)
+                qualified (when sym-ns (symbol sym-ns sym-name))
+                core-qualified (symbol "clojure.core" sym-name)
+                allowed? (or (contains? (set allow) sym)
+                             (contains? (set allow) core-qualified)
+                             (when qualified (contains? (set allow) qualified)))]
+            (when-not allowed?
+              (throw (ex-info (str sym " is not allowed!")
+                              {:type :sci/error})))))))
     (when (and deny (seq deny))
       (let [sym-name (name sym)
             core-qualified (symbol "clojure.core" sym-name)]

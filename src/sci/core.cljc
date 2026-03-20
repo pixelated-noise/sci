@@ -279,7 +279,11 @@
                     {:val (fn [& vars]
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
-                                        (some? (.-val ^sci.lang.Var v))
+                                        (let [sym (.-sym ^sci.lang.Var v)
+                                              entry (get @heap-atom sym)]
+                                          (if entry
+                                            (:bound? entry true)
+                                            (some? (.-val ^sci.lang.Var v))))
                                         (clojure.core/bound? v)))
                                     vars))
                      :meta {:name 'bound?}}
