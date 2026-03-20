@@ -1582,17 +1582,29 @@
   [machine form]
   (if-not (seq? form)
     [false form]
-    (let [head (first form)]
+    (let [head (first form)
+          ;; Don't macro-expand forms whose head is a special form
+          ;; (e.g. clojure.core/fn is a macro but fn* is the special form we want)
+          bare (when (symbol? head) (symbol (name head)))]
+      (if (and bare (contains? special-forms bare))
+        ;; Rewrite qualified special form to unqualified
+        (if (= head bare)
+          [false form]
+          [true (cons bare (rest form))])
+
+        (if (and (symbol? head) (contains? (:env machine) head))
+        ;; Head is a local binding — don't macro-expand
+        [false form]
       (if-let [macro-val (try-resolve-macro machine head)]
-        (let [is-host-macro? (var? macro-val)
-              macro-fn (if is-host-macro? @macro-val macro-val)
-              expanded (if is-host-macro?
-                         ;; Host macros get &form and &env as first two args
-                         (apply macro-fn form {} (rest form))
-                         ;; SCI-defined macros just get the args directly
-                         (apply macro-fn (rest form)))]
-          [true expanded])
-        [false form]))))
+          (let [is-host-macro? (var? macro-val)
+                macro-fn (if is-host-macro? @macro-val macro-val)
+                expanded (if is-host-macro?
+                           ;; Host macros get &form and &env as first two args
+                           (apply macro-fn form {} (rest form))
+                           ;; SCI-defined macros just get the args directly
+                           (apply macro-fn (rest form)))]
+            [true expanded])
+          [false form]))))))
 
 ;; ============================================================
 ;; Permission checking
@@ -1653,7 +1665,16 @@
                       (assoc :last-loc loc)
                       (cond-> (nil? (:top-loc machine)) (assoc :top-loc loc)))
                   machine)]
-    (case (classify-form form)
+    (let [classification (classify-form form)
+          ;; If classified as :special but the head is a local binding,
+          ;; treat as :invoke instead (e.g. (defn foo [fn] (fn 1)))
+          classification (if (and (= :special classification)
+                                  (seq? form)
+                                  (symbol? (first form))
+                                  (contains? (:env machine) (first form)))
+                           :invoke
+                           classification)]
+      (case classification
       :literal (step-eval-literal machine frame)
       :symbol  (step-eval-symbol machine frame)
       :vector  (step-eval-vector machine frame)
@@ -1709,7 +1730,7 @@
                      (m/replace-frame machine {:op :eval :expr head})
                      (step-eval-invoke machine frame)))
                  :cljs
-                 (step-eval-invoke machine frame))))))))
+                 (step-eval-invoke machine frame)))))))))
 
 ;; ============================================================
 ;; Main step function
