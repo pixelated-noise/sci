@@ -315,9 +315,14 @@
                               (step/run m2)))
                      :meta {:name 'load-string}}
                     (symbol "clojure.core" "read-string")
-                    {:val (fn sci-read-string [s]
-                            (edamame/parse-string s (assoc (make-reader-opts)
-                                                           :location? (constantly false))))
+                    {:val (fn sci-read-string
+                            ([s]
+                             (edamame/parse-string s (assoc (make-reader-opts)
+                                                            :location? (constantly false))))
+                            ([opts s]
+                             (edamame/parse-string s (merge (assoc (make-reader-opts)
+                                                                   :location? (constantly false))
+                                                            opts))))
                      :meta {:name 'read-string}}}
         heap (merge (:heap ctx) extra-heap)
         m (machine/make-machine
