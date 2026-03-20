@@ -534,13 +534,19 @@
   ([arities argc] (match-arity arities argc nil))
   ([arities argc fn-name]
    (or
+    ;; Prefer exact match over variadic
     (first (filter (fn [{:keys [params]}]
                      (let [params-vec (vec params)
                            amp-pos (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil))
                                               nil params-vec)]
-                       (if amp-pos
-                         (>= argc amp-pos)
-                         (= argc (count params)))))
+                       (and (nil? amp-pos) (= argc (count params)))))
+                   arities))
+    ;; Fall back to variadic match
+    (first (filter (fn [{:keys [params]}]
+                     (let [params-vec (vec params)
+                           amp-pos (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil))
+                                              nil params-vec)]
+                       (and amp-pos (>= argc amp-pos))))
                    arities))
     (let [arity-desc (if fn-name
                        (str fn-name)
@@ -683,7 +689,14 @@
     (if (and (nil? init-expr) (empty? init))
       (let [ns-sym (:current-ns machine)
             qualified (symbol (str ns-sym) (str sym))
-            entry {:val nil :meta meta-map :bound? false}]
+            ;; Only create entry if var doesn't already exist (declare semantics)
+            heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+            existing (get heap qualified)
+            entry (if (and existing (:bound? existing))
+                    ;; Var already bound — keep existing value, update meta
+                    (assoc existing :meta meta-map)
+                    ;; Var not yet bound or doesn't exist — declare it
+                    {:val nil :meta meta-map :bound? false})]
         (when-let [a (:heap-atom machine)]
           (swap! a assoc qualified entry))
         (-> machine
