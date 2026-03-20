@@ -1018,7 +1018,7 @@
            (if (seq? method-or-call)
              [(first method-or-call) (rest method-or-call)]
              [method-or-call args])
-           method-str (str method-name)
+           method-str (name method-name) ;; use name to strip namespace (e.g. clojure.core/close → close)
            is-field? (.startsWith ^String method-str "-")]
        (-> machine
            (m/replace-frame {:op :eval-args
@@ -1028,7 +1028,7 @@
                              :dot? true
                              :method-name (if is-field?
                                             (symbol (subs method-str 1))
-                                            method-name)
+                                            (symbol method-str))
                              :field? is-field?})
            (m/push-frame {:op :eval :expr obj-expr}))))
    :cljs
