@@ -677,6 +677,14 @@
 ;; def
 ;; ============================================================
 
+(defn- meta-needs-eval?
+  "Check if any values in a metadata map need evaluation (are non-literal forms)."
+  [meta-map]
+  (and meta-map
+       (some (fn [[_ v]]
+               (and (seq? v) (not (nil? v))))
+             meta-map)))
+
 (defn step-eval-def [machine frame]
   (let [[_ sym & init] (:expr frame)
         ;; Handle (def name docstring init-expr)
@@ -686,6 +694,14 @@
           (and (= 2 (count init)) (string? (first init)))
           [(first init) (second init) (merge (meta sym) {:doc (first init)})]
           :else               [nil (first init) (meta sym)])]
+    ;; If metadata contains unevaluated forms, evaluate the map first
+    (if (meta-needs-eval? meta-map)
+      (-> machine
+          (m/replace-frame {:op :def-with-meta
+                            :sym sym
+                            :init init
+                            :init-expr init-expr})
+          (m/push-frame {:op :eval :expr (into {} meta-map)}))
     (if (and (nil? init-expr) (empty? init))
       (let [ns-sym (:current-ns machine)
             qualified (symbol (str ns-sym) (str sym))
@@ -702,6 +718,34 @@
         (-> machine
             (assoc-in [:heap qualified] entry)
             (m/push-value (sci.lang/->Var qualified nil meta-map (:dynamic meta-map)))))
+      (-> machine
+          (m/replace-frame {:op :def :sym sym
+                            :ns-sym (:current-ns machine)
+                            :meta-map meta-map})
+          (m/push-frame {:op :eval :expr init-expr}))))))
+
+(defn step-def-with-meta
+  "Continue def after metadata has been evaluated."
+  [machine frame]
+  (let [meta-map (:result machine)
+        sym (:sym frame)
+        init (:init frame)
+        init-expr (:init-expr frame)]
+    (if (and (nil? init-expr) (empty? init))
+      ;; declare path
+      (let [ns-sym (:current-ns machine)
+            qualified (symbol (str ns-sym) (str sym))
+            heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+            existing (get heap qualified)
+            entry (if (and existing (:bound? existing))
+                    (assoc existing :meta meta-map)
+                    {:val nil :meta meta-map :bound? false})]
+        (when-let [a (:heap-atom machine)]
+          (swap! a assoc qualified entry))
+        (-> machine
+            (assoc-in [:heap qualified] entry)
+            (m/push-value (sci.lang/->Var qualified nil meta-map (:dynamic meta-map)))))
+      ;; def with init — push eval frame for the init expression
       (-> machine
           (m/replace-frame {:op :def :sym sym
                             :ns-sym (:current-ns machine)
@@ -1763,6 +1807,7 @@
         :let             (step-let machine frame)
         :do-restore-env  (step-do-restore-env machine frame)
         :def             (step-def machine frame)
+        :def-with-meta   (step-def-with-meta machine frame)
         :fn-body         (if (= :return (:phase frame))
                            (step-fn-body-return machine frame)
                            (step-fn-body machine frame))
