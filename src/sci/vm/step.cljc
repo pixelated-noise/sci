@@ -174,7 +174,9 @@
 
 (defn step-eval-symbol [machine frame]
   (let [sym (:expr frame)]
-    (check-permission machine sym)
+    ;; Only check permissions for non-local symbols
+    (when-not (contains? (:env machine) sym)
+      (check-permission machine sym))
     (m/push-value machine (resolve-symbol machine sym))))
 
 (defn step-eval-vector [machine frame]
@@ -1632,9 +1634,19 @@
         (m/replace-frame machine {:op :eval :expr new-form}))
 
       :invoke
-      ;; Check permission on the symbol before macro expansion
+      ;; Only check deny list before macro expansion — allow list is checked
+      ;; after expansion on the resulting special forms
       (do (when (symbol? (first form))
-            (check-permission machine (first form)))
+            (let [perms (:permissions machine)
+                  deny (:deny perms)]
+              (when (and deny (seq deny))
+                (let [sym (first form)
+                      sym-name (name sym)
+                      core-qualified (symbol "clojure.core" sym-name)]
+                  (when (or (contains? (set deny) sym)
+                            (contains? (set deny) core-qualified))
+                    (throw (ex-info (str sym " is not allowed!")
+                                    {:type :sci/error})))))))
           (let [[expanded? new-form] (macroexpand-form machine form)]
             (if expanded?
               (m/replace-frame machine {:op :eval :expr new-form})
