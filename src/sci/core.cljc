@@ -230,6 +230,15 @@
                                 new-val)
                               (apply clojure.core/alter-var-root v f args)))
                      :meta {:name 'alter-var-root}}
+                    (symbol "clojure.core" "meta")
+                    {:val (fn sci-meta [obj]
+                            (let [m (meta obj)]
+                              (if (:sci/closure m)
+                                ;; Strip internal SCI closure keys from metadata
+                                (let [cleaned (dissoc m :sci/closure :type :name :arities :env)]
+                                  (when (seq cleaned) cleaned))
+                                m)))
+                     :meta {:name 'meta}}
                     (symbol "clojure.core" "alter-meta!")
                     {:val (fn sci-alter-meta! [ref f & args]
                             (if (instance? sci.lang.Var ref)
