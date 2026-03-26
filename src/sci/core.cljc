@@ -233,11 +233,14 @@
                     (symbol "clojure.core" "meta")
                     {:val (fn sci-meta [obj]
                             (let [m (meta obj)]
-                              (if (:sci/closure m)
-                                ;; Strip internal SCI closure keys from metadata
+                              (cond
+                                (:sci/closure m)
                                 (let [cleaned (dissoc m :sci/closure :type :name :arities :env)]
                                   (when (seq cleaned) cleaned))
-                                m)))
+                                ;; Strip internal SCI keys from var/other metadata
+                                (:sci.impl/var-sym m)
+                                (dissoc m :sci.impl/var-sym)
+                                :else m)))
                      :meta {:name 'meta}}
                     (symbol "clojure.core" "alter-meta!")
                     {:val (fn sci-alter-meta! [ref f & args]

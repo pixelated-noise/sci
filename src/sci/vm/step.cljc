@@ -546,11 +546,31 @@
                 (run m))))]
     (with-meta f (assoc closure-map :sci/closure true))))
 
+(defn- validate-fn-arities
+  "Check multi-arity fn validity."
+  [arities]
+  (let [variadic-arities (filter (fn [{:keys [params]}]
+                                   (some #{'&} params))
+                                 arities)
+        fixed-arities (remove (fn [{:keys [params]}]
+                                (some #{'&} params))
+                              arities)]
+    (when (> (count variadic-arities) 1)
+      (throw (ex-info "Can't have more than 1 variadic overload"
+                      {:type :sci/error})))
+    (when (and (seq variadic-arities) (seq fixed-arities))
+      (let [variadic-fixed (count (take-while #(not= '& %) (:params (first variadic-arities))))
+            max-fixed (apply max (map #(count (:params %)) fixed-arities))]
+        (when (> max-fixed variadic-fixed)
+          (throw (ex-info "Can't have fixed arity function with more params than variadic function"
+                          {:type :sci/error})))))))
+
 (defn step-eval-fn [machine frame]
   (let [parsed (parse-fn-form (:expr frame))
+        ;; Validate multi-arity fn rules
+        _ (when (> (count (:arities parsed)) 1)
+            (validate-fn-arities (:arities parsed)))
         ;; Check recur tail position only for user-written fn* forms
-        ;; (those with :line metadata from the reader). Macro-expanded fn*
-        ;; (from for, doseq, etc.) has no reader metadata and is skipped.
         _ (when (:line (meta (:expr frame)))
             (check-recur-tail-position (:arities parsed)))
         closure-map {:type :closure
