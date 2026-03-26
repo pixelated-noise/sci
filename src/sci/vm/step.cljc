@@ -409,10 +409,8 @@
         ;; (loop* [bindings...] body...) — body is a new recur target
         (= 'loop* head) nil
 
-        ;; (fn* ...) / (fn ...) / (letfn* ...) — new recur context
-        (= 'fn* head) nil
-        (= 'fn head) nil
-        (= 'letfn* head) nil
+        ;; (fn* ...) / (fn ...) / (letfn* ...) / (defn ...) — new recur context, don't descend
+        (contains? '#{fn* fn letfn* defn defn- letfn reify} head) nil
 
         ;; (try ...) — recur not allowed in try/catch/finally
         (= 'try head)
@@ -1510,8 +1508,15 @@
   ;; then evaluate body in a scope where the names are bound.
   (let [[_ bindings & body] (:expr frame)
         pairs (vec (partition 2 bindings))
+        ;; Propagate source location to inner fn forms for recur checking
+        loc-meta (select-keys (meta (:expr frame)) [:line :column])
         ;; Build a do form: (do (def name1 (fn* ...)) (def name2 (fn* ...)) ... body...)
-        defs (mapv (fn [[fname fn-form]] (list 'def fname fn-form)) pairs)
+        defs (mapv (fn [[fname fn-form]]
+                     (let [fn-form (if (and (seq loc-meta) (not (meta fn-form)))
+                                    (with-meta fn-form loc-meta)
+                                    fn-form)]
+                       (list 'def fname fn-form)))
+                   pairs)
         ;; Wrap names in let bindings after defs so they're in local scope
         fn-names (mapv first pairs)
         let-bindings (vec (mapcat (fn [n] [n n]) fn-names))
@@ -1822,7 +1827,11 @@
                            ;; Host macros get &form and &env as first two args
                            (apply macro-fn form {} (rest form))
                            ;; SCI-defined macros just get the args directly
-                           (apply macro-fn (rest form)))]
+                           (apply macro-fn (rest form)))
+                ;; Preserve source location from original form on expanded form
+                expanded (if (and (seq? expanded) (meta form) (not (meta expanded)))
+                           (with-meta expanded (meta form))
+                           expanded)]
             [true expanded])
           [false form]))))))
 
