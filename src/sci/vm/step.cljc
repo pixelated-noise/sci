@@ -829,7 +829,13 @@
           (empty? init)       [nil nil (meta sym)]
           (and (= 2 (count init)) (string? (first init)))
           [(first init) (second init) (merge (meta sym) {:doc (first init)})]
-          :else               [nil (first init) (meta sym)])]
+          :else               [nil (first init) (meta sym)])
+        ;; Add source location from the form metadata
+        form-meta (meta (:expr frame))
+        meta-map (cond-> (or meta-map {})
+                   (:line form-meta) (assoc :line (:line form-meta)
+                                            :column (:column form-meta))
+                   (:current-file machine) (assoc :file (:current-file machine)))]
     ;; If metadata contains unevaluated forms, evaluate the map first
     (if (meta-needs-eval? meta-map)
       (-> machine
