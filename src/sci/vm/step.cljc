@@ -349,8 +349,10 @@
 (defn- check-recur-in-body
   "Check that recur only appears in tail position within a body.
    `tail?` indicates whether the current form is in tail position.
-   Throws if recur is found in non-tail position."
-  [form tail?]
+   `expected-argc` is the expected number of recur args (param count), or nil.
+   Throws if recur is found in non-tail position or with wrong arity."
+  ([form tail?] (check-recur-in-body form tail? nil))
+  ([form tail? expected-argc]
   (cond
     ;; Check inside vectors — not tail position
     (vector? form) (doseq [e form] (check-recur-in-body e false))
@@ -369,18 +371,22 @@
                  (symbol (name raw-head))
                  raw-head)]
       (cond
-        ;; (recur ...) — check if we're in tail position
+        ;; (recur ...) — check if we're in tail position and arity matches
         (= 'recur head)
-        (when-not tail?
-          (throw (ex-info "Can only recur from tail position"
-                          {:type :sci/error})))
+        (do (when-not tail?
+              (throw (ex-info "Can only recur from tail position"
+                              {:type :sci/error})))
+            (when (and expected-argc (not= expected-argc (count (rest form))))
+              (throw (ex-info (str "Mismatched argument count to recur, expected: "
+                                   expected-argc " args, got: " (count (rest form)))
+                              {:type :sci/error}))))
 
         ;; (if test then else) — test is not tail, branches inherit tail?
         (= 'if head)
         (let [[_ test then else] form]
           (check-recur-in-body test false)
-          (check-recur-in-body then tail?)
-          (when else (check-recur-in-body else tail?)))
+          (check-recur-in-body then tail? expected-argc)
+          (when else (check-recur-in-body else tail? expected-argc)))
 
         ;; (do expr...) — only last expr is tail
         (= 'do head)
@@ -388,24 +394,22 @@
           (when (seq exprs)
             (doseq [e (butlast exprs)]
               (check-recur-in-body e false))
-            (check-recur-in-body (last exprs) tail?)))
+            (check-recur-in-body (last exprs) tail? expected-argc)))
 
         ;; (let* [bindings...] body...) or (let ...) — only last body expr is tail
         (contains? '#{let* let letfn*} head)
         (let [[_ bindings & body] form]
-          ;; Check binding init exprs — not tail
           (doseq [[_ init] (partition 2 bindings)]
             (check-recur-in-body init false))
           (when (seq body)
             (doseq [e (butlast body)]
               (check-recur-in-body e false))
-            (check-recur-in-body (last body) tail?)))
+            (check-recur-in-body (last body) tail? expected-argc)))
 
         ;; (loop* [bindings...] body...) — body is a new recur target
-        ;; Don't check inside loop — it has its own recur target
         (= 'loop* head) nil
 
-        ;; (fn* ...) / (fn ...) / (letfn* ...) — new recur context, don't check inside
+        ;; (fn* ...) / (fn ...) / (letfn* ...) — new recur context
         (= 'fn* head) nil
         (= 'fn head) nil
         (= 'letfn* head) nil
@@ -414,20 +418,18 @@
         (= 'try head)
         (doseq [expr (rest form)]
           (if (and (seq? expr) (contains? #{'catch 'finally} (first expr)))
-            ;; catch/finally bodies — recur not allowed
             (doseq [e (rest expr)]
               (check-recur-in-body e false))
-            ;; try body — recur not allowed
             (check-recur-in-body expr false)))
 
         ;; (case* ...) / (case ...) — result exprs inherit tail position
         (contains? '#{case* case} head)
         (let [[_ expr _ _ default case-map] form]
           (check-recur-in-body expr false)
-          (check-recur-in-body default tail?)
+          (check-recur-in-body default tail? expected-argc)
           (when (map? case-map)
             (doseq [[_ [_ result-expr]] case-map]
-              (check-recur-in-body result-expr tail?))))
+              (check-recur-in-body result-expr tail? expected-argc))))
 
         ;; (def ...) — init expr is not tail
         (= 'def head)
@@ -440,7 +442,7 @@
           (when (seq body)
             (doseq [e (butlast body)]
               (check-recur-in-body e false))
-            (check-recur-in-body (last body) tail?)))
+            (check-recur-in-body (last body) tail? expected-argc)))
 
         ;; Macros that pass tail position to their last arg
         (contains? '#{or and when when-not when-first} head)
@@ -448,30 +450,29 @@
           (when (seq args)
             (doseq [e (butlast args)]
               (check-recur-in-body e false))
-            (check-recur-in-body (last args) tail?)))
+            (check-recur-in-body (last args) tail? expected-argc)))
 
         ;; if-let/when-let/if-some/when-some — [binding] then else
         (contains? '#{if-let when-let if-some when-some} head)
         (let [[_ bindings & body] form]
-          ;; Binding vector — not tail
           (when (vector? bindings)
             (doseq [e bindings] (check-recur-in-body e false)))
-          ;; Body branches inherit tail position
-          (doseq [e body] (check-recur-in-body e tail?)))
+          (doseq [e body] (check-recur-in-body e tail? expected-argc)))
 
         ;; Any other list form — args are not tail
         :else
         (doseq [arg (rest form)]
-          (check-recur-in-body arg false))))))
+          (check-recur-in-body arg false)))))))
 
 (defn- check-recur-tail-position
   "Check that recur is only used in tail position within fn/loop arities."
   [arities]
-  (doseq [{:keys [body]} arities]
+  (doseq [{:keys [params body]} arities]
     (when (seq body)
-      (doseq [e (butlast body)]
-        (check-recur-in-body e false))
-      (check-recur-in-body (last body) true))))
+      (let [argc (count (remove #{'&} params))]
+        (doseq [e (butlast body)]
+          (check-recur-in-body e false))
+        (check-recur-in-body (last body) true argc)))))
 
 ;; ============================================================
 ;; fn*
@@ -529,10 +530,11 @@
 
 (defn step-eval-fn [machine frame]
   (let [parsed (parse-fn-form (:expr frame))
-        ;; Note: recur tail-position checking for fn* is not done here
-        ;; because host macro expansions (for, doseq, etc.) produce fn*
-        ;; with valid internal recur that our checker can't distinguish.
-        ;; The check IS done for loop* in step-eval-loop.
+        ;; Check recur tail position only for user-written fn* forms
+        ;; (those with :line metadata from the reader). Macro-expanded fn*
+        ;; (from for, doseq, etc.) has no reader metadata and is skipped.
+        _ (when (:line (meta (:expr frame)))
+            (check-recur-tail-position (:arities parsed)))
         closure-map {:type :closure
                      :name (:name parsed)
                      :arities (:arities parsed)
@@ -929,10 +931,9 @@
   (let [[_ bindings & body] (:expr frame)
         binding-pairs (vec (partition 2 bindings))
         body-vec (vec body)]
-    ;; Note: recur tail-position checking for loop* is not done here
-    ;; because host macro expansions (for, doseq, etc.) produce loop*
-    ;; with valid internal recur patterns that our checker rejects.
-    ;; The check is done in check-recur-in-body when processing fn bodies.
+    ;; Check recur tail position only for user-written loop* forms
+    (when (:line (meta (:expr frame)))
+      (check-recur-tail-position [{:params (mapv first binding-pairs) :body body-vec}]))
     (m/replace-frame machine {:op :loop-init
                               :bindings binding-pairs
                               :body body-vec
@@ -1000,7 +1001,7 @@
   (let [stack (:stack machine)]
     (loop [i (- (count stack) 2)]
       (if (neg? i)
-        (throw (ex-info "recur without matching target" {:type :sci/error}))
+        (throw (ex-info "Can only recur from tail position" {:type :sci/error}))
         (let [target (nth stack i)]
           (if (:recur-target target)
             (let [params (:params target)
