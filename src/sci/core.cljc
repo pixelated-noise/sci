@@ -399,6 +399,14 @@
                                              m))
                                          {} heap)))
                      :meta {:name 'ns-map}}
+                    ;; Override with-in-str to use VM binding (not host push-thread-bindings)
+                    (symbol "clojure.core" "with-in-str")
+                    {:val (fn sci-with-in-str [s & body]
+                            (list 'let ['s__in (list 'new 'clojure.lang.LineNumberingPushbackReader
+                                                     (list 'new 'java.io.StringReader s))]
+                                  (list* 'binding ['*in* 's__in] body)))
+                     :meta {:macro true :name 'with-in-str}
+                     :macro? true}
                     (symbol "clojure.core" "ns-unmap")
                     {:val (fn [ns-sym sym]
                             (let [qualified (symbol (str ns-sym) (str sym))]

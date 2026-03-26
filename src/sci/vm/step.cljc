@@ -960,12 +960,20 @@
 
 #?(:clj
    (defn- try-resolve-real-var
-     "If sym resolves to a real Clojure dynamic var, return it. Otherwise nil."
+     "If sym resolves to a real Clojure dynamic var, return it. Otherwise nil.
+      Also tries clojure.core/ prefix for user/ vars like user/*in* → clojure.core/*in*."
      [qualified]
      (try
-       (let [v (clojure.core/resolve qualified)]
-         (when (and (var? v) (.isDynamic ^clojure.lang.Var v))
-           v))
+       (or (let [v (clojure.core/resolve qualified)]
+             (when (and (var? v) (.isDynamic ^clojure.lang.Var v))
+               v))
+           ;; Try clojure.core/ version for user namespace vars
+           (when (and (namespace qualified)
+                      (not= "clojure.core" (namespace qualified)))
+             (let [core-sym (symbol "clojure.core" (name qualified))
+                   v (clojure.core/resolve core-sym)]
+               (when (and (var? v) (.isDynamic ^clojure.lang.Var v))
+                 v))))
        (catch Exception _ nil))))
 
 (defn step-binding-init [machine frame]
