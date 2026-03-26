@@ -1730,16 +1730,7 @@
                       (assoc :last-loc loc)
                       (cond-> (nil? (:top-loc machine)) (assoc :top-loc loc)))
                   machine)]
-    (let [classification (classify-form form)
-          ;; If classified as :special but the head is a local binding,
-          ;; treat as :invoke instead (e.g. (defn foo [fn] (fn 1)))
-          classification (if (and (= :special classification)
-                                  (seq? form)
-                                  (symbol? (first form))
-                                  (contains? (:env machine) (first form)))
-                           :invoke
-                           classification)]
-      (case classification
+    (case (classify-form form)
       :literal (step-eval-literal machine frame)
       :symbol  (step-eval-symbol machine frame)
       :vector  (step-eval-vector machine frame)
@@ -1795,7 +1786,7 @@
                      (m/replace-frame machine {:op :eval :expr head})
                      (step-eval-invoke machine frame)))
                  :cljs
-                 (step-eval-invoke machine frame)))))))))
+                 (step-eval-invoke machine frame))))))))
 
 ;; ============================================================
 ;; Main step function
