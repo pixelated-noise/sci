@@ -863,6 +863,15 @@
 
 (defn step-eval-def [machine frame]
   (let [[_ sym & init] (:expr frame)
+        ;; Validate def arguments
+        _ (when (and (symbol? sym) (namespace sym))
+            (throw (ex-info (str "Can't def a qualified name: " sym
+                                 ". Def requires a simple symbol.")
+                            {:type :sci/error})))
+        _ (when (or (> (count init) 2)
+                    (and (= 2 (count init)) (not (string? (first init)))))
+            (throw (ex-info "Too many arguments to def"
+                            {:type :sci/error})))
         ;; Handle (def name docstring init-expr)
         [doc-str init-expr meta-map]
         (cond
