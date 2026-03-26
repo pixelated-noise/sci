@@ -268,29 +268,60 @@
                     (symbol "clojure.core" "macroexpand-1")
                     {:val (fn sci-macroexpand-1
                             ([form]
-                             (if (and (seq? form) (symbol? (first form)))
+                             (if-not (and (seq? form) (symbol? (first form)))
+                               form
                                (let [head (first form)
-                                     heap @heap-atom
-                                     sym-name (name head)
-                                     sym-ns (clojure.core/namespace head)
-                                     candidates (if sym-ns
-                                                  [(symbol sym-ns sym-name)]
-                                                  [(symbol "user" sym-name)
-                                                   (symbol "clojure.core" sym-name)])
-                                     macro-entry (some #(let [e (get heap %)]
-                                                          (when (:macro? e) e))
-                                                       candidates)]
-                                 (if macro-entry
-                                   (let [mv (:val macro-entry)
-                                         mf (if (var? mv) @mv mv)]
-                                     (if (var? mv)
-                                       (apply mf form {} (rest form))
-                                       (apply mf (rest form))))
-                                   form))
-                               form))
+                                     n (name head)]
+                                 (cond
+                                   ;; .method sugar → (. obj method args...)
+                                   (and #?(:clj (.startsWith ^String n ".")
+                                           :cljs (= "." (subs n 0 1)))
+                                        (not= n "..")
+                                        (> (count n) 1))
+                                   (let [method (symbol (subs n 1))
+                                         [_ obj & args] form]
+                                     (list* '. obj method args))
+
+                                   ;; Constructor. sugar → (new ClassName args...)
+                                   #?(:clj (.endsWith ^String n ".")
+                                      :cljs (= "." (subs n (dec (count n)))))
+                                   (let [class-name (symbol (subs n 0 (dec (count n))))]
+                                     (list* 'new class-name (rest form)))
+
+                                   ;; Macro expansion
+                                   :else
+                                   (let [heap @heap-atom
+                                         sym-ns (clojure.core/namespace head)
+                                         candidates (if sym-ns
+                                                      [(symbol sym-ns n)]
+                                                      [(symbol "user" n)
+                                                       (symbol "clojure.core" n)])
+                                         macro-entry (some #(let [e (get heap %)]
+                                                              (when (:macro? e) e))
+                                                           candidates)]
+                                     (if macro-entry
+                                       (let [mv (:val macro-entry)
+                                             mf (if (var? mv) @mv mv)]
+                                         (if (var? mv)
+                                           (apply mf form {} (rest form))
+                                           (apply mf (rest form))))
+                                       form))))))
                             ([env form]
-                             (sci-macroexpand-1 form)))
+                             ;; If the head symbol is in the env, don't expand
+                             (if (and (seq? form) (symbol? (first form))
+                                      (contains? env (first form)))
+                               form
+                               (sci-macroexpand-1 form))))
                      :meta {:name 'macroexpand-1}}
+                    (symbol "clojure.core" "macroexpand")
+                    {:val (fn sci-macroexpand [form]
+                            (let [me1-fn (:val (get @heap-atom (symbol "clojure.core" "macroexpand-1")))]
+                              (loop [f form]
+                                (let [expanded (me1-fn f)]
+                                  (if (= expanded f)
+                                    f
+                                    (recur expanded))))))
+                     :meta {:name 'macroexpand}}
                     (symbol "clojure.core" "bound?")
                     {:val (fn [& vars]
                             (every? (fn [v]
