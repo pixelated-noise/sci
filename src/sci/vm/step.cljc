@@ -373,10 +373,13 @@
       (cond
         ;; (recur ...) — check if we're in tail position and arity matches
         (= 'recur head)
-        (do (when-not tail?
+        (do (when (= expected-argc :in-try)
+              (throw (ex-info "Cannot recur across try"
+                              {:type :sci/error})))
+            (when-not tail?
               (throw (ex-info "Can only recur from tail position"
                               {:type :sci/error})))
-            (when (and expected-argc (not= expected-argc (count (rest form))))
+            (when (and (number? expected-argc) (not= expected-argc (count (rest form))))
               (throw (ex-info (str "Mismatched argument count to recur, expected: "
                                    expected-argc " args, got: " (count (rest form)))
                               {:type :sci/error}))))
@@ -409,16 +412,33 @@
         ;; (loop* [bindings...] body...) — body is a new recur target
         (= 'loop* head) nil
 
-        ;; (fn* ...) / (fn ...) / (letfn* ...) / (defn ...) — new recur context, don't descend
-        (contains? '#{fn* fn letfn* defn defn- letfn reify} head) nil
+        ;; (fn* ...) / (fn ...) / (letfn* ...) — new recur context, don't descend
+        (contains? '#{fn* fn letfn* letfn reify} head) nil
 
-        ;; (try ...) — recur not allowed in try/catch/finally
+        ;; (defn name [params] body) — new recur context, but check body
+        (contains? '#{defn defn-} head)
+        (let [args (rest form)
+              ;; Skip name, docstring?, attr-map?
+              args (if (symbol? (first args)) (rest args) args)
+              args (if (string? (first args)) (rest args) args)
+              args (if (map? (first args)) (rest args) args)]
+          (when (vector? (first args))
+            ;; Single arity: [params] body...
+            (let [params (first args)
+                  body (rest args)
+                  argc (count (remove #{'&} params))]
+              (when (seq body)
+                (doseq [e (butlast body)]
+                  (check-recur-in-body e false))
+                (check-recur-in-body (last body) true argc)))))
+
+        ;; (try ...) — recur not allowed across try
         (= 'try head)
         (doseq [expr (rest form)]
           (if (and (seq? expr) (contains? #{'catch 'finally} (first expr)))
             (doseq [e (rest expr)]
-              (check-recur-in-body e false))
-            (check-recur-in-body expr false)))
+              (check-recur-in-body e false :in-try))
+            (check-recur-in-body expr false :in-try)))
 
         ;; (case* ...) / (case ...) — result exprs inherit tail position
         (contains? '#{case* case} head)
@@ -842,7 +862,8 @@
           (m/replace-frame {:op :def-with-meta
                             :sym sym
                             :init init
-                            :init-expr init-expr})
+                            :init-expr init-expr
+                            :form-meta (meta (:expr frame))})
           (m/push-frame {:op :eval :expr (into {} meta-map)}))
     (if (and (nil? init-expr) (empty? init))
       (let [ns-sym (:current-ns machine)
@@ -862,11 +883,18 @@
             (m/push-value (sci.lang/->Var (symbol (name qualified)) nil
                                           (assoc meta-map :sci.impl/var-sym qualified)
                                           (:dynamic meta-map)))))
-      (-> machine
-          (m/replace-frame {:op :def :sym sym
-                            :ns-sym (:current-ns machine)
-                            :meta-map meta-map})
-          (m/push-frame {:op :eval :expr init-expr}))))))
+      (let [;; Propagate :line from the def form to init-expr (for recur checking)
+            init-expr (if (and (seq? init-expr)
+                               (not (:line (meta init-expr)))
+                               (:line (meta (:expr frame))))
+                        (with-meta init-expr
+                          (select-keys (meta (:expr frame)) [:line :column]))
+                        init-expr)]
+        (-> machine
+            (m/replace-frame {:op :def :sym sym
+                              :ns-sym (:current-ns machine)
+                              :meta-map meta-map})
+            (m/push-frame {:op :eval :expr init-expr})))))))
 
 (defn step-def-with-meta
   "Continue def after metadata has been evaluated."
@@ -892,11 +920,17 @@
                                           (assoc meta-map :sci.impl/var-sym qualified)
                                           (:dynamic meta-map)))))
       ;; def with init — push eval frame for the init expression
-      (-> machine
-          (m/replace-frame {:op :def :sym sym
-                            :ns-sym (:current-ns machine)
-                            :meta-map meta-map})
-          (m/push-frame {:op :eval :expr init-expr})))))
+      (let [form-meta (:form-meta frame)
+            init-expr (if (and (seq? init-expr)
+                               (not (:line (meta init-expr)))
+                               (:line form-meta))
+                        (with-meta init-expr (select-keys form-meta [:line :column]))
+                        init-expr)]
+        (-> machine
+            (m/replace-frame {:op :def :sym sym
+                              :ns-sym (:current-ns machine)
+                              :meta-map meta-map})
+            (m/push-frame {:op :eval :expr init-expr}))))))
 
 (defn step-def [machine frame]
   (let [sym (:sym frame)
@@ -1812,10 +1846,11 @@
           ;; (e.g. clojure.core/fn is a macro but fn* is the special form we want)
           bare (when (symbol? head) (symbol (name head)))]
       (if (and bare (contains? special-forms bare))
-        ;; Rewrite qualified special form to unqualified
+        ;; Rewrite qualified special form to unqualified, preserving metadata
         (if (= head bare)
           [false form]
-          [true (cons bare (rest form))])
+          (let [rewritten (cons bare (rest form))]
+            [true (if (meta form) (with-meta rewritten (meta form)) rewritten)]))
 
         (if (and (symbol? head) (contains? (:env machine) head))
         ;; Head is a local binding — don't macro-expand
@@ -1829,8 +1864,9 @@
                            ;; SCI-defined macros just get the args directly
                            (apply macro-fn (rest form)))
                 ;; Preserve source location from original form on expanded form
-                expanded (if (and (seq? expanded) (meta form) (not (meta expanded)))
-                           (with-meta expanded (meta form))
+                expanded (if (and (seq? expanded) (:line (meta form)))
+                           (with-meta expanded
+                             (merge (meta expanded) (select-keys (meta form) [:line :column])))
                            expanded)]
             [true expanded])
           [false form]))))))
