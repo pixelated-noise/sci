@@ -853,7 +853,9 @@
           (swap! a assoc qualified entry))
         (-> machine
             (assoc-in [:heap qualified] entry)
-            (m/push-value (sci.lang/->Var qualified nil meta-map (:dynamic meta-map)))))
+            (m/push-value (sci.lang/->Var (symbol (name qualified)) nil
+                                          (assoc meta-map :sci.impl/var-sym qualified)
+                                          (:dynamic meta-map)))))
       (-> machine
           (m/replace-frame {:op :def :sym sym
                             :ns-sym (:current-ns machine)
@@ -880,7 +882,9 @@
           (swap! a assoc qualified entry))
         (-> machine
             (assoc-in [:heap qualified] entry)
-            (m/push-value (sci.lang/->Var qualified nil meta-map (:dynamic meta-map)))))
+            (m/push-value (sci.lang/->Var (symbol (name qualified)) nil
+                                          (assoc meta-map :sci.impl/var-sym qualified)
+                                          (:dynamic meta-map)))))
       ;; def with init — push eval frame for the init expression
       (-> machine
           (m/replace-frame {:op :def :sym sym
@@ -900,7 +904,9 @@
       (swap! a assoc qualified entry))
     (-> machine
         (assoc-in [:heap qualified] entry)
-        (m/push-value (sci.lang/->Var qualified val meta-map (:dynamic meta-map))))))
+        (m/push-value (sci.lang/->Var (symbol (name qualified)) val
+                                      (assoc meta-map :sci.impl/var-sym qualified)
+                                      (:dynamic meta-map))))))
 
 ;; ============================================================
 ;; quote
@@ -1070,11 +1076,12 @@
                             local-q)))))
         entry (get heap qualified)
         ;; Create an SCI var-like object
-        var-obj (sci.lang/->Var qualified
+        var-obj (sci.lang/->Var (symbol (name qualified))
                                (:val entry)
                                (merge (:meta entry)
                                       {:name (symbol (name qualified))
-                                       :ns (symbol (namespace qualified))})
+                                       :ns (symbol (namespace qualified))
+                                       :sci.impl/var-sym qualified})
                                (:dynamic? entry))]
     (m/push-value machine var-obj)))
 

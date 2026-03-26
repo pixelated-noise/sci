@@ -878,6 +878,8 @@
   "Get the fully qualified symbol for a var-like value."
   [v]
   (cond
+    (instance? sci.lang.Var v) (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var v))
+                                   (.-sym ^sci.lang.Var v))
     (var? v) (let [m (meta v)] (symbol (str (:ns m)) (str (:name m))))
     :else nil))
 

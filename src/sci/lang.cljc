@@ -31,7 +31,7 @@
              (invoke [_ a b c d e f g] (val a b c d e f g))
              (applyTo [_ args] (clojure.lang.AFn/applyToHelper val args))
              Object
-             (toString [_] (str "#'" sym))]
+             (toString [_] (str "#'" (or (:sci.impl/var-sym meta-map) sym)))]
       :cljs [IDeref
              (-deref [_] val)
              IMeta
@@ -46,7 +46,7 @@
 
 #?(:clj
    (defmethod print-method Var [^Var v ^java.io.Writer w]
-     (.write w (str "#'" (.-sym v)))))
+     (.write w (str "#'" (or (:sci.impl/var-sym (.-meta-map v)) (.-sym v))))))
 
 #?(:clj
    (defn ^:static cloneThreadBindings
