@@ -10,7 +10,8 @@
    - (run-all)                           — run all SCI test namespaces
    - (bisect-hanging 'sci.core-test)    — binary search for the hanging test"
   (:require [clojure.test :as t]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [sci.vm.step]))
 
 ;; ============================================================
 ;; Internals
@@ -60,7 +61,8 @@
         start (System/nanoTime)
         fut (future
               (binding [t/*report-counters* counters
-                        t/*testing-vars* []]
+                        t/*testing-vars* []
+                        sci.vm.step/*max-steps* 1000000]
                 (try
                   (t/test-var v)
                   (catch Throwable e
