@@ -172,6 +172,14 @@
 (defn step-eval-literal [machine frame]
   (m/push-value machine (:expr frame)))
 
+(defn- meta-needs-eval?
+  "Check if any values in a metadata map need evaluation (are non-literal forms)."
+  [meta-map]
+  (and meta-map
+       (some (fn [[_ v]]
+               (and (seq? v) (not (nil? v))))
+             meta-map)))
+
 (defn step-eval-symbol [machine frame]
   (let [sym (:expr frame)]
     ;; Permission check is done at call sites (step-eval-special, invoke),
@@ -182,7 +190,11 @@
   (let [exprs (:expr frame)
         form-meta (meta (:expr frame))]
     (if (empty? exprs)
-      (m/push-value machine (if form-meta (with-meta [] form-meta) []))
+      (if (meta-needs-eval? form-meta)
+        (-> machine
+            (m/replace-frame {:op :apply-meta :value []})
+            (m/push-frame {:op :eval :expr (into {} form-meta)}))
+        (m/push-value machine (if form-meta (with-meta [] form-meta) [])))
       (-> machine
           (m/replace-frame {:op :eval-coll :coll-type :vector
                             :pending (subvec exprs 1) :done []
@@ -194,7 +206,11 @@
         form-meta (meta (:expr frame))
         flat (reduce-kv (fn [acc k v] (conj acc k v)) [] exprs)]
     (if (empty? flat)
-      (m/push-value machine (if form-meta (with-meta {} form-meta) {}))
+      (if (meta-needs-eval? form-meta)
+        (-> machine
+            (m/replace-frame {:op :apply-meta :value {}})
+            (m/push-frame {:op :eval :expr (into {} form-meta)}))
+        (m/push-value machine (if form-meta (with-meta {} form-meta) {})))
       (-> machine
           (m/replace-frame {:op :eval-coll :coll-type :map
                             :pending (vec (rest flat)) :done []
@@ -205,7 +221,11 @@
   (let [exprs (vec (:expr frame))
         form-meta (meta (:expr frame))]
     (if (empty? exprs)
-      (m/push-value machine (if form-meta (with-meta #{} form-meta) #{}))
+      (if (meta-needs-eval? form-meta)
+        (-> machine
+            (m/replace-frame {:op :apply-meta :value #{}})
+            (m/push-frame {:op :eval :expr (into {} form-meta)}))
+        (m/push-value machine (if form-meta (with-meta #{} form-meta) #{})))
       (-> machine
           (m/replace-frame {:op :eval-coll :coll-type :set
                             :pending (vec (rest exprs)) :done []
@@ -229,14 +249,28 @@
                               (throw (ex-info (str "Duplicate key: "
                                                    (pr-str (first (filter #(> (count (filter #{%} ks)) 1) ks))))
                                               {:type :sci/error})))
-                            (apply hash-map done)))
-            val (if-let [fm (:form-meta frame)]
-                  (with-meta raw fm)
-                  raw)]
-        (m/push-value machine val))
+                            (apply array-map done)))
+            fm (:form-meta frame)]
+        (if (and fm (meta-needs-eval? fm))
+          ;; Metadata has unevaluated forms — evaluate it first
+          (-> machine
+              (m/replace-frame {:op :apply-meta :value raw})
+              (m/push-frame {:op :eval :expr (into {} fm)}))
+          ;; Apply metadata as-is
+          (let [val (if fm (with-meta raw fm) raw)]
+            (m/push-value machine val))))
       (-> machine
           (m/replace-frame (assoc frame :done done :pending (vec (rest pending))))
           (m/push-frame {:op :eval :expr (first pending)})))))
+
+(defn step-apply-meta [machine frame]
+  (let [val (:value frame)
+        evaled-meta (:result machine)
+        ;; Merge with existing metadata (preserve :sci/closure etc.)
+        new-meta (if (meta val)
+                   (merge (meta val) evaled-meta)
+                   evaled-meta)]
+    (m/push-value machine (with-meta val new-meta))))
 
 ;; ============================================================
 ;; if
@@ -577,8 +611,20 @@
                      :name (:name parsed)
                      :arities (:arities parsed)
                      :env (:env machine)}
-        callable (make-callable-closure closure-map machine)]
-    (m/push-value machine callable)))
+        callable (make-callable-closure closure-map machine)
+        ;; Check for user metadata on the fn form (e.g. ^{:foo 1} (fn []))
+        form-meta (meta (:expr frame))
+        user-meta (when form-meta
+                    (dissoc form-meta :line :column :end-line :end-column))]
+    (if (meta-needs-eval? user-meta)
+      ;; Metadata needs evaluation — push eval frame
+      (-> machine
+          (m/replace-frame {:op :apply-meta :value callable})
+          (m/push-frame {:op :eval :expr (into {} user-meta)}))
+      ;; Apply user metadata directly (merged with closure meta)
+      (if (seq user-meta)
+        (m/push-value machine (vary-meta callable merge user-meta))
+        (m/push-value machine callable)))))
 
 ;; ============================================================
 ;; Function application
@@ -852,14 +898,6 @@
 ;; ============================================================
 ;; def
 ;; ============================================================
-
-(defn- meta-needs-eval?
-  "Check if any values in a metadata map need evaluation (are non-literal forms)."
-  [meta-map]
-  (and meta-map
-       (some (fn [[_ v]]
-               (and (seq? v) (not (nil? v))))
-             meta-map)))
 
 (defn step-eval-def [machine frame]
   (let [[_ sym & init] (:expr frame)
@@ -2030,6 +2068,7 @@
         :apply           (step-apply machine frame)
         :eval-args       (step-eval-args machine frame)
         :eval-coll       (step-eval-coll machine frame)
+        :apply-meta      (step-apply-meta machine frame)
         :if              (step-if machine frame)
         :do              (step-do machine frame)
         :let             (step-let machine frame)
