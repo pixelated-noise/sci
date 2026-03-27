@@ -138,7 +138,12 @@
                 current-ns (:current-ns machine)
                 current-ns-data (get ns-table current-ns)
                 resolved-ns (or (get (:aliases current-ns-data) (symbol sym-ns))
+                                ;; Global ns-aliases
+                                (get (:ns-aliases machine) (symbol sym-ns))
                                 (symbol sym-ns))
+                ;; Follow ns-aliases transitively
+                resolved-ns (or (get (:ns-aliases machine) resolved-ns)
+                                resolved-ns)
                 qualified (symbol (str resolved-ns) sym-name)]
             (if (contains? heap qualified)
               (:val (get heap qualified))
@@ -1704,8 +1709,9 @@
         ns-str (str ns-sym)
         has-entries? (some #(= ns-str (namespace %)) (keys heap))]
     (if (or has-entries?
-            (contains? (set host/default-namespaces) ns-sym))
-      machine ;; already loaded
+            (contains? (set host/default-namespaces) ns-sym)
+            (get (:ns-aliases machine) ns-sym)) ;; global ns-alias
+      machine ;; already loaded or aliased
       (if-let [load-fn (:load-fn machine)]
         (let [result (load-fn {:namespace ns-sym})]
           (if result

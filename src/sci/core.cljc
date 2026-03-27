@@ -69,7 +69,7 @@
 (defn init
   "Create an SCI context (the machine's initial state)."
   [opts]
-  (let [{:keys [bindings namespaces classes aliases imports
+  (let [{:keys [bindings namespaces classes aliases ns-aliases imports
                 features load-fn readers deny allow]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
@@ -127,6 +127,7 @@
      :features (or features #{:clj})
      :load-fn load-fn
      :readers readers
+     :ns-aliases ns-aliases
      :deny deny
      :allow allow}))
 
@@ -548,7 +549,8 @@
                  (first forms)
                  (cons 'do forms))
           m (cond-> (assoc m :heap-atom heap-atom :ns-atom ns-atom)
-                (:load-fn ctx) (assoc :load-fn (:load-fn ctx)))]
+                (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
+                (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx)))]
       (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
