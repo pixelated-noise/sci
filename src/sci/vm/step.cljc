@@ -1709,12 +1709,13 @@
 (defn- load-ns-if-needed
   "If the namespace isn't loaded and a load-fn is available, load it."
   [machine ns-sym]
-  (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
-        ns-str (str ns-sym)
-        has-entries? (some #(= ns-str (namespace %)) (keys heap))]
-    (if (or has-entries?
-            (contains? (set host/default-namespaces) ns-sym)
-            (get (:ns-aliases machine) ns-sym)) ;; global ns-alias
+  (let [ns-table (:ns machine)
+        loaded? (contains? ns-table ns-sym)
+        ns-str (str ns-sym)]
+    (if (and (or loaded?
+                 (contains? (set host/default-namespaces) ns-sym)
+                 (get (:ns-aliases machine) ns-sym))
+             (not (:force-reload machine)))
       machine ;; already loaded or aliased
       (if-let [load-fn (:load-fn machine)]
         (let [result (load-fn {:namespace ns-sym})]
@@ -1735,10 +1736,10 @@
                                 :current-ns ns-sym)
                          (m/push-frame {:op :eval :expr expr}))]
               (run m2)
-              ;; Return machine with updated heap from atom
-              (if heap-atom
-                (assoc machine :heap @heap-atom)
-                machine))
+              ;; Return machine with updated heap and ns table
+              (cond-> machine
+                heap-atom (assoc :heap @heap-atom)
+                true (update :ns assoc ns-sym {:aliases {} :refers {} :imports {}})))
             (throw (ex-info (str "Could not locate " (clojure.string/replace ns-str "." "/")
                                 "__init.class, " (clojure.string/replace ns-str "." "/")
                                 ".clj or " (clojure.string/replace ns-str "." "/")
@@ -1813,7 +1814,15 @@
   (let [specs (rest (:expr frame))
         ;; Unquote specs — require args are quoted
         specs (map (fn [s] (if (and (seq? s) (= 'quote (first s))) (second s) s)) specs)
-        machine (reduce process-require-spec machine specs)]
+        ;; Extract flags (:reload, :reload-all)
+        flags (set (filter keyword? specs))
+        specs (remove keyword? specs)
+        ;; If :reload, force re-loading by clearing loaded ns entries
+        machine (if (or (:reload flags) (:reload-all flags))
+                  (assoc machine :force-reload true)
+                  machine)
+        machine (reduce process-require-spec machine specs)
+        machine (dissoc machine :force-reload)]
     (m/push-value (sync-ns-atom! machine) nil)))
 
 (defn step-eval-ns [machine frame]
