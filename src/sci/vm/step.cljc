@@ -2100,26 +2100,18 @@
         :binding-body    (step-binding-body machine frame)
         :set!-apply      (step-set!-apply machine frame)
         :suspend-apply   (step-suspend-apply machine frame)
-        :throw           (let [v (:result machine)
-                               loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
+        :throw           (let [v (:result machine)]
                            (if (instance? #?(:clj Throwable :cljs js/Error) v)
-                             ;; Wrap the original exception with location info
-                             (throw (ex-info (or (ex-message v) (str #?(:clj (.getName (class v)) :cljs "Error")))
-                                            (merge {:type :sci/error
-                                                    :message (ex-message v)
-                                                    :sci.impl/callstack (:callstack machine)}
-                                                   (when loc
-                                                     {:line (:line loc)
-                                                      :column (:column loc)
-                                                      :file (:file loc)}))
-                                            v))
-                             (throw (ex-info (str v)
-                                            (merge {:type :sci/error
-                                                    :sci.impl/callstack (:callstack machine)}
-                                                   (when loc
-                                                     {:line (:line loc)
-                                                      :column (:column loc)
-                                                      :file (:file loc)}))))))
+                             ;; Rethrow as-is (preserve user's ex-info data)
+                             (throw v)
+                             (let [loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
+                               (throw (ex-info (str v)
+                                              (merge {:type :sci/error
+                                                      :sci.impl/callstack (:callstack machine)}
+                                                     (when loc
+                                                       {:line (:line loc)
+                                                        :column (:column loc)
+                                                        :file (:file loc)})))))))
         (throw (ex-info (str "Unknown op: " (:op frame))
                         {:type :sci/error}))))))
 
@@ -2148,23 +2140,28 @@
                            (let [[_ class-sym _binding & _body] catch-form]
                              ;; Resolve the class
                              #?(:clj
-                                (try
-                                  (let [klass (if (= 'Exception class-sym)
-                                                Exception
-                                                (Class/forName (str class-sym)))]
-                                    (instance? klass ex))
-                                  (catch ClassNotFoundException _ false))
+                                (when-let [klass (try-resolve-class (str class-sym))]
+                                  ;; Check both the exception and its cause (for wrapped exceptions)
+                                  (or (instance? klass ex)
+                                      (when-let [cause (ex-cause ex)]
+                                        (instance? klass cause))))
                                 :cljs true)))
                          catches))]
       (if match
         (let [[_ _class-sym binding-sym & body] match
               ;; Truncate stack to the try frame
               new-stack (subvec (vec (:stack machine)) 0 idx)
-              ;; Restore env and bind exception
+              ;; Restore env and bind exception (use cause if wrapper didn't match directly)
+              [_ catch-class-sym] match
+              bound-ex #?(:clj (let [klass (or (try-resolve-class (str catch-class-sym)) Exception)]
+                                 (if (instance? klass ex)
+                                   ex
+                                   (or (ex-cause ex) ex)))
+                          :cljs ex)
               m (-> machine
                     (assoc :stack new-stack
                            :status :running)
-                    (update :env assoc binding-sym ex))]
+                    (update :env assoc binding-sym bound-ex))]
           ;; Evaluate catch body
           (if (seq body)
             (let [catch-body-frame {:op :try
