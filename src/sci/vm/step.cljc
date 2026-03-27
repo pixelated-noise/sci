@@ -1,8 +1,10 @@
 (ns sci.vm.step
   "The step function — heart of the VM. Each step processes one frame."
   (:require [sci.vm.machine :as m]
+            [sci.vm.host :as host]
             [sci.lang]
-            [clojure.string]))
+            [clojure.string]
+            [edamame.core :as edamame]))
 
 (declare match-arity bind-params run check-permission form-location do-extend)
 
@@ -23,8 +25,8 @@
 ;; ============================================================
 
 (def special-forms
-  '#{if do let* fn* def quote var loop* recur try catch
-     finally throw set! new . defmacro case* import*
+  '#{if do let* fn* def quote var loop* recur try
+     throw set! new . defmacro case* import*
      ns in-ns require letfn* binding
      defmulti defmethod remove-method prefer-method
      defprotocol extend extend-type extend-protocol
@@ -1133,9 +1135,18 @@
 (defn step-eval-try [machine frame]
   (let [form (:expr frame)
         clauses (rest form)
-        body (vec (remove #(and (seq? %) (contains? #{'catch 'finally} (first %))) clauses))
-        catches (vec (filter #(and (seq? %) (= 'catch (first %))) clauses))
+        body (vec (remove #(and (seq? %)
+                                (or (and (= 'catch (first %)) (>= (count %) 3))
+                                    (= 'finally (first %)))) clauses))
+        catches (vec (filter #(and (seq? %) (= 'catch (first %)) (>= (count %) 3)) clauses))
         finally-form (first (filter #(and (seq? %) (= 'finally (first %))) clauses))]
+    ;; Validate catch class names at compile time
+    #?(:clj (doseq [c catches]
+              (let [[_ class-sym] c]
+                (when (and (symbol? class-sym)
+                           (not (try-resolve-class (str class-sym))))
+                  (throw (ex-info (str "Unable to resolve classname: " class-sym)
+                                  {:type :sci/error}))))))
     (let [m (m/replace-frame machine {:op :try
                                        :catches catches
                                        :finally finally-form
@@ -1686,6 +1697,45 @@
         sync-ns-atom!
         (m/push-value ns-sym))))
 
+(defn- load-ns-if-needed
+  "If the namespace isn't loaded and a load-fn is available, load it."
+  [machine ns-sym]
+  (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+        ns-str (str ns-sym)
+        has-entries? (some #(= ns-str (namespace %)) (keys heap))]
+    (if (or has-entries?
+            (contains? (set host/default-namespaces) ns-sym))
+      machine ;; already loaded
+      (if-let [load-fn (:load-fn machine)]
+        (let [result (load-fn {:namespace ns-sym})]
+          (if result
+            ;; Evaluate the loaded source
+            (let [source (:source result)
+                  forms (edamame/parse-string-all source
+                          {:all true :read-cond :allow :features #{:clj}
+                           :fn true :quote true :var true :deref true :regex true
+                           :location? seq? :row-key :line :col-key :column})
+                  expr (if (= 1 (count forms)) (first forms) (cons 'do forms))
+                  heap-atom (:heap-atom machine)
+                  m2 (-> (m/make-machine {:heap (if heap-atom @heap-atom (:heap machine))
+                                           :ns-table (:ns machine)})
+                         (assoc :heap-atom heap-atom
+                                :ns-atom (:ns-atom machine)
+                                :load-fn load-fn
+                                :current-ns ns-sym)
+                         (m/push-frame {:op :eval :expr expr}))]
+              (run m2)
+              ;; Return machine with updated heap from atom
+              (if heap-atom
+                (assoc machine :heap @heap-atom)
+                machine))
+            (throw (ex-info (str "Could not locate " (clojure.string/replace ns-str "." "/")
+                                "__init.class, " (clojure.string/replace ns-str "." "/")
+                                ".clj or " (clojure.string/replace ns-str "." "/")
+                                ".cljc on classpath.")
+                           {:type :sci/error}))))
+        machine))))
+
 (defn- process-require-spec
   "Process a single require spec and update the machine's ns table."
   [machine spec]
@@ -1693,7 +1743,8 @@
     (cond
       ;; Simple symbol: (require 'foo)
       (symbol? spec)
-      (update-in machine [:ns current-ns :aliases] assoc spec spec)
+      (-> (load-ns-if-needed machine spec)
+          (update-in [:ns current-ns :aliases] assoc spec spec))
 
       ;; Vector spec: (require '[foo :as f :refer [x y]])
       ;; Or nested: (require '[clojure [set :refer [union]] [string :as str]])
@@ -1715,6 +1766,7 @@
                     (rest spec)))
           ;; Normal: [ns-sym :as alias :refer [syms]]
           (let [ns-sym first-elem
+                machine (load-ns-if-needed machine ns-sym)
                 opts (apply hash-map (rest spec))
                 alias-sym (:as opts)
                 refers (:refer opts)]

@@ -547,7 +547,8 @@
     (let [expr (if (= 1 (count forms))
                  (first forms)
                  (cons 'do forms))
-          m (assoc m :heap-atom heap-atom :ns-atom ns-atom)]
+          m (cond-> (assoc m :heap-atom heap-atom :ns-atom ns-atom)
+                (:load-fn ctx) (assoc :load-fn (:load-fn ctx)))]
       (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
