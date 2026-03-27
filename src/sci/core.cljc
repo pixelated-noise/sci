@@ -54,9 +54,13 @@
 
 (defn read-all
   "Read all forms from a string."
-  ([s] (read-all s 'user))
-  ([s current-ns]
-   (edamame/parse-string-all s (make-reader-opts current-ns))))
+  ([s] (read-all s 'user nil))
+  ([s current-ns] (read-all s current-ns nil))
+  ([s current-ns features]
+   (let [opts (make-reader-opts current-ns)]
+     (edamame/parse-string-all s (if features
+                                   (assoc opts :features features)
+                                   opts)))))
 
 ;; ============================================================
 ;; Context / init
@@ -541,7 +545,7 @@
          ;; Read all forms at once (syntax-quote resolved at read time)
          ;; For now, use a single read pass. Per-form reading with ns tracking
          ;; would be needed for full syntax-quote ns support across ns changes.
-         forms (read-all s)
+         forms (read-all s 'user (:features ctx))
          machine (make-machine-from-ctx ctx forms)]
      (step/run machine))))
 
@@ -796,7 +800,21 @@
 (defn merge-opts
   "Merge additional options into a context."
   [ctx opts]
-  (merge ctx opts))
+  (let [ctx (merge ctx (dissoc opts :namespaces :bindings))]
+    ;; Merge custom namespaces into heap
+    (if-let [namespaces (:namespaces opts)]
+      (let [heap (reduce-kv
+                  (fn [h ns-sym ns-map]
+                    (reduce-kv
+                     (fn [h2 sym val]
+                       (let [sym-name (if (symbol? sym) (name sym) (str sym))
+                             qualified (symbol (str ns-sym) sym-name)]
+                         (assoc h2 qualified {:val val :meta {} :dynamic? false})))
+                     h ns-map))
+                  (:heap ctx)
+                  namespaces)]
+        (assoc ctx :heap heap))
+      ctx)))
 
 ;; ============================================================
 ;; IO vars
