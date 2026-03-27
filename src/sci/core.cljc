@@ -56,10 +56,10 @@
   "Read all forms from a string."
   ([s] (read-all s 'user nil))
   ([s current-ns] (read-all s current-ns nil))
-  ([s current-ns features]
+  ([s current-ns extra-opts]
    (let [opts (make-reader-opts current-ns)]
-     (edamame/parse-string-all s (if features
-                                   (assoc opts :features features)
+     (edamame/parse-string-all s (if extra-opts
+                                   (merge opts extra-opts)
                                    opts)))))
 
 ;; ============================================================
@@ -164,7 +164,17 @@
                         m2 (assoc m2 :heap-atom heap-atom)
                         m2 (machine/push-frame m2 {:op :eval :expr form})]
                     (step/run m2)))
-        extra-heap {(symbol "clojure.core" "var?")
+        extra-heap {(symbol "clojure.core" "symbol")
+                    {:val (fn sci-symbol
+                            ([name]
+                             (if (instance? sci.lang.Var name)
+                               (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var name))
+                                   (.-sym ^sci.lang.Var name))
+                               (clojure.core/symbol name)))
+                            ([ns name]
+                             (clojure.core/symbol ns name)))
+                     :meta {:name 'symbol}}
+                    (symbol "clojure.core" "var?")
                     {:val (fn sci-var? [x]
                             (or (var? x) (instance? sci.lang.Var x)))
                      :meta {:name 'var?}}
@@ -545,7 +555,10 @@
          ;; Read all forms at once (syntax-quote resolved at read time)
          ;; For now, use a single read pass. Per-form reading with ns tracking
          ;; would be needed for full syntax-quote ns support across ns changes.
-         forms (read-all s 'user (:features ctx))
+         reader-opts (cond-> {}
+                       (:features ctx) (assoc :features (:features ctx))
+                       (:readers ctx) (assoc :readers (:readers ctx)))
+         forms (read-all s 'user reader-opts)
          machine (make-machine-from-ctx ctx forms)]
      (step/run machine))))
 

@@ -183,9 +183,18 @@
              meta-map)))
 
 (defn step-eval-symbol [machine frame]
-  (let [sym (:expr frame)]
-    ;; Permission check is done at call sites (step-eval-special, invoke),
-    ;; not for symbol resolution (variables, values)
+  (let [sym (:expr frame)
+        ;; Check if symbol resolves to a macro — can't use macro as value
+        _ (when-not (contains? (:env machine) sym)
+            (let [sym-name (name sym)
+                  heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                  ns-sym (:current-ns machine)
+                  candidates [(symbol (str ns-sym) sym-name)
+                              (symbol "clojure.core" sym-name)]
+                  entry (some #(get heap %) candidates)]
+              (when (:macro? entry)
+                (throw (ex-info (str "Can't take value of a macro: " sym)
+                                {:type :sci/error})))))]
     (m/push-value machine (resolve-symbol machine sym))))
 
 (defn step-eval-vector [machine frame]
