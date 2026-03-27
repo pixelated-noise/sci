@@ -372,14 +372,28 @@
                     {:val (fn
                             ([ns-sym name-sym]
                              (let [qualified (symbol (str ns-sym) (str name-sym))
-                                   entry {:val nil :meta {} :dynamic? false}]
+                                   existing (get @heap-atom qualified)
+                                   name-meta (meta name-sym)
+                                   entry (if existing
+                                           (update existing :meta merge name-meta)
+                                           {:val nil :meta (or name-meta {}) :dynamic? false})]
                                (swap! heap-atom assoc qualified entry)
-                               (sci.lang/->Var qualified nil {:name name-sym :ns ns-sym} false)))
+                               (sci.lang/->Var (symbol (str name-sym)) (:val entry)
+                                               (assoc (:meta entry) :name name-sym :ns ns-sym
+                                                      :sci.impl/var-sym qualified)
+                                               (:dynamic? entry))))
                             ([ns-sym name-sym val]
                              (let [qualified (symbol (str ns-sym) (str name-sym))
-                                   entry {:val val :meta {} :dynamic? false}]
+                                   existing (get @heap-atom qualified)
+                                   name-meta (meta name-sym)
+                                   entry (if existing
+                                           (-> existing (assoc :val val) (update :meta merge name-meta))
+                                           {:val val :meta (or name-meta {}) :dynamic? false})]
                                (swap! heap-atom assoc qualified entry)
-                               (sci.lang/->Var qualified val {:name name-sym :ns ns-sym} false))))
+                               (sci.lang/->Var (symbol (str name-sym)) val
+                                               (assoc (:meta entry) :name name-sym :ns ns-sym
+                                                      :sci.impl/var-sym qualified)
+                                               (:dynamic? entry)))))
                      :meta {:name 'intern}}
                     (symbol "clojure.core" "find-ns")
                     {:val (fn [sym] (when (get (:ns-table ctx) sym) sym))
@@ -731,7 +745,11 @@
 (defn intern
   "Intern a var."
   [ctx ns-sym var-name val]
-  ctx)
+  (let [qualified (symbol (str ns-sym) (str var-name))
+        entry {:val val :meta {} :dynamic? false :bound? true}]
+    (when-let [a (:heap-atom ctx)]
+      (swap! a assoc qualified entry))
+    (update ctx :heap assoc qualified entry)))
 
 ;; ============================================================
 ;; Dynamic binding macros
