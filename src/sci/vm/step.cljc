@@ -151,10 +151,10 @@
               #?(:clj
                  (if-let [klass (try-resolve-class sym-ns)]
                    (resolve-static-member klass sym-name)
-                   (throw (ex-info (str "Could not resolve symbol: " sym)
+                   (throw (ex-info (str "Unable to resolve symbol: " sym)
                                   {:type :sci/error :sym sym})))
                  :cljs
-                 (throw (ex-info (str "Could not resolve symbol: " sym)
+                 (throw (ex-info (str "Unable to resolve symbol: " sym)
                                  {:type :sci/error :sym sym})))))
           ;; Unqualified
           (let [ns-sym (:current-ns machine)
@@ -167,9 +167,9 @@
                 (if (contains? heap qualified) (:val (get heap qualified))
                   (if (contains? heap core-q) (:val (get heap core-q))
                     #?(:clj (or (try-resolve-class sym-name)
-                                (throw (ex-info (str "Could not resolve symbol: " sym)
+                                (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                 {:type :sci/error :sym sym})))
-                       :cljs (throw (ex-info (str "Could not resolve symbol: " sym)
+                       :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
                                              {:type :sci/error :sym sym})))))))))))))
 
 ;; ============================================================

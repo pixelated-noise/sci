@@ -122,7 +122,9 @@
                            (reduce-kv (fn [a k v] (assoc a k v)) {} aliases))
                    ns-table)]
     {:heap heap
+     :heap-atom (atom heap)
      :ns-table ns-table
+     :ns-atom (atom ns-table)
      :classes (or classes {})
      :features (or features #{:clj})
      :load-fn load-fn
@@ -134,7 +136,13 @@
 (defn fork
   "Create a fork of a context — an independent copy."
   [ctx]
-  (update ctx :heap #(or % {})))
+  (let [heap @(:heap-atom ctx)
+        ns-table @(:ns-atom ctx)]
+    (assoc ctx
+           :heap heap
+           :heap-atom (atom heap)
+           :ns-table ns-table
+           :ns-atom (atom ns-table))))
 
 ;; ============================================================
 ;; Evaluation
@@ -149,7 +157,7 @@
 (defn- make-machine-from-ctx
   "Create a fresh machine from a context and a list of forms."
   [ctx forms]
-  (let [heap-atom (atom (:heap ctx))
+  (let [heap-atom (or (:heap-atom ctx) (atom (:heap ctx)))
         ;; Inject VM-aware functions that need heap access
         resolve-fn (fn sci-resolve
                      ([sym] (sci-resolve 'user sym))
@@ -534,15 +542,15 @@
                                  eof-val
                                  result))))
                      :meta {:name 'read-string}}}
-        ns-atom (atom (:ns-table ctx))
+        ns-atom (or (:ns-atom ctx) (atom (:ns-table ctx)))
         ;; Override ns-aliases to read from ns-atom
-        heap (assoc (merge (:heap ctx) extra-heap)
+        heap (assoc (merge @heap-atom extra-heap)
                     (symbol "clojure.core" "ns-aliases")
                     {:val (fn [ns-sym] (or (:aliases (get @ns-atom ns-sym)) {}))
                      :meta {:name 'ns-aliases}})
         m (machine/make-machine
            {:heap heap
-            :ns-table (:ns-table ctx)
+            :ns-table @ns-atom
             :permissions {:allow (:allow ctx)
                           :deny (:deny ctx)}})]
     (let [expr (if (= 1 (count forms))
