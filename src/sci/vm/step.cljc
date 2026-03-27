@@ -795,7 +795,9 @@
                                                    (if amp amp (count params))))
                                                arities)]
                          (str "function of arity " (clojure.string/join ", " arity-counts))))]
-      (throw (ex-info (str "Wrong number of args (" argc ") passed to: " arity-desc)
+      (throw (ex-info (if fn-name
+                        (str "Cannot call " fn-name " with " argc " arguments")
+                        (str "Wrong number of args (" argc ") passed to: " arity-desc))
                       {:type :sci/error}))))))
 
 (defn bind-params [params args]
