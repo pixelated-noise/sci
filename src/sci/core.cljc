@@ -874,7 +874,15 @@
                      h ns-map))
                   (:heap ctx)
                   namespaces)]
-        (assoc ctx :heap heap))
+        ;; Update both the context heap and shared heap-atom
+        (let [new-entries (reduce-kv
+                           (fn [acc k v]
+                             (if (not= v (get (:heap ctx) k))
+                               (assoc acc k v) acc))
+                           {} heap)]
+          (when-let [a (:heap-atom ctx)]
+            (swap! a merge new-entries))
+          (assoc ctx :heap heap)))
       ctx)))
 
 ;; ============================================================
