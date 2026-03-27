@@ -125,6 +125,7 @@
      :heap-atom (atom heap)
      :ns-table ns-table
      :ns-atom (atom ns-table)
+     :current-ns-atom (atom 'user)
      :classes (or classes {})
      :features (or features #{:clj})
      :load-fn load-fn
@@ -142,7 +143,8 @@
            :heap heap
            :heap-atom (atom heap)
            :ns-table ns-table
-           :ns-atom (atom ns-table))))
+           :ns-atom (atom ns-table)
+           :current-ns-atom (atom @(:current-ns-atom ctx)))))
 
 ;; ============================================================
 ;; Evaluation
@@ -556,7 +558,10 @@
     (let [expr (if (= 1 (count forms))
                  (first forms)
                  (cons 'do forms))
-          m (cond-> (assoc m :heap-atom heap-atom :ns-atom ns-atom)
+          current-ns-atom (or (:current-ns-atom ctx) (atom 'user))
+          m (cond-> (assoc m :heap-atom heap-atom :ns-atom ns-atom
+                             :current-ns-atom current-ns-atom
+                             :current-ns @current-ns-atom)
                 (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
                 (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx)))]
       (reset! heap-atom heap)
@@ -938,12 +943,15 @@
   "Like eval-string but returns a map with :val and :ns."
   ([ctx s] (eval-string+ ctx s nil))
   ([ctx s opts]
-   (let [use-ctx (if-let [ns-val (:ns opts)]
-                   ctx ;; TODO: switch namespace
-                   ctx)
-         result (eval-string s use-ctx)]
+   (let [reader-opts (cond-> {}
+                       (:features ctx) (assoc :features (:features ctx))
+                       (:readers ctx) (assoc :readers (:readers ctx)))
+         forms (read-all s 'user reader-opts)
+         machine (make-machine-from-ctx ctx forms)
+         current-ns-atom (:current-ns-atom machine)
+         result (step/run machine)]
      {:val result
-      :ns (or (:ns opts) 'user)})))
+      :ns @current-ns-atom})))
 
 (defn resolve
   "Resolve a symbol in a context."

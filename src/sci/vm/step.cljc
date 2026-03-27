@@ -1698,6 +1698,8 @@
 
 (defn step-in-ns-apply [machine frame]
   (let [ns-sym (:result machine)]
+    (when-let [a (:current-ns-atom machine)]
+      (reset! a ns-sym))
     (-> machine
         (assoc :current-ns ns-sym)
         (update :ns #(if (get % ns-sym) % (assoc % ns-sym {:aliases {} :refers {} :imports {}})))
@@ -1818,6 +1820,8 @@
   ;; (ns name & references)
   ;; Simplified: switch namespace + process :require, :import etc.
   (let [[_ ns-sym & refs] (:expr frame)
+        _ (when-let [a (:current-ns-atom machine)]
+            (reset! a ns-sym))
         machine (-> machine
                     (assoc :current-ns ns-sym)
                     (update :ns #(if (get % ns-sym) % (assoc % ns-sym {:aliases {} :refers {} :imports {}}))))]
