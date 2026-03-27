@@ -165,14 +165,22 @@
                      ([sym] (sci-resolve 'user sym))
                      ([ns-sym sym]
                       (let [heap @heap-atom
-                            qualified (symbol (str ns-sym) (str sym))
-                            core-q (symbol "clojure.core" (str sym))
-                            entry (or (get heap qualified) (get heap core-q))]
+                            ;; Handle already-qualified symbols
+                            [qualified core-q]
+                            (if (qualified-symbol? sym)
+                              [sym nil]
+                              [(symbol (str ns-sym) (str sym))
+                               (symbol "clojure.core" (str sym))])
+                            entry (or (get heap qualified) (when core-q (get heap core-q)))]
                         (when entry
-                          (sci.lang/->Var (or (when (get heap qualified) qualified) core-q)
-                                         (:val entry)
-                                         (merge (:meta entry) {:name sym :ns (symbol (str ns-sym))})
-                                         (:dynamic? entry))))))
+                          (let [found-key (if (get heap qualified) qualified core-q)]
+                            (sci.lang/->Var (symbol (name found-key))
+                                           (:val entry)
+                                           (assoc (:meta entry)
+                                                  :name (symbol (name found-key))
+                                                  :ns (symbol (namespace found-key))
+                                                  :sci.impl/var-sym found-key)
+                                           (:dynamic? entry)))))))
         eval-fn (fn sci-eval [form]
                   (let [m2 (machine/make-machine {:heap @heap-atom
                                                    :ns-table (:ns-table ctx)
