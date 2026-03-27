@@ -139,6 +139,12 @@
 ;; Evaluation
 ;; ============================================================
 
+(defn- var-qualified-sym
+  "Get the qualified heap key for a sci.lang.Var."
+  [^sci.lang.Var v]
+  (or (:sci.impl/var-sym (.-meta-map v))
+      (.-sym v)))
+
 (defn- make-machine-from-ctx
   "Create a fresh machine from a context and a list of forms."
   [ctx forms]
@@ -182,7 +188,7 @@
                     {:val (fn sci-var-get [v]
                             (if (instance? sci.lang.Var v)
                               ;; Get latest value from heap-atom
-                              (let [sym (.-sym ^sci.lang.Var v)
+                              (let [sym (var-qualified-sym v)
                                     entry (get @heap-atom sym)]
                                 (if entry (:val entry) (.-val ^sci.lang.Var v)))
                               (var-get v)))
@@ -201,7 +207,7 @@
                     (symbol "clojure.core" "var-set")
                     {:val (fn sci-var-set [v val]
                             (if (instance? sci.lang.Var v)
-                              (let [sym (.-sym ^sci.lang.Var v)
+                              (let [sym (var-qualified-sym v)
                                     entry (assoc (get @heap-atom sym) :val val)]
                                 (swap! heap-atom assoc sym entry)
                                 val)
@@ -213,12 +219,12 @@
                                   clj-bindings (remove (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
                                   ;; Save old values for SCI vars
                                   old-vals (into {} (map (fn [[v _]]
-                                                           (let [sym (.-sym ^sci.lang.Var v)]
+                                                           (let [sym (var-qualified-sym v)]
                                                              [sym (:val (get @heap-atom sym))]))
                                                          sci-bindings))]
                               ;; Set new values
                               (doseq [[v new-val] sci-bindings]
-                                (let [sym (.-sym ^sci.lang.Var v)
+                                (let [sym (var-qualified-sym v)
                                       entry (assoc (get @heap-atom sym) :val new-val)]
                                   (swap! heap-atom assoc sym entry)))
                               (try
@@ -234,7 +240,7 @@
                     (symbol "clojure.core" "alter-var-root")
                     {:val (fn sci-alter-var-root [v f & args]
                             (if (instance? sci.lang.Var v)
-                              (let [sym (.-sym ^sci.lang.Var v)
+                              (let [sym (var-qualified-sym v)
                                     old-val (.-val ^sci.lang.Var v)
                                     new-val (apply f old-val args)
                                     entry {:val new-val
@@ -259,18 +265,18 @@
                     (symbol "clojure.core" "alter-meta!")
                     {:val (fn sci-alter-meta! [ref f & args]
                             (if (instance? sci.lang.Var ref)
-                              (let [sym (.-sym ^sci.lang.Var ref)
+                              (let [qualified (var-qualified-sym ref)
                                     old-meta (.-meta-map ^sci.lang.Var ref)
                                     new-meta (apply f old-meta args)
-                                    entry (get @heap-atom sym)]
-                                (swap! heap-atom assoc sym (assoc entry :meta new-meta))
+                                    entry (get @heap-atom qualified)]
+                                (swap! heap-atom assoc qualified (assoc entry :meta new-meta))
                                 new-meta)
                               (apply clojure.core/alter-meta! ref f args)))
                      :meta {:name 'alter-meta!}}
                     (symbol "clojure.core" "reset-meta!")
                     {:val (fn sci-reset-meta! [ref m]
                             (if (instance? sci.lang.Var ref)
-                              (let [sym (.-sym ^sci.lang.Var ref)
+                              (let [sym (var-qualified-sym ref)
                                     entry (get @heap-atom sym)]
                                 (swap! heap-atom assoc sym (assoc entry :meta m))
                                 m)
@@ -343,7 +349,7 @@
                     {:val (fn [& vars]
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
-                                        (let [sym (.-sym ^sci.lang.Var v)
+                                        (let [sym (var-qualified-sym v)
                                               entry (get @heap-atom sym)]
                                           (if entry
                                             (:bound? entry true)
