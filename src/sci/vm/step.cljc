@@ -1851,7 +1851,11 @@
         head (if (qualified-symbol? raw-head)
                (symbol (name raw-head))
                raw-head)]
-    (check-permission machine head)
+    ;; Only check permissions for user-written forms (with :line metadata).
+    ;; Macro-expanded special forms (e.g. loop*/recur from doseq) should not
+    ;; be blocked by deny lists since the user didn't write them directly.
+    (when (:line (meta (:expr frame)))
+      (check-permission machine head))
     (case head
       if       (step-eval-if machine frame)
       do       (step-eval-do machine frame)
@@ -2037,19 +2041,31 @@
         (m/replace-frame machine {:op :eval :expr new-form}))
 
       :invoke
-      ;; Only check deny list before macro expansion — allow list is checked
-      ;; after expansion on the resulting special forms
+      ;; Check both deny and allow lists for invoke forms
       (do (when (symbol? (first form))
-            (let [perms (:permissions machine)
-                  deny (:deny perms)]
-              (when (and deny (seq deny))
-                (let [sym (first form)
-                      sym-name (name sym)
-                      core-qualified (symbol "clojure.core" sym-name)]
-                  (when (or (contains? (set deny) sym)
-                            (contains? (set deny) core-qualified))
-                    (throw (ex-info (str sym " is not allowed!")
-                                    {:type :sci/error})))))))
+            (let [perms (:permissions machine)]
+              ;; Deny check
+              (let [deny (:deny perms)]
+                (when (and deny (seq deny))
+                  (let [sym (first form)
+                        sym-name (name sym)
+                        core-qualified (symbol "clojure.core" sym-name)]
+                    (when (or (contains? (set deny) sym)
+                              (contains? (set deny) core-qualified))
+                      (throw (ex-info (str sym " is not allowed!")
+                                      {:type :sci/error}))))))
+              ;; Allow check — only for user-written forms
+              (let [allow (:allow perms)]
+                (when (and allow (seq allow) (:line (meta form)))
+                  (let [sym (first form)
+                        sym-name (name sym)
+                        bare-sym (symbol sym-name)]
+                    (when-not (or (contains? always-allowed-for-allow-list bare-sym)
+                                  (contains? (set allow) sym)
+                                  (contains? (set allow) bare-sym)
+                                  (contains? (set allow) (symbol "clojure.core" sym-name)))
+                      (throw (ex-info (str sym " is not allowed!")
+                                      {:type :sci/error}))))))))
           (let [[expanded? new-form] (macroexpand-form machine form)]
             (if expanded?
               (m/replace-frame machine {:op :eval :expr new-form})
