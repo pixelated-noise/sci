@@ -173,11 +173,13 @@
   (m/push-value machine (:expr frame)))
 
 (defn- meta-needs-eval?
-  "Check if any values in a metadata map need evaluation (are non-literal forms)."
+  "Check if any values in a metadata map need evaluation (are non-literal forms
+   or have metadata that needs evaluation)."
   [meta-map]
   (and meta-map
        (some (fn [[_ v]]
-               (and (seq? v) (not (nil? v))))
+               (or (and (seq? v) (not (nil? v)))
+                   (meta-needs-eval? (meta v))))
              meta-map)))
 
 (defn step-eval-symbol [machine frame]
