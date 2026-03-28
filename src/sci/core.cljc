@@ -268,13 +268,16 @@
                     {:val (fn sci-alter-var-root [v f & args]
                             (if (instance? sci.lang.Var v)
                               (let [sym (var-qualified-sym v)
-                                    old-val (.-val ^sci.lang.Var v)
-                                    new-val (apply f old-val args)
-                                    entry {:val new-val
-                                           :meta (.-meta-map ^sci.lang.Var v)
-                                           :dynamic? (.-dynamic? ^sci.lang.Var v)}]
-                                (swap! heap-atom assoc sym entry)
-                                new-val)
+                                    result (atom nil)]
+                                ;; Atomic read-modify-write in single swap!
+                                (swap! heap-atom
+                                       (fn [h]
+                                         (let [entry (get h sym)
+                                               old-val (:val entry)
+                                               new-val (apply f old-val args)]
+                                           (reset! result new-val)
+                                           (assoc h sym (assoc entry :val new-val)))))
+                                @result)
                               (apply clojure.core/alter-var-root v f args)))
                      :meta {:name 'alter-var-root}}
                     (symbol "clojure.core" "meta")
