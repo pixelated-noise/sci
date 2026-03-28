@@ -336,8 +336,10 @@
                                      (list* '. obj method args))
 
                                    ;; Constructor. sugar → (new ClassName args...)
-                                   #?(:clj (.endsWith ^String n ".")
-                                      :cljs (= "." (subs n (dec (count n)))))
+                                   (and #?(:clj (.endsWith ^String n ".")
+                                           :cljs (= "." (subs n (dec (count n)))))
+                                        (not= n "..")
+                                        (> (count n) 1))
                                    (let [class-name (symbol (subs n 0 (dec (count n))))]
                                      (list* 'new class-name (rest form)))
 
@@ -431,12 +433,13 @@
                     (symbol "clojure.core" "create-ns")
                     {:val (fn [sym]
                             ;; Create namespace if it doesn't exist
-                            (when-let [a (:ns-atom ctx)]
-                              (swap! a (fn [ns-table]
-                                         (if (get ns-table sym)
-                                           ns-table
-                                           (assoc ns-table sym {:aliases {} :refers {} :imports {}})))))
-                            sym)
+                            (let [sym (if (string? sym) (symbol sym) sym)]
+                              (when-let [a (:ns-atom ctx)]
+                                (swap! a (fn [ns-table]
+                                           (if (get ns-table sym)
+                                             ns-table
+                                             (assoc ns-table sym {:aliases {} :refers {} :imports {}})))))
+                              sym))
                      :meta {:name 'create-ns}}
                     (symbol "clojure.core" "the-ns")
                     {:val (fn [sym]
@@ -451,7 +454,11 @@
                                                 {:type :sci/error})))))
                      :meta {:name 'the-ns}}
                     (symbol "clojure.core" "ns-name")
-                    {:val (fn [ns-sym] (if (symbol? ns-sym) ns-sym (clojure.core/ns-name ns-sym)))
+                    {:val (fn [ns-sym]
+                            (cond
+                              (symbol? ns-sym) ns-sym
+                              (string? ns-sym) (symbol ns-sym)
+                              :else (clojure.core/ns-name ns-sym)))
                      :meta {:name 'ns-name}}
                     (symbol "clojure.core" "all-ns")
                     {:val (fn [] (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
