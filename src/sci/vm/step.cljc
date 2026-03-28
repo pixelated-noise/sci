@@ -942,11 +942,14 @@
 
 (defn step-eval-def [machine frame]
   (let [[_ sym & init] (:expr frame)
-        ;; Validate def arguments
-        _ (when (and (symbol? sym) (namespace sym))
+        ;; Validate def arguments — allow qualified if namespace matches current
+        _ (when (and (symbol? sym) (namespace sym)
+                     (not= (symbol (namespace sym)) (:current-ns machine)))
             (throw (ex-info (str "Can't def a qualified name: " sym
                                  ". Def requires a simple symbol.")
                             {:type :sci/error})))
+        ;; Strip namespace if it matches current ns
+        sym (if (namespace sym) (symbol (name sym)) sym)
         _ (when (or (> (count init) 2)
                     (and (= 2 (count init)) (not (string? (first init)))))
             (throw (ex-info "Too many arguments to def"
@@ -1708,7 +1711,9 @@
       (swap! a assoc qualified entry))
     (-> machine
         (assoc-in [:heap qualified] entry)
-        (m/push-value (symbol (str ns-sym) (str macro-name))))))
+        (m/push-value (sci.lang/->Var (symbol (str macro-name)) callable
+                                      (assoc macro-meta :sci.impl/var-sym qualified)
+                                      false)))))
 
 ;; ============================================================
 ;; ns / in-ns / require
