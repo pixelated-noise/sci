@@ -269,16 +269,22 @@
                     {:val (fn sci-alter-var-root [v f & args]
                             (if (instance? sci.lang.Var v)
                               (let [sym (var-qualified-sym v)
-                                    result (atom nil)]
-                                ;; Atomic read-modify-write in single swap!
-                                (swap! heap-atom
-                                       (fn [h]
-                                         (let [entry (get h sym)
-                                               old-val (:val entry)
-                                               new-val (apply f old-val args)]
-                                           (reset! result new-val)
-                                           (assoc h sym (assoc entry :val new-val)))))
-                                @result)
+                                    ns-str (when sym (namespace sym))]
+                                ;; Check if built-in/read-only
+                                (when (and ns-str
+                                           (contains? (set (map str host/default-namespaces)) ns-str))
+                                  (throw (ex-info (str "Var " sym " is read-only")
+                                                  {:type :sci/error})))
+                                (let [result (atom nil)]
+                                  ;; Atomic read-modify-write in single swap!
+                                  (swap! heap-atom
+                                         (fn [h]
+                                           (let [entry (get h sym)
+                                                 old-val (:val entry)
+                                                 new-val (apply f old-val args)]
+                                             (reset! result new-val)
+                                             (assoc h sym (assoc entry :val new-val)))))
+                                  @result))
                               (apply clojure.core/alter-var-root v f args)))
                      :meta {:name 'alter-var-root}}
                     (symbol "clojure.core" "meta")
@@ -297,11 +303,17 @@
                     {:val (fn sci-alter-meta! [ref f & args]
                             (if (instance? sci.lang.Var ref)
                               (let [qualified (var-qualified-sym ref)
-                                    old-meta (.-meta-map ^sci.lang.Var ref)
-                                    new-meta (apply f old-meta args)
-                                    entry (get @heap-atom qualified)]
-                                (swap! heap-atom assoc qualified (assoc entry :meta new-meta))
-                                new-meta)
+                                    ns-str (when qualified (namespace qualified))]
+                                ;; Check if built-in/read-only
+                                (when (and ns-str
+                                           (contains? (set (map str host/default-namespaces)) ns-str))
+                                  (throw (ex-info (str "Var " qualified " is read-only")
+                                                  {:type :sci/error})))
+                                (let [old-meta (.-meta-map ^sci.lang.Var ref)
+                                      new-meta (apply f old-meta args)
+                                      entry (get @heap-atom qualified)]
+                                  (swap! heap-atom assoc qualified (assoc entry :meta new-meta))
+                                  new-meta))
                               (apply clojure.core/alter-meta! ref f args)))
                      :meta {:name 'alter-meta!}}
                     (symbol "clojure.core" "reset-meta!")
