@@ -154,7 +154,11 @@
                                 resolved-ns)
                 qualified (symbol (str resolved-ns) sym-name)]
             (if (contains? heap qualified)
-              (:val (get heap qualified))
+              (let [entry (get heap qualified)]
+                (if (and (not (:bound? entry true))
+                         (nil? (:val entry)))
+                  (sci.lang/->Unbound qualified)
+                  (:val entry)))
               ;; Try as Java static field/method
               #?(:clj
                  (if-let [klass (try-resolve-class sym-ns)]
@@ -716,8 +720,17 @@
                  ;; Instance access
                  (if (:field? frame)
                    (m/push-value machine (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))
-                   (m/push-value machine
-                     (clojure.lang.Reflector/invokeInstanceMethod f method-str (to-array []))))))
+                   ;; Special methods for sci.lang.Var
+                   (if (and (instance? sci.lang.Var f)
+                            (contains? #{"hasRoot" "isBound" "isDynamic" "get"} method-str))
+                     (m/push-value machine
+                       (case method-str
+                         "hasRoot" (some? (.-val ^sci.lang.Var f))
+                         "isBound" (some? (.-val ^sci.lang.Var f))
+                         "isDynamic" (boolean (.-dynamic? ^sci.lang.Var f))
+                         "get" (.-val ^sci.lang.Var f)))
+                     (m/push-value machine
+                       (clojure.lang.Reflector/invokeInstanceMethod f method-str (to-array [])))))))
              :cljs
              (throw (ex-info "Interop not supported in CLJS" {})))
           (:new? frame)

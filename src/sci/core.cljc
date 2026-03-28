@@ -401,7 +401,7 @@
                                    name-meta (meta name-sym)
                                    entry (if existing
                                            (update existing :meta merge name-meta)
-                                           {:val nil :meta (or name-meta {}) :dynamic? false})]
+                                           {:val nil :meta (or name-meta {}) :dynamic? false :bound? false})]
                                (swap! heap-atom assoc qualified entry)
                                (sci.lang/->Var (symbol (str name-sym)) (:val entry)
                                                (assoc (:meta entry) :name name-sym :ns ns-sym
@@ -471,8 +471,12 @@
                                   ns-str (str ns-sym)]
                               (reduce-kv (fn [m k v]
                                            (if (= ns-str (namespace k))
-                                             (assoc m (symbol (name k))
-                                                    (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
+                                             (let [var-meta (merge {:name (symbol (name k))
+                                                                    :ns (symbol (namespace k))}
+                                                                   (:meta v)
+                                                                   {:sci.impl/var-sym k})]
+                                               (assoc m (symbol (name k))
+                                                      (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
                                              m))
                                          {} heap)))
                      :meta {:name 'ns-publics}}
@@ -483,8 +487,12 @@
                                   ns-str (str ns-sym)]
                               (reduce-kv (fn [m k v]
                                            (if (= ns-str (namespace k))
-                                             (assoc m (symbol (name k))
-                                                    (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
+                                             (let [var-meta (merge {:name (symbol (name k))
+                                                                    :ns (symbol (namespace k))}
+                                                                   (:meta v)
+                                                                   {:sci.impl/var-sym k})]
+                                               (assoc m (symbol (name k))
+                                                      (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
                                              m))
                                          {} heap)))
                      :meta {:name 'ns-interns}}
@@ -509,8 +517,12 @@
                                            (let [k-ns (namespace k)]
                                              (if (or (= ns-str k-ns)
                                                      (= "clojure.core" k-ns))
-                                               (assoc m (symbol (name k))
-                                                      (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
+                                               (let [var-meta (merge {:name (symbol (name k))
+                                                                      :ns (symbol (namespace k))}
+                                                                     (:meta v)
+                                                                     {:sci.impl/var-sym k})]
+                                                 (assoc m (symbol (name k))
+                                                        (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
                                                m)))
                                          {} heap)))
                      :meta {:name 'ns-map}}
