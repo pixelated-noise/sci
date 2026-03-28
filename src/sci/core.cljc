@@ -526,6 +526,31 @@
                                                m)))
                                          {} heap)))
                      :meta {:name 'ns-map}}
+                    (symbol "clojure.core" "ns-refers")
+                    {:val (fn [ns-sym]
+                            ;; Returns all referred vars (clojure.core + explicit refers)
+                            (let [heap @heap-atom
+                                  ns-str (str ns-sym)]
+                              (reduce-kv (fn [m k v]
+                                           (let [k-ns (namespace k)
+                                                 k-name (name k)]
+                                             ;; Include clojure.core vars and vars from
+                                             ;; other namespaces that were referred into this ns
+                                             (if (and (not= ns-str k-ns)
+                                                      (or (= "clojure.core" k-ns)
+                                                          ;; Check if this var appears in this ns too
+                                                          ;; (from explicit refer)
+                                                          (get heap (symbol ns-str k-name))))
+                                               (let [var-meta (merge {:name (symbol k-name)
+                                                                      :ns (symbol k-ns)}
+                                                                     (:meta v)
+                                                                     {:sci.impl/var-sym k})]
+                                                 (assoc m (symbol k-name)
+                                                        (sci.lang/->Var (symbol k-name) (:val v)
+                                                                        var-meta (:dynamic? v))))
+                                               m)))
+                                         {} heap)))
+                     :meta {:name 'ns-refers}}
                     ;; Override with-in-str to use VM binding (not host push-thread-bindings)
                     (symbol "clojure.core" "with-in-str")
                     {:val (fn sci-with-in-str [s & body]
