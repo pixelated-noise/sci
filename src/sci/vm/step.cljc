@@ -1375,12 +1375,19 @@
       (-> machine
           (assoc-in [:dynamic-bindings qualified] val)
           (m/push-value val))
-      (let [entry (assoc (get (:heap machine) qualified) :val val)]
-        (when-let [a (:heap-atom machine)]
-          (swap! a assoc qualified entry))
-        (-> machine
-            (assoc-in [:heap qualified] entry)
-            (m/push-value val))))))
+      ;; Check if this is a dynamic var being set outside binding
+      (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+            entry (get heap qualified)]
+        (if (:dynamic? entry)
+          (throw (ex-info (str "Can't change/establish root binding of: #'" qualified
+                               " with set")
+                          {:type :sci/error}))
+          (let [entry (assoc entry :val val)]
+            (when-let [a (:heap-atom machine)]
+              (swap! a assoc qualified entry))
+            (-> machine
+                (assoc-in [:heap qualified] entry)
+                (m/push-value val))))))))
 
 ;; ============================================================
 ;; new
