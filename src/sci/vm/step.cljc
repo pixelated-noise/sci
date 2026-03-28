@@ -9,7 +9,7 @@
 (declare match-arity bind-params run check-permission form-location do-extend)
 
 ;; Shared dynamic bindings for closures called from host code (e.g. via map)
-(def ^:private current-dynamic-bindings (atom nil))
+(def current-dynamic-bindings (atom nil))
 
 ;; ============================================================
 ;; Helpers
@@ -164,7 +164,12 @@
             ;; Use if-let chain instead of or — or treats false/nil as "not found"
             (if (and dyn (contains? dyn qualified)) (get dyn qualified)
               (if (and dyn (contains? dyn core-q)) (get dyn core-q)
-                (if (contains? heap qualified) (:val (get heap qualified))
+                (if (contains? heap qualified)
+                  (let [entry (get heap qualified)]
+                    (if (and (not (:bound? entry true))
+                             (nil? (:val entry)))
+                      (sci.lang/->Unbound qualified)
+                      (:val entry)))
                   (if (contains? heap core-q) (:val (get heap core-q))
                     #?(:clj (or (try-resolve-class sym-name)
                                 (throw (ex-info (str "Unable to resolve symbol: " sym)
@@ -553,13 +558,22 @@
         [fname args] (if (symbol? (first args))
                        [(first args) (rest args)]
                        [nil args])
+        ;; Skip optional docstring
+        [docstring args] (if (string? (first args))
+                           [(first args) (rest args)]
+                           [nil args])
+        ;; Skip optional attr-map
+        [attr-map args] (if (and (map? (first args))
+                                 (not (vector? (first args))))
+                           [(first args) (rest args)]
+                           [nil args])
         arities (if (vector? (first args))
                   [{:params (vec (first args)) :body (vec (rest args))}]
                   (mapv (fn [arity-form]
                           {:params (vec (first arity-form))
                            :body (vec (rest arity-form))})
                         args))]
-    {:name fname :arities arities}))
+    {:name fname :arities arities :docstring docstring :attr-map attr-map}))
 
 (defn make-callable-closure
   "Create a closure that is both an IFn (so host code like `map` can call it)
@@ -627,6 +641,7 @@
             (check-recur-tail-position (:arities parsed)))
         closure-map {:type :closure
                      :name (:name parsed)
+                     :ns (:current-ns machine)
                      :arities (:arities parsed)
                      :env (:env machine)}
         callable (make-callable-closure closure-map machine)
@@ -795,9 +810,7 @@
                                                    (if amp amp (count params))))
                                                arities)]
                          (str "function of arity " (clojure.string/join ", " arity-counts))))]
-      (throw (ex-info (if fn-name
-                        (str "Cannot call " fn-name " with " argc " arguments")
-                        (str "Wrong number of args (" argc ") passed to: " arity-desc))
+      (throw (ex-info (str "Wrong number of args (" argc ") passed to: " arity-desc)
                       {:type :sci/error}))))))
 
 (defn bind-params [params args]
@@ -836,7 +849,12 @@
 
       ;; Closure
       (and (map? f) (= :closure (:type f)))
-      (let [arity (match-arity (:arities f) (count args) (:name f))
+      (let [;; Qualify the name for error messages
+            qualified-name (when-let [n (:name f)]
+                             (if (qualified-symbol? n) n
+                               (let [ns-sym (or (:ns f) (:current-ns machine))]
+                                 (symbol (str ns-sym) (str n)))))
+            arity (match-arity (:arities f) (count args) qualified-name)
             bindings (bind-params (:params arity) args)
             fn-env (merge (:env f)
                           bindings
@@ -1024,6 +1042,10 @@
         ns-sym (:ns-sym frame)
         qualified (symbol (str ns-sym) (str sym))
         val (:result machine)
+        ;; If the value is a closure (IFn with :sci/closure meta), update its name
+        val (if (and (fn? val) (:sci/closure (meta val)) (nil? (:name (meta val))))
+              (vary-meta val assoc :name sym :ns ns-sym)
+              val)
         meta-map (:meta-map frame)
         entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true}]
     ;; Update both the immutable heap and the shared atom
@@ -1671,7 +1693,14 @@
         callable (make-callable-closure closure-map machine)
         ns-sym (:current-ns machine)
         qualified (symbol (str ns-sym) (str macro-name))
-        entry {:val callable :meta {:macro true} :macro? true}]
+        macro-meta (merge {:macro true
+                           :name macro-name
+                           :ns ns-sym
+                           :arglists (apply list (mapv :params (:arities parsed)))}
+                          (when-let [ds (:docstring parsed)]
+                            {:doc ds})
+                          (:attr-map parsed))
+        entry {:val callable :meta macro-meta :macro? true}]
     (when-let [a (:heap-atom machine)]
       (swap! a assoc qualified entry))
     (-> machine
@@ -1826,14 +1855,28 @@
     (m/push-value (sync-ns-atom! machine) nil)))
 
 (defn step-eval-ns [machine frame]
-  ;; (ns name & references)
+  ;; (ns name docstring? attr-map? & references)
   ;; Simplified: switch namespace + process :require, :import etc.
-  (let [[_ ns-sym & refs] (:expr frame)
+  (let [[_ ns-sym & rest-form] (:expr frame)
+        ;; Skip optional docstring
+        [docstring rest-form] (if (string? (first rest-form))
+                                [(first rest-form) (next rest-form)]
+                                [nil rest-form])
+        ;; Skip optional attr-map
+        [attr-map refs] (if (and (map? (first rest-form))
+                                 (not (keyword? (ffirst rest-form))))
+                           [(first rest-form) (next rest-form)]
+                           [nil rest-form])
         _ (when-let [a (:current-ns-atom machine)]
             (reset! a ns-sym))
+        ns-meta (merge attr-map (when docstring {:doc docstring}))
         machine (-> machine
                     (assoc :current-ns ns-sym)
-                    (update :ns #(if (get % ns-sym) % (assoc % ns-sym {:aliases {} :refers {} :imports {}}))))]
+                    (update :ns #(let [existing (get % ns-sym)]
+                                   (assoc % ns-sym
+                                          (merge {:aliases {} :refers {} :imports {}}
+                                                 existing
+                                                 (when ns-meta ns-meta))))))]
     ;; Process references like (:require ...) (:import ...)
     (let [machine (reduce
                    (fn [m ref]

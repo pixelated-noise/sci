@@ -369,10 +369,13 @@
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
                                         (let [sym (var-qualified-sym v)
-                                              entry (get @heap-atom sym)]
-                                          (if entry
-                                            (:bound? entry true)
-                                            (some? (.-val ^sci.lang.Var v))))
+                                              entry (get @heap-atom sym)
+                                              dyn @step/current-dynamic-bindings]
+                                          (or (:bound? entry)
+                                              ;; Check if currently dynamically bound
+                                              (and dyn (contains? dyn sym))
+                                              ;; Fallback: check val directly
+                                              (some? (.-val ^sci.lang.Var v))))
                                         (clojure.core/bound? v)))
                                     vars))
                      :meta {:name 'bound?}}
@@ -515,6 +518,61 @@
                                   (list 'var name)))
                      :meta {:macro true :name 'defonce}
                      :macro? true}
+                    ;; doc — override host macro that uses host resolve
+                    (symbol "clojure.repl" "doc")
+                    {:val (fn sci-doc [sym-name]
+                            ;; Look up at expansion time (we have heap-atom closure)
+                            (let [heap @heap-atom
+                                  sym-str (str sym-name)
+                                  ;; Try to find as a var
+                                  candidates (if (qualified-symbol? sym-name)
+                                               [sym-name]
+                                               [(symbol "user" sym-str)
+                                                (symbol "clojure.core" sym-str)])
+                                  entry (some #(get heap %) candidates)
+                                  ;; Only show doc for entries with meaningful metadata
+                                  ;; (not bare bindings which have empty meta)
+                                  has-doc-meta? (and entry
+                                                     (let [m (:meta entry)]
+                                                       (or (:doc m) (:arglists m) (:name m)
+                                                           (:macro m))))
+                                  ns-data (when-let [na (:ns-atom ctx)]
+                                            (get @na sym-name))]
+                              (cond
+                                has-doc-meta?
+                                (list (list 'var 'clojure.repl/print-doc)
+                                      (list 'meta (list 'resolve (list 'quote sym-name))))
+                                ns-data
+                                (list (list 'var 'clojure.repl/print-doc)
+                                      (list 'quote {:name sym-name :doc (:doc ns-data)}))
+                                :else nil)))
+                     :meta {:macro true :name 'doc :doc "Prints documentation for a var or special form given its name,\n   or for a spec if given a keyword"}
+                     :macro? true}
+                    ;; find-doc — override host version that uses host ns-publics
+                    (symbol "clojure.repl" "find-doc")
+                    {:val (fn sci-find-doc [re-string-or-pattern]
+                            (let [re (re-pattern re-string-or-pattern)
+                                  heap @heap-atom
+                                  matches (->> heap
+                                               (filter (fn [[_ entry]]
+                                                         (let [m (:meta entry)]
+                                                           (and m (or (when-let [d (:doc m)]
+                                                                        (re-find re d))
+                                                                      (re-find re (str (:name m))))))))
+                                               (sort-by first))]
+                              (doseq [[qualified-sym entry] matches]
+                                ;; Format name as ns/name without using ns-name
+                                (let [m (merge (dissoc (:meta entry) :ns)
+                                               {:name qualified-sym})]
+                                  (#'clojure.repl/print-doc m)))
+                              ;; Also check namespace docs
+                              (when-let [ns-data @(or (:ns-atom ctx) (atom {}))]
+                                (doseq [[ns-sym ns-info] (sort-by first ns-data)]
+                                  (when-let [doc-str (:doc ns-info)]
+                                    (when (re-find re doc-str)
+                                      (#'clojure.repl/print-doc
+                                       {:name ns-sym :doc doc-str})))))))
+                     :meta {:name 'find-doc :doc "Prints documentation for any var whose documentation or name\n contains a match for re-string-or-pattern"}}
                     (symbol "clojure.core" "load-string")
                     {:val (fn sci-load-string [s]
                             (let [forms (read-all s)

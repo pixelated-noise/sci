@@ -29,12 +29,30 @@
 (def default-namespaces
   '[clojure.core clojure.string clojure.set clojure.walk clojure.edn clojure.repl])
 
+(defn- add-private-vars
+  "Add specific private vars needed by host macro expansions."
+  [heap]
+  #?(:clj
+     (let [privates [#'clojure.repl/print-doc
+                     #'clojure.repl/special-doc
+                     #'clojure.repl/namespace-doc]]
+       (reduce (fn [h v]
+                 (let [m (meta v)
+                       qualified (symbol (str (:ns m)) (str (:name m)))]
+                   (assoc h qualified {:val @v
+                                       :meta (select-keys m [:name :ns :doc :arglists])
+                                       :dynamic? (:dynamic m)})))
+               heap
+               privates))
+     :cljs heap))
+
 (defn default-heap
   "Build the default heap with all host functions."
   []
-  (reduce (fn [heap ns-sym] (merge heap (make-ns-registry ns-sym)))
-          {}
-          default-namespaces))
+  (-> (reduce (fn [heap ns-sym] (merge heap (make-ns-registry ns-sym)))
+              {}
+              default-namespaces)
+      (add-private-vars)))
 
 #?(:clj
    (defn inverse-registry

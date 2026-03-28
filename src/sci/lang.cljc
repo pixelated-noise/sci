@@ -48,6 +48,13 @@
    (defmethod print-method Var [^Var v ^java.io.Writer w]
      (.write w (str "#'" (or (:sci.impl/var-sym (.-meta-map v)) (.-sym v))))))
 
+;; Unbound — represents an unbound SCI var
+(deftype Unbound [sym]
+  #?@(:clj [Object
+             (toString [_] (str "Unbound: #'" sym))]
+      :cljs [IPrintWithWriter
+             (-pr-writer [_ writer _] (-write writer (str "Unbound: #'" sym)))]))
+
 #?(:clj
    (defn ^:static cloneThreadBindings
      "Clone the current thread bindings."
