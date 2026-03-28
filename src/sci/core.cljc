@@ -206,20 +206,22 @@
                     (symbol "clojure.core" "var-get")
                     {:val (fn sci-var-get [v]
                             (if (instance? sci.lang.Var v)
-                              ;; Get latest value from heap-atom
+                              ;; Check dynamic bindings first, then heap
                               (let [sym (var-qualified-sym v)
-                                    entry (get @heap-atom sym)]
-                                (if entry (:val entry) (.-val ^sci.lang.Var v)))
+                                    dyn @step/current-dynamic-bindings]
+                                (if (and dyn (contains? dyn sym))
+                                  (get dyn sym)
+                                  (let [entry (get @heap-atom sym)]
+                                    (if entry (:val entry) (.-val ^sci.lang.Var v)))))
                               (var-get v)))
                      :meta {:name 'var-get}}
                     (symbol "clojure.core" "thread-bound?")
                     {:val (fn sci-thread-bound? [& vars]
-                            ;; For SCI vars, check if they have dynamic bindings in the VM
-                            ;; This is a best-effort since we don't have the machine context
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
-                                        ;; SCI vars are considered bound if they have a value
-                                        (some? (.-val ^sci.lang.Var v))
+                                        (let [sym (var-qualified-sym v)
+                                              dyn @step/current-dynamic-bindings]
+                                          (and dyn (contains? dyn sym)))
                                         (clojure.core/thread-bound? v)))
                                     vars))
                      :meta {:name 'thread-bound?}}
@@ -227,9 +229,15 @@
                     {:val (fn sci-var-set [v val]
                             (if (instance? sci.lang.Var v)
                               (let [sym (var-qualified-sym v)
-                                    entry (assoc (get @heap-atom sym) :val val)]
-                                (swap! heap-atom assoc sym entry)
-                                val)
+                                    dyn @step/current-dynamic-bindings]
+                                (if (and dyn (contains? dyn sym))
+                                  ;; Update dynamic binding
+                                  (do (swap! step/current-dynamic-bindings assoc sym val)
+                                      val)
+                                  ;; Update heap
+                                  (let [entry (assoc (get @heap-atom sym) :val val)]
+                                    (swap! heap-atom assoc sym entry)
+                                    val)))
                               (var-set v val)))
                      :meta {:name 'var-set}}
                     (symbol "clojure.core" "with-redefs-fn")

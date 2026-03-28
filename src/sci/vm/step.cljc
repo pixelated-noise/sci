@@ -903,6 +903,11 @@
              (clojure.lang.Reflector/invokeConstructor
               ^Class f (to-array args)))])
 
+      ;; Unbound var
+      (instance? sci.lang.Unbound f)
+      (throw (ex-info (str "unbound fn: #'" (.-sym ^sci.lang.Unbound f))
+                      {:type :sci/error}))
+
       :else
       (throw (ex-info (str "Cannot call " (pr-str f) " as a function")
                       {:type :sci/error})))))
@@ -1261,6 +1266,12 @@
 
 (defn step-eval-binding [machine frame]
   (let [[_ bindings & body] (:expr frame)
+        _ (when-not (vector? bindings)
+            (throw (ex-info "binding requires a vector for its bindings"
+                            {:type :sci/error})))
+        _ (when (odd? (count bindings))
+            (throw (ex-info "binding requires an even number of forms in binding vector"
+                            {:type :sci/error})))
         pairs (vec (partition 2 bindings))]
     (-> machine
         (m/replace-frame {:op :binding-init
@@ -2361,11 +2372,19 @@
                    (when (and max-steps (>= steps max-steps))
                      (throw (ex-info "Execution limit reached"
                                      {:type :sci/error :steps steps})))
-                   (let [_ (reset! current-dynamic-bindings (:dynamic-bindings m))
+                   (let [pre-dyn (:dynamic-bindings m)
+                         _ (reset! current-dynamic-bindings pre-dyn)
                          next-m (try
                                   (step m)
                                   (catch #?(:clj Throwable :cljs :default) ex
-                                    (handle-exception m ex)))]
+                                    (handle-exception m ex)))
+                         ;; Sync back var-set changes: only if a host fn modified
+                         ;; current-dynamic-bindings (not if step itself changed it)
+                         post-dyn @current-dynamic-bindings
+                         next-m (if (identical? post-dyn pre-dyn)
+                                  next-m ;; No host-side changes
+                                  ;; Host fn modified bindings — merge into step result
+                                  (assoc next-m :dynamic-bindings post-dyn))]
                      (recur next-m (unchecked-inc steps))))
         :done    (:result m)
         :suspend m
