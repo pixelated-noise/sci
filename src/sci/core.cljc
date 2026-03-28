@@ -274,7 +274,7 @@
                             (let [m (meta obj)]
                               (cond
                                 (:sci/closure m)
-                                (let [cleaned (dissoc m :sci/closure :type :name :arities :env)]
+                                (let [cleaned (dissoc m :sci/closure :type :name :ns :arities :env)]
                                   (when (seq cleaned) cleaned))
                                 ;; Strip internal SCI keys from var/other metadata
                                 (:sci.impl/var-sym m)
@@ -407,22 +407,36 @@
                                                (:dynamic? entry)))))
                      :meta {:name 'intern}}
                     (symbol "clojure.core" "find-ns")
-                    {:val (fn [sym] (when (get (:ns-table ctx) sym) sym))
+                    {:val (fn [sym]
+                            (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
+                                  ns-info (get ns-data sym)]
+                              (when ns-info
+                                ;; Return symbol with namespace metadata (doc, etc.)
+                                (with-meta sym (select-keys ns-info [:doc])))))
                      :meta {:name 'find-ns}}
                     (symbol "clojure.core" "create-ns")
-                    {:val (fn [sym] sym)
+                    {:val (fn [sym]
+                            ;; Create namespace if it doesn't exist
+                            (when-let [a (:ns-atom ctx)]
+                              (swap! a (fn [ns-table]
+                                         (if (get ns-table sym)
+                                           ns-table
+                                           (assoc ns-table sym {:aliases {} :refers {} :imports {}})))))
+                            sym)
                      :meta {:name 'create-ns}}
                     (symbol "clojure.core" "the-ns")
                     {:val (fn [sym]
-                            (or (when (get (:ns-table ctx) sym) sym)
-                                (throw (ex-info (str "No namespace: " sym " found")
-                                               {:type :sci/error}))))
+                            (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
+                              (or (when (get ns-data sym) sym)
+                                  (throw (ex-info (str "No namespace: " sym " found")
+                                                  {:type :sci/error})))))
                      :meta {:name 'the-ns}}
                     (symbol "clojure.core" "ns-name")
                     {:val (fn [ns-sym] (if (symbol? ns-sym) ns-sym (clojure.core/ns-name ns-sym)))
                      :meta {:name 'ns-name}}
                     (symbol "clojure.core" "all-ns")
-                    {:val (fn [] (keys (:ns-table ctx)))
+                    {:val (fn [] (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
+                                   (keys ns-data)))
                      :meta {:name 'all-ns}}
                     (symbol "clojure.core" "ns-publics")
                     {:val (fn [ns-sym]
@@ -435,6 +449,18 @@
                                              m))
                                          {} heap)))
                      :meta {:name 'ns-publics}}
+                    (symbol "clojure.core" "ns-interns")
+                    {:val (fn [ns-sym]
+                            ;; In SCI, ns-interns is the same as ns-publics
+                            (let [heap @heap-atom
+                                  ns-str (str ns-sym)]
+                              (reduce-kv (fn [m k v]
+                                           (if (= ns-str (namespace k))
+                                             (assoc m (symbol (name k))
+                                                    (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
+                                             m))
+                                         {} heap)))
+                     :meta {:name 'ns-interns}}
                     (symbol "clojure.core" "*clojure-version*")
                     {:val {:major (:major *clojure-version*)
                            :minor (:minor *clojure-version*)
@@ -476,6 +502,20 @@
                     {:val (fn [ns-sym]
                             {}) ;; TODO: track imports properly
                      :meta {:name 'ns-imports}}
+                    (symbol "clojure.core" "remove-ns")
+                    {:val (fn [ns-sym]
+                            ;; Remove namespace from ns-atom and its vars from heap
+                            (when-let [a (:ns-atom ctx)]
+                              (swap! a dissoc ns-sym))
+                            (let [ns-str (str ns-sym)]
+                              (swap! heap-atom (fn [h]
+                                                 (reduce-kv (fn [acc k v]
+                                                              (if (= ns-str (namespace k))
+                                                                acc
+                                                                (assoc acc k v)))
+                                                            {} h))))
+                            nil)
+                     :meta {:name 'remove-ns}}
                     (symbol "clojure.core" "find-var")
                     {:val (fn [sym]
                             (when-not (qualified-symbol? sym)
@@ -573,6 +613,10 @@
                                       (#'clojure.repl/print-doc
                                        {:name ns-sym :doc doc-str})))))))
                      :meta {:name 'find-doc :doc "Prints documentation for any var whose documentation or name\n contains a match for re-string-or-pattern"}}
+                    ;; source-fn — SCI doesn't have source for user or host fns
+                    (symbol "clojure.repl" "source-fn")
+                    {:val (fn [sym] nil)
+                     :meta {:name 'source-fn}}
                     (symbol "clojure.core" "load-string")
                     {:val (fn sci-load-string [s]
                             (let [forms (read-all s)

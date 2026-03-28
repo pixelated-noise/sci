@@ -128,10 +128,13 @@
   (let [env (:env machine)]
     (if (contains? env sym)
       (get env sym)
-      (let [sym-ns (namespace sym)
-            sym-name (name sym)
-            ;; Use heap-atom for latest state (handles intern, defmacro etc.)
-            heap (if-let [a (:heap-atom machine)] @a (:heap machine))]
+      (let [sym-name (name sym)]
+        ;; Special handling for *ns*
+        (if (= sym-name "*ns*")
+          (:current-ns machine)
+          (let [sym-ns (namespace sym)
+                ;; Use heap-atom for latest state (handles intern, defmacro etc.)
+                heap (if-let [a (:heap-atom machine)] @a (:heap machine))]
         (if sym-ns
           ;; Qualified symbol
           (let [ns-table (:ns machine)
@@ -175,7 +178,7 @@
                                 (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                 {:type :sci/error :sym sym})))
                        :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                             {:type :sci/error :sym sym})))))))))))))
+                                             {:type :sci/error :sym sym})))))))))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
