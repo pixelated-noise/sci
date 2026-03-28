@@ -422,8 +422,11 @@
                             (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
                                   ns-info (get ns-data sym)]
                               (when ns-info
-                                ;; Return symbol with namespace metadata (doc, etc.)
-                                (with-meta sym (select-keys ns-info [:doc])))))
+                                ;; Return symbol with namespace metadata
+                                (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
+                                  (if (seq ns-meta)
+                                    (with-meta sym ns-meta)
+                                    sym)))))
                      :meta {:name 'find-ns}}
                     (symbol "clojure.core" "create-ns")
                     {:val (fn [sym]
@@ -437,10 +440,15 @@
                      :meta {:name 'create-ns}}
                     (symbol "clojure.core" "the-ns")
                     {:val (fn [sym]
-                            (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
-                              (or (when (get ns-data sym) sym)
-                                  (throw (ex-info (str "No namespace: " sym " found")
-                                                  {:type :sci/error})))))
+                            (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
+                                  ns-info (get ns-data sym)]
+                              (if ns-info
+                                (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
+                                  (if (seq ns-meta)
+                                    (with-meta sym ns-meta)
+                                    sym))
+                                (throw (ex-info (str "No namespace: " sym " found")
+                                                {:type :sci/error})))))
                      :meta {:name 'the-ns}}
                     (symbol "clojure.core" "ns-name")
                     {:val (fn [ns-sym] (if (symbol? ns-sym) ns-sym (clojure.core/ns-name ns-sym)))
@@ -488,11 +496,14 @@
                     {:val (fn [ns-sym]
                             (let [heap @heap-atom
                                   ns-str (str ns-sym)]
+                              ;; Include both ns-specific and clojure.core vars
                               (reduce-kv (fn [m k v]
-                                           (if (= ns-str (namespace k))
-                                             (assoc m (symbol (name k))
-                                                    (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
-                                             m))
+                                           (let [k-ns (namespace k)]
+                                             (if (or (= ns-str k-ns)
+                                                     (= "clojure.core" k-ns))
+                                               (assoc m (symbol (name k))
+                                                      (sci.lang/->Var k (:val v) (:meta v) (:dynamic? v)))
+                                               m)))
                                          {} heap)))
                      :meta {:name 'ns-map}}
                     ;; Override with-in-str to use VM binding (not host push-thread-bindings)

@@ -131,7 +131,12 @@
       (let [sym-name (name sym)]
         ;; Special handling for *ns*
         (if (= sym-name "*ns*")
-          (:current-ns machine)
+          (let [ns-sym (:current-ns machine)
+                ns-info (get-in machine [:ns ns-sym])
+                ns-meta (dissoc ns-info :aliases :refers :imports)]
+            (if (seq ns-meta)
+              (with-meta ns-sym ns-meta)
+              ns-sym))
           (let [sym-ns (namespace sym)
                 ;; Use heap-atom for latest state (handles intern, defmacro etc.)
                 heap (if-let [a (:heap-atom machine)] @a (:heap machine))]
@@ -1888,7 +1893,7 @@
                            [nil rest-form])
         _ (when-let [a (:current-ns-atom machine)]
             (reset! a ns-sym))
-        ns-meta (merge attr-map (when docstring {:doc docstring}))
+        ns-meta (merge (meta ns-sym) attr-map (when docstring {:doc docstring}))
         machine (-> machine
                     (assoc :current-ns ns-sym)
                     (update :ns #(let [existing (get % ns-sym)]
