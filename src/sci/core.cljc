@@ -720,15 +720,25 @@
    (let [ctx (if (and opts (:heap opts))
                opts  ;; already initialized
                (init (or opts {})))
-         ;; Read all forms at once (syntax-quote resolved at read time)
-         ;; For now, use a single read pass. Per-form reading with ns tracking
-         ;; would be needed for full syntax-quote ns support across ns changes.
-         reader-opts (cond-> {}
-                       (:features ctx) (assoc :features (:features ctx))
-                       (:readers ctx) (assoc :readers (:readers ctx)))
-         forms (read-all s 'user reader-opts)
-         machine (make-machine-from-ctx ctx forms)]
-     (step/run machine))))
+         current-ns-atom (or (:current-ns-atom ctx) (atom 'user))
+         reader-extra (cond-> {}
+                        (:features ctx) (assoc :features (:features ctx))
+                        (:readers ctx) (assoc :readers (:readers ctx)))
+         ;; Parse forms one at a time, evaluating between reads
+         ;; so that (ns ...) affects ::keyword resolution
+         reader (edamame/reader s)
+         eof (Object.)]
+     (loop [result nil]
+       (let [current-ns @current-ns-atom
+             read-opts (merge (make-reader-opts current-ns) reader-extra {:eof eof})
+             form (edamame/parse-next reader read-opts)]
+         (if (identical? form eof)
+           (if (and (map? result) (contains? #{:suspend :effect} (:status result)))
+             result  ;; Return suspended machine as-is
+             result)
+           (let [machine (make-machine-from-ctx ctx [form])
+                 res (step/run machine)]
+             (recur res))))))))
 
 (defn eval-string*
   "Same as eval-string but takes an already-initialized context.

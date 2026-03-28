@@ -1903,10 +1903,12 @@
         ns-meta (merge (meta ns-sym) attr-map (when docstring {:doc docstring}))
         machine (-> machine
                     (assoc :current-ns ns-sym)
-                    (update :ns #(let [existing (get % ns-sym)]
+                    (update :ns #(let [existing (get % ns-sym)
+                                          ;; Preserve structural data, replace metadata
+                                          structural (select-keys existing [:aliases :refers :imports])]
                                    (assoc % ns-sym
                                           (merge {:aliases {} :refers {} :imports {}}
-                                                 existing
+                                                 structural
                                                  (when ns-meta ns-meta))))))]
     ;; Process references like (:require ...) (:import ...)
     (let [machine (reduce
