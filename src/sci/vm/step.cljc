@@ -1794,12 +1794,18 @@
                                 :ns-atom (:ns-atom machine)
                                 :load-fn load-fn
                                 :current-ns ns-sym)
+                         ;; Propagate reload-all to sub-machine so transitive deps reload
+                         (cond-> (:reload-all machine)
+                                 (assoc :force-reload true :reload-all true))
                          (m/push-frame {:op :eval :expr expr}))]
               (run m2)
               ;; Return machine with updated heap and ns table
-              (cond-> machine
-                heap-atom (assoc :heap @heap-atom)
-                true (update :ns assoc ns-sym {:aliases {} :refers {} :imports {}})))
+              ;; Merge ns-atom changes (from sub-machine's ns form and transitive requires)
+              (let [loaded-ns (when-let [a (:ns-atom machine)] @a)]
+                (cond-> machine
+                  heap-atom (assoc :heap @heap-atom)
+                  loaded-ns (assoc :ns (merge (:ns machine) loaded-ns))
+                  (not loaded-ns) (update :ns assoc ns-sym {:aliases {} :refers {} :imports {}}))))
             (throw (ex-info (str "Could not locate " (clojure.string/replace ns-str "." "/")
                                 "__init.class, " (clojure.string/replace ns-str "." "/")
                                 ".clj or " (clojure.string/replace ns-str "." "/")
@@ -1879,10 +1885,11 @@
         specs (remove keyword? specs)
         ;; If :reload, force re-loading by clearing loaded ns entries
         machine (if (or (:reload flags) (:reload-all flags))
-                  (assoc machine :force-reload true)
+                  (cond-> (assoc machine :force-reload true)
+                    (:reload-all flags) (assoc :reload-all true))
                   machine)
         machine (reduce process-require-spec machine specs)
-        machine (dissoc machine :force-reload)]
+        machine (dissoc machine :force-reload :reload-all)]
     (m/push-value (sync-ns-atom! machine) nil)))
 
 (defn step-eval-ns [machine frame]
