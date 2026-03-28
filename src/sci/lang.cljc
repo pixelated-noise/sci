@@ -31,7 +31,14 @@
              (invoke [_ a b c d e f g] (val a b c d e f g))
              (applyTo [_ args] (clojure.lang.AFn/applyToHelper val args))
              Object
-             (toString [_] (str "#'" (or (:sci.impl/var-sym meta-map) sym)))]
+             (toString [_] (str "#'" (or (:sci.impl/var-sym meta-map) sym)))
+             (equals [_ other]
+               (and (instance? Var other)
+                    (= (or (:sci.impl/var-sym meta-map) sym)
+                       (or (:sci.impl/var-sym (.-meta-map ^Var other))
+                           (.-sym ^Var other)))))
+             (hashCode [_]
+               (.hashCode (or (:sci.impl/var-sym meta-map) sym)))]
       :cljs [IDeref
              (-deref [_] val)
              IMeta

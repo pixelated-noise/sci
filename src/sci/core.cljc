@@ -70,7 +70,7 @@
   "Create an SCI context (the machine's initial state)."
   [opts]
   (let [{:keys [bindings namespaces classes aliases ns-aliases imports
-                features load-fn readers deny allow]} opts
+                features load-fn readers deny allow file]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
         ;; Override satisfies? to handle SCI protocols
@@ -132,7 +132,8 @@
      :readers readers
      :ns-aliases ns-aliases
      :deny deny
-     :allow allow}))
+     :allow allow
+     :file file}))
 
 (defn fork
   "Create a fork of a context — an independent copy."
@@ -548,11 +549,19 @@
                     (symbol "clojure.core" "find-var")
                     {:val (fn [sym]
                             (when-not (qualified-symbol? sym)
-                              (throw (ex-info "Symbol must be namespace-qualified"
+                              (throw (ex-info (str "Not a qualified symbol: " sym)
                                               {:type :sci/error})))
-                            (let [entry (get @heap-atom sym)]
-                              (when entry
-                                (sci.lang/->Var sym (:val entry) (:meta entry) (:dynamic? entry)))))
+                            ;; Check if namespace exists
+                            (let [ns-sym (symbol (namespace sym))
+                                  ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
+                              (when-not (get ns-data ns-sym)
+                                (throw (ex-info (str "No such namespace: " ns-sym)
+                                                {:type :sci/error})))
+                              (let [entry (get @heap-atom sym)]
+                                (when entry
+                                  (sci.lang/->Var (symbol (name sym)) (:val entry)
+                                                  (assoc (:meta entry) :sci.impl/var-sym sym)
+                                                  (:dynamic? entry))))))
                      :meta {:name 'find-var}}
                     (symbol "clojure.core" "refer")
                     {:val (fn sci-refer
@@ -716,7 +725,8 @@
                              :current-ns-atom current-ns-atom
                              :current-ns @current-ns-atom)
                 (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
-                (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx)))]
+                (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx))
+                (:file ctx) (assoc :current-file (:file ctx)))]
       (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
