@@ -1023,10 +1023,21 @@
                                (:line (meta (:expr frame))))
                         (with-meta init-expr
                           (select-keys (meta (:expr frame)) [:line :column]))
-                        init-expr)]
+                        init-expr)
+            ;; Pre-declare the var as unbound so self-referential defs work
+            ;; e.g. (def foo foo) — foo is resolvable as Unbound during init
+            ns-sym (:current-ns machine)
+            qualified (symbol (str ns-sym) (str sym))
+            heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+            machine (if (contains? heap qualified)
+                      machine ;; already exists, don't clobber
+                      (let [entry {:val nil :meta meta-map :bound? false}]
+                        (when-let [a (:heap-atom machine)]
+                          (swap! a assoc qualified entry))
+                        (assoc-in machine [:heap qualified] entry)))]
         (-> machine
             (m/replace-frame {:op :def :sym sym
-                              :ns-sym (:current-ns machine)
+                              :ns-sym ns-sym
                               :meta-map meta-map})
             (m/push-frame {:op :eval :expr init-expr})))))))
 

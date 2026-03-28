@@ -763,7 +763,9 @@
                              :current-ns @current-ns-atom)
                 (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
                 (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx))
-                (:file ctx) (assoc :current-file (:file ctx)))]
+                true (as-> m' m'
+                      (let [f (or (:file ctx) @(clojure.core/resolve 'sci.core/file))]
+                        (if f (assoc m' :current-file f) m'))))]
       (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
