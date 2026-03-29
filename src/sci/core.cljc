@@ -19,8 +19,9 @@
 
 (defn- make-reader-opts
   "Create edamame reader options, optionally with a current namespace for ::keyword resolution."
-  ([] (make-reader-opts 'user))
-  ([current-ns]
+  ([] (make-reader-opts 'user nil))
+  ([current-ns] (make-reader-opts current-ns nil))
+  ([current-ns ns-aliases]
    {:all true
     :row-key :line
     :col-key :column
@@ -50,7 +51,8 @@
     :var true
     :deref true
     :regex true
-    :auto-resolve {:current (or current-ns 'user)}}))
+    :auto-resolve (merge {:current (or current-ns 'user)}
+                        ns-aliases)}))
 
 (defn read-all
   "Read all forms from a string."
@@ -807,7 +809,11 @@
          eof (Object.)]
      (loop [result nil]
        (let [current-ns @current-ns-atom
-             read-opts (merge (make-reader-opts current-ns) reader-extra {:eof eof})
+             ;; Get current namespace aliases for ::alias/keyword resolution
+             ns-atom (or (:ns-atom ctx) (atom {}))
+             ns-info (get @ns-atom current-ns)
+             aliases (:aliases ns-info)
+             read-opts (merge (make-reader-opts current-ns aliases) reader-extra {:eof eof})
              form (edamame/parse-next reader read-opts)]
          (if (identical? form eof)
            (if (and (map? result) (contains? #{:suspend :effect} (:status result)))

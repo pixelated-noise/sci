@@ -1868,11 +1868,15 @@
                         (process-require-spec m expanded)))
                     machine
                     (rest spec)))
-          ;; Normal: [ns-sym :as alias :refer [syms]]
+          ;; Normal: [ns-sym :as alias :refer [syms] :as-alias alias]
           (let [ns-sym first-elem
-                machine (load-ns-if-needed machine ns-sym)
                 opts (apply hash-map (rest spec))
-                alias-sym (:as opts)
+                as-alias-sym (:as-alias opts)
+                ;; Don't load the namespace if only :as-alias is used
+                machine (if (and as-alias-sym (not (:as opts)) (not (:refer opts)))
+                          machine  ;; :as-alias only — skip loading
+                          (load-ns-if-needed machine ns-sym))
+                alias-sym (or (:as opts) as-alias-sym)
                 refers (:refer opts)]
             (cond-> machine
               alias-sym (update-in [:ns current-ns :aliases] assoc alias-sym ns-sym)
@@ -1976,7 +1980,36 @@
                                (update-in m [:ns ns-sym :refer-clojure-excludes]
                                           (fnil into #{}) exclude-syms)
                                m))
-                           :use m ;; TODO
+                           :use
+                           (reduce (fn [m' use-spec]
+                                     ;; (use 'clojure.set) or (use '[clojure.set :only [union]])
+                                     (let [spec (if (and (seq? use-spec) (= 'quote (first use-spec)))
+                                                  (second use-spec)
+                                                  use-spec)
+                                           [ns-sym opts] (if (sequential? spec)
+                                                           [(first spec) (apply hash-map (rest spec))]
+                                                           [spec nil])
+                                           ;; First require the namespace
+                                           m' (process-require-spec m' (if opts
+                                                                         (vec (cons ns-sym (mapcat identity opts)))
+                                                                         ns-sym))
+                                           ;; Then refer all public vars (or :only)
+                                           only-syms (:only opts)
+                                           heap-atom (:heap-atom m')
+                                           heap (if heap-atom @heap-atom (:heap m'))
+                                           ns-str (str ns-sym)]
+                                       (reduce-kv (fn [m'' k v]
+                                                    (if (and (= ns-str (namespace k))
+                                                             (or (nil? only-syms)
+                                                                 (contains? (set only-syms)
+                                                                            (symbol (name k)))))
+                                                      (let [target (symbol (str (:current-ns m'')) (name k))]
+                                                        (when heap-atom
+                                                          (swap! heap-atom assoc target v))
+                                                        (assoc-in m'' [:heap target] v))
+                                                      m''))
+                                                  m' heap)))
+                                   m ref-specs)
                            m))
                        m))
                    machine
