@@ -582,6 +582,13 @@
                                   (list* 'binding ['*in* 's__in] body)))
                      :meta {:macro true :name 'with-in-str}
                      :macro? true}
+                    (symbol "clojure.core" "alias")
+                    {:val (fn [alias-sym ns-sym]
+                            (when-let [a (:ns-atom ctx)]
+                              (let [current-ns (if-let [cna (:current-ns-atom ctx)] @cna 'user)]
+                                (swap! a update-in [current-ns :aliases] assoc alias-sym ns-sym)))
+                            nil)
+                     :meta {:name 'alias}}
                     (symbol "clojure.core" "ns-unmap")
                     {:val (fn [ns-sym sym]
                             (let [qualified (symbol (str ns-sym) (str sym))]

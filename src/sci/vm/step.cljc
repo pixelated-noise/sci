@@ -1927,6 +1927,9 @@
   ;; (ns name docstring? attr-map? & references)
   ;; Simplified: switch namespace + process :require, :import etc.
   (let [[_ ns-sym & rest-form] (:expr frame)
+        _ (when-not (symbol? ns-sym)
+            (throw (ex-info (str "Namespace name must be a symbol, got: " (pr-str ns-sym))
+                            {:type :sci/error})))
         ;; Skip optional docstring
         [docstring rest-form] (if (string? (first rest-form))
                                 [(first rest-form) (next rest-form)]
@@ -2129,8 +2132,17 @@
     (let [sym-ns (clojure.core/namespace sym)
           sym-name (name sym)
           heap (:heap machine)
+          ;; Resolve namespace aliases
+          resolved-ns (when sym-ns
+                        (let [ns-table (:ns machine)
+                              current-ns (:current-ns machine)
+                              current-ns-data (get ns-table current-ns)
+                              alias-sym (symbol sym-ns)]
+                          (or (get (:aliases current-ns-data) alias-sym)
+                              (get (:ns-aliases machine) alias-sym)
+                              (symbol sym-ns))))
           candidates (if sym-ns
-                       [(symbol sym-ns sym-name)]
+                       [(symbol (str resolved-ns) sym-name)]
                        [(symbol (str (:current-ns machine)) sym-name)
                         (symbol "clojure.core" sym-name)])]
       (some (fn [qualified]
