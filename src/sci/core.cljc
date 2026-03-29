@@ -856,8 +856,8 @@
 (defn reader
   "Create a reader from a string."
   [s]
-  ;; Return an atom wrapping position + string for sequential reads
-  (atom {:source s :pos 0}))
+  ;; Use edamame's reader for proper position tracking
+  (edamame/reader s))
 
 (defn source-reader
   "Create a source reader from a string."
@@ -867,28 +867,17 @@
 (defn parse-next
   "Parse the next form from a reader."
   [ctx rdr]
-  (let [state @rdr
-        remaining (subs (:source state) (:pos state))]
-    (if (empty? (clojure.string/trim remaining))
-      ::eof
-      (let [form (edamame/parse-string remaining
-                                        {:all true
-                                         :read-cond :allow
-                                         :features #{:clj}
-                                         :fn true
-                                         :quote true
-                                         :var true
-                                         :deref true
-                                         :regex true})]
-        ;; Advance position (approximate — find end of first form)
-        (swap! rdr assoc :pos (count (:source state)))
-        form))))
+  (let [eof ::eof
+        opts (merge (make-reader-opts)
+                    {:eof eof})
+        form (edamame/parse-next rdr opts)]
+    (if (identical? form eof) ::eof form)))
 
 (defn get-line-number [rdr]
-  1)
+  (edamame/get-line-number rdr))
 
 (defn get-column-number [rdr]
-  1)
+  (edamame/get-column-number rdr))
 
 ;; ============================================================
 ;; Vars API
@@ -1185,11 +1174,14 @@
 (def eof ::eof)
 
 (defn parse-next+string
-  "Parse the next form from a reader, returning both the form and the string."
+  "Parse the next form from a reader, returning [form string]."
   [ctx rdr]
-  (let [form (parse-next ctx rdr)]
-    {:val form
-     :string (pr-str form)}))
+  (let [col-before (edamame/get-column-number rdr)
+        form (parse-next ctx rdr)
+        col-after (edamame/get-column-number rdr)]
+    ;; Return [form source-string]
+    ;; Note: exact source string reconstruction is limited
+    [form (pr-str form)]))
 
 ;; ============================================================
 ;; Additional API functions
