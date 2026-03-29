@@ -163,15 +163,24 @@
   (let [heap-atom (or (:heap-atom ctx) (atom (:heap ctx)))
         ;; Inject VM-aware functions that need heap access
         resolve-fn (fn sci-resolve
-                     ([sym] (sci-resolve 'user sym))
+                     ([sym]
+                      ;; Use current-ns from current-ns-atom if available
+                      (let [ns-sym (if-let [a (:current-ns-atom ctx)] @a 'user)]
+                        (sci-resolve ns-sym sym)))
                      ([ns-sym sym]
                       (let [heap @heap-atom
+                            ;; Check :refer-clojure :exclude
+                            ns-data (if-let [a (:ns-atom ctx)]
+                                      (get @a ns-sym)
+                                      (get (:ns-table ctx) ns-sym))
+                            excludes (:refer-clojure-excludes ns-data)
                             ;; Handle already-qualified symbols
                             [qualified core-q]
                             (if (qualified-symbol? sym)
                               [sym nil]
                               [(symbol (str ns-sym) (str sym))
-                               (symbol "clojure.core" (str sym))])
+                               (when-not (and excludes (contains? excludes sym))
+                                 (symbol "clojure.core" (str sym)))])
                             entry (or (get heap qualified) (when core-q (get heap core-q)))]
                         (when entry
                           (let [found-key (if (get heap qualified) qualified core-q)]

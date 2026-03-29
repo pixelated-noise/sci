@@ -172,17 +172,20 @@
           (let [ns-sym (:current-ns machine)
                 qualified (symbol (str ns-sym) sym-name)
                 core-q (symbol "clojure.core" sym-name)
-                dyn (:dynamic-bindings machine)]
+                dyn (:dynamic-bindings machine)
+                ;; Check :refer-clojure :exclude
+                excludes (get-in machine [:ns ns-sym :refer-clojure-excludes])
+                core-excluded? (and excludes (contains? excludes (symbol sym-name)))]
             ;; Use if-let chain instead of or — or treats false/nil as "not found"
             (if (and dyn (contains? dyn qualified)) (get dyn qualified)
-              (if (and dyn (contains? dyn core-q)) (get dyn core-q)
+              (if (and (not core-excluded?) dyn (contains? dyn core-q)) (get dyn core-q)
                 (if (contains? heap qualified)
                   (let [entry (get heap qualified)]
                     (if (and (not (:bound? entry true))
                              (nil? (:val entry)))
                       (sci.lang/->Unbound qualified)
                       (:val entry)))
-                  (if (contains? heap core-q) (:val (get heap core-q))
+                  (if (and (not core-excluded?) (contains? heap core-q)) (:val (get heap core-q))
                     #?(:clj (or (try-resolve-class sym-name)
                                 (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                 {:type :sci/error :sym sym})))
@@ -1966,7 +1969,13 @@
                                                          m' classes))
                                                m'))
                                            m ref-specs)
-                           :refer-clojure m ;; TODO
+                           :refer-clojure
+                           (let [opts (apply hash-map ref-specs)
+                                 exclude-syms (set (:exclude opts))]
+                             (if (seq exclude-syms)
+                               (update-in m [:ns ns-sym :refer-clojure-excludes]
+                                          (fnil into #{}) exclude-syms)
+                               m))
                            :use m ;; TODO
                            m))
                        m))
