@@ -589,6 +589,13 @@
                                 (swap! a update-in [current-ns :aliases] assoc alias-sym ns-sym)))
                             nil)
                      :meta {:name 'alias}}
+                    (symbol "clojure.core" "ns-unalias")
+                    {:val (fn [ns-sym alias-sym]
+                            (let [ns-sym (if (symbol? ns-sym) ns-sym (clojure.core/ns-name ns-sym))]
+                              (when-let [a (:ns-atom ctx)]
+                                (swap! a update-in [ns-sym :aliases] dissoc alias-sym))
+                              nil))
+                     :meta {:name 'ns-unalias}}
                     (symbol "clojure.core" "ns-unmap")
                     {:val (fn [ns-sym sym]
                             (let [qualified (symbol (str ns-sym) (str sym))]
