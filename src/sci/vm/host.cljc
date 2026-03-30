@@ -168,10 +168,30 @@
              (when (fn? v) (.put m v qualified-sym)))))
        m)))
 
+(def ^:private default-imports
+  "Default Java imports (java.lang classes) available in all namespaces."
+  #?(:clj
+     (let [common-classes [String Long Integer Double Float Short Byte Character Boolean
+                           Object Class Number Comparable Iterable
+                           Thread Runnable Exception RuntimeException Error
+                           Throwable ArithmeticException ArrayIndexOutOfBoundsException
+                           ClassCastException ClassNotFoundException
+                           IllegalArgumentException IllegalStateException
+                           IndexOutOfBoundsException NullPointerException
+                           NumberFormatException StringIndexOutOfBoundsException
+                           UnsupportedOperationException
+                           Math System Runtime Process ProcessBuilder
+                           StackTraceElement StringBuilder StringBuffer
+                           clojure.lang.ExceptionInfo]]
+       (reduce (fn [m ^Class c]
+                 (assoc m (symbol (.getSimpleName c)) c))
+               {} common-classes))
+     :cljs {}))
+
 (defn default-ns-table
   "Build the default namespace table."
   []
   (reduce (fn [t ns-sym]
-            (assoc t ns-sym {:aliases {} :refers {} :imports {}}))
-          {'user {:aliases {} :refers {} :imports {}}}
+            (assoc t ns-sym {:aliases {} :refers {} :imports default-imports}))
+          {'user {:aliases {} :refers {} :imports default-imports}}
           default-namespaces))

@@ -902,7 +902,11 @@
                                         (subs method-str 1)
                                         method-str)]
                        (m/push-value machine (get f (keyword field-name))))
-                     (m/push-value machine (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false)))
+                     ;; For .-field syntax, try field access first, fall back to method
+                     (m/push-value machine
+                                   (try (clojure.lang.Reflector/getInstanceField f method-str)
+                                        (catch Exception _
+                                          (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false)))))
                    ;; Special methods for sci.lang.Var
                    (if (and (instance? sci.lang.Var f)
                             (contains? #{"hasRoot" "isBound" "isDynamic" "get"} method-str))
@@ -1766,6 +1770,9 @@
      ;; (. obj method args...) or (. obj (method args...)) or (. obj -field)
      (let [form (:expr frame)
            [_ obj-expr method-or-call & args] form
+           _ (when (nil? method-or-call)
+               (throw (IllegalArgumentException.
+                       "Malformed member expression, expecting (. target member ...)")))
            [method-name method-args]
            (if (seq? method-or-call)
              [(first method-or-call) (rest method-or-call)]
@@ -1799,8 +1806,11 @@
      (let [idx (.lastIndexOf ^String class-name ".")]
        (when (> idx 0)
          (let [ns-str (subs class-name 0 idx)
-               type-str (subs class-name (inc idx))]
-           (get-in machine [:ns (symbol ns-str) :types (symbol type-str)]))))
+               type-str (subs class-name (inc idx))
+               ;; Also try un-munged namespace (underscores → dashes)
+               ns-str-unm (clojure.string/replace ns-str "_" "-")]
+           (or (get-in machine [:ns (symbol ns-str) :types (symbol type-str)])
+               (get-in machine [:ns (symbol ns-str-unm) :types (symbol type-str)])))))
      :cljs nil))
 
 (defn step-eval-import [machine frame]
@@ -1812,9 +1822,11 @@
              sci-type (when-not klass (try-resolve-sci-type machine class-str))]
          (cond
            klass
-           (let [short-name (symbol (.getSimpleName ^Class klass))]
+           (let [short-name (symbol (.getSimpleName ^Class klass))
+                 cur-ns (:current-ns machine)]
              (-> machine
                  (update :env assoc short-name klass)
+                 (update-in [:ns cur-ns :imports] assoc short-name klass)
                  (m/push-value klass)))
            sci-type
            (let [idx (.lastIndexOf ^String class-str ".")
@@ -1823,6 +1835,7 @@
              (-> machine
                  (update :env assoc short-name sci-type)
                  (update-in [:ns cur-ns :types] assoc short-name sci-type)
+                 (update-in [:ns cur-ns :imports] assoc short-name sci-type)
                  (m/push-value sci-type)))
            :else
            (throw (ex-info (str "Unable to resolve classname: " class-str)
@@ -3226,16 +3239,19 @@
       :dot-call
       ;; (.method obj args...) or (.-field obj) → (. obj method args...) or (. obj -field)
       (let [head (first form)
-            raw-name (subs (name head) 1)
-            is-field? #?(:clj (.startsWith ^String raw-name "-")
-                         :cljs (= "-" (subs raw-name 0 1)))
-            member-name (if is-field?
-                          (symbol (str "-" (subs raw-name 1))) ;; keep the dash for (. obj -field)
-                          (symbol raw-name))
-            obj-expr (second form)
-            args (drop 2 form)
-            dot-form (list* '. obj-expr member-name args)]
-        (m/replace-frame machine {:op :eval :expr dot-form}))
+            raw-name (subs (name head) 1)]
+        (when (or (empty? raw-name) (nil? (second form)))
+          (throw (#?(:clj IllegalArgumentException. :cljs js/Error.)
+                  (str "Malformed member expression, expecting (.member target ...)"))))
+        (let [is-field? #?(:clj (.startsWith ^String raw-name "-")
+                           :cljs (= "-" (subs raw-name 0 1)))
+              member-name (if is-field?
+                            (symbol (str "-" (subs raw-name 1)))
+                            (symbol raw-name))
+              obj-expr (second form)
+              args (drop 2 form)
+              dot-form (list* '. obj-expr member-name args)]
+          (m/replace-frame machine {:op :eval :expr dot-form})))
 
       :new-call
       ;; (ClassName. args...) → (new ClassName args...)

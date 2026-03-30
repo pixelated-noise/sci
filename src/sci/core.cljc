@@ -1073,9 +1073,16 @@
                               nil))
                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs nil)}}
                     (symbol "clojure.core" "ns-imports")
-                    {:val (fn [ns-sym]
-                            {}) ;; TODO: track imports properly
-                     :meta {:name 'ns-imports}}
+                    {:val (fn [ns-sym-or-obj]
+                            (let [ns-sym (if (symbol? ns-sym-or-obj)
+                                           ns-sym-or-obj
+                                           (if (and (instance? clojure.lang.Named ns-sym-or-obj))
+                                             (symbol (name ns-sym-or-obj))
+                                             ns-sym-or-obj))
+                                  ns-a (:ns-atom ctx)
+                                  ns-table (if ns-a @ns-a {})]
+                              (get-in ns-table [ns-sym :imports] {})))
+                     :meta {:name 'ns-imports :doc #?(:clj (:doc (meta #'clojure.core/ns-imports)) :cljs nil)}}
                     (symbol "clojure.core" "remove-ns")
                     {:val (make-remove-ns-fn ctx heap-atom) :meta {:name 'remove-ns :doc #?(:clj (:doc (meta #'clojure.core/remove-ns)) :cljs nil)}}
                     (symbol "clojure.core" "find-var")
