@@ -1934,7 +1934,18 @@
                                              arglists (remove string? arglists)]
                                          [mname {:arglists (vec arglists)}])))
                                    method-defs))
-        protocol (make-protocol proto-name method-sigs ns-sym opts)
+        ;; Build :sigs map for protocol introspection
+        sigs-map (reduce-kv (fn [acc mname {:keys [arglists]}]
+                              (let [doc-str (some (fn [md]
+                                                    (when (and (seq? md) (= mname (first md)))
+                                                      (let [s (second md)]
+                                                        (when (string? s) s))))
+                                                  method-defs)]
+                                (assoc acc (keyword mname)
+                                       {:name mname :arglists arglists :doc doc-str})))
+                            {} method-sigs)
+        protocol (assoc (make-protocol proto-name method-sigs ns-sym opts)
+                        :sigs sigs-map)
         qualified (symbol (str ns-sym) (str proto-name))
         ;; Create dispatch functions for each protocol method
         machine (reduce
@@ -1981,7 +1992,20 @@
                                                               " found for: " (type target))
                                                          {:type :sci/error})))))))
                          mq (symbol (str ns-sym) (str mname))
-                         entry {:val method-fn :meta {:protocol protocol} :dynamic? false}]
+                         method-arglists arglists
+                         ;; Find docstring for this method (immediately after the method-name in the definition)
+                         method-doc (some (fn [md]
+                                           (when (and (seq? md) (= mname (first md)))
+                                             (let [second-el (second md)]
+                                               (when (string? second-el) second-el))))
+                                         method-defs)
+                         entry {:val method-fn
+                                :meta {:protocol protocol
+                                       :name mname
+                                       :ns (symbol (str ns-sym))
+                                       :arglists (vec method-arglists)
+                                       :doc method-doc}
+                                :dynamic? false}]
                      (when-let [a (:heap-atom m)]
                        (swap! a assoc mq entry))
                      (-> m
@@ -1996,7 +2020,7 @@
     (-> machine
         (assoc-in [:heap qualified] proto-entry)
         (update :env assoc proto-name protocol)
-        (m/push-value protocol))))
+        (m/push-value proto-name))))
 
 (defn step-eval-extend [machine frame]
   ;; (extend Type Protocol {:method-name fn ...})
@@ -2632,7 +2656,8 @@
                                                              (assoc acc mname f)
                                                              acc))
                                                          {} proto-methods)]
-                                    (when (seq impl-fns) (do-extend proto type-obj impl-fns))
+                                    ;; Always register, even for marker protocols (empty impl-fns)
+                                    (do-extend proto type-obj impl-fns)
                                     m)
                                   m)))
                             machine protocols-vec))
@@ -2686,7 +2711,7 @@
                                                              (assoc acc mname f)
                                                              acc))
                                                          {} proto-methods)]
-                                    (when (seq impl-fns) (do-extend proto type-obj impl-fns))
+                                    (do-extend proto type-obj impl-fns)
                                     m)
                                   m)))
                             machine interfaces-vec))
