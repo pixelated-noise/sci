@@ -1375,6 +1375,13 @@
               (vary-meta val assoc :name sym :ns ns-sym :sci/def-named true)
               val)
         meta-map (:meta-map frame)
+        ;; Merge with existing metadata — preserves :arglists/:doc set by deftype* constructors
+        ;; when the host deftype macro expansion re-defs ->TypeName
+        heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+        existing-meta (:meta (get heap qualified))
+        meta-map (if existing-meta
+                   (merge existing-meta meta-map)
+                   meta-map)
         entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true
                :const? (boolean (:const meta-map))
                :user-defined? true}]
@@ -2567,7 +2574,11 @@
   (let [form (:expr frame)
         parts         (vec (rest form))
         qualified-sym (nth parts 0)
-        dotted-sym    (nth parts 1)
+        dotted-sym    (let [ds (nth parts 1)
+                            s (str ds)]
+                        ;; Munge dashes to underscores in ns part (before last dot)
+                        ;; e.g. my-ns.Foo → my_ns.Foo (matching Java class naming)
+                        (symbol (clojure.string/replace s #"^([^.]+)\." (fn [[_ ns-part]] (str (clojure.string/replace ns-part "-" "_") ".")))))
         fields-vec    (nth parts 2)
         ;; Find :implements keyword and its vector
         impl-idx (reduce-kv (fn [_ i v] (if (= :implements v) (reduced i) nil)) nil parts)
@@ -2637,7 +2648,11 @@
                                         {:type type-obj :sci.impl/record true}))
                         map-ctor-sym (symbol (str "map->" type-name))
                         map-ctor-q   (symbol (str ns-sym) (str map-ctor-sym))
-                        map-ctor-entry {:val map-ctor-fn :meta {:name map-ctor-sym} :bound? true}]
+                        map-ctor-entry {:val map-ctor-fn
+                                       :meta {:name map-ctor-sym
+                                              :arglists (list '[m])
+                                              :doc (str "Factory function for " dotted-sym ", taking a map of keywords to field values.")}
+                                       :bound? true}]
                     (when-let [a (:heap-atom machine)] (swap! a assoc map-ctor-q map-ctor-entry))
                     (assoc-in machine [:heap map-ctor-q] map-ctor-entry))
                   machine)

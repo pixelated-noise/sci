@@ -65,6 +65,13 @@
         ;; Fallback: heap → Java class → host Clojure var → current-ns qualify
         :else
         (or
+         ;; Check SCI type (deftype/defrecord) in ns-table — use dotted form like Clojure
+         (when ns-atom
+           (let [types (get-in @ns-atom [current-ns :types])
+                 type-obj (get types (symbol sym-name))]
+             (when (instance? sci.lang.Type type-obj)
+               ;; Use the type's own name (which is the dotted form: ns.Name)
+               (symbol (.getName ^sci.lang.Type type-obj)))))
          ;; Check SCI heap: sym defined/referred in current ns?
          (when heap-atom
            (let [h     @heap-atom
@@ -271,6 +278,24 @@
                                   ([child parent] (clojure.core/isa? (type->tag child) (type->tag parent)))
                                   ([h child parent] (clojure.core/isa? h (type->tag child) (type->tag parent))))
                            :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs nil)}
+                           :dynamic? false})
+                   (assoc (symbol "clojure.core" "parents")
+                          {:val (fn sci-parents
+                                  ([tag] (clojure.core/parents (type->tag tag)))
+                                  ([h tag] (clojure.core/parents h (type->tag tag))))
+                           :meta {:name 'parents :doc #?(:clj (:doc (meta #'clojure.core/parents)) :cljs nil)}
+                           :dynamic? false})
+                   (assoc (symbol "clojure.core" "ancestors")
+                          {:val (fn sci-ancestors
+                                  ([tag] (clojure.core/ancestors (type->tag tag)))
+                                  ([h tag] (clojure.core/ancestors h (type->tag tag))))
+                           :meta {:name 'ancestors :doc #?(:clj (:doc (meta #'clojure.core/ancestors)) :cljs nil)}
+                           :dynamic? false})
+                   (assoc (symbol "clojure.core" "descendants")
+                          {:val (fn sci-descendants
+                                  ([tag] (clojure.core/descendants (type->tag tag)))
+                                  ([h tag] (clojure.core/descendants h (type->tag tag))))
+                           :meta {:name 'descendants :doc #?(:clj (:doc (meta #'clojure.core/descendants)) :cljs nil)}
                            :dynamic? false})))
         ;; Install user bindings into heap as user/sym vars
         ;; :dynamic? true so thread-local bindings (sci/binding, sci/with-bindings) work.
