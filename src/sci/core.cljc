@@ -13,6 +13,8 @@
             [sci.impl.types]
             #?(:clj [clojure.string :as str])))
 
+(declare read-eval)
+
 ;; ============================================================
 ;; Reader
 ;; ============================================================
@@ -76,15 +78,23 @@
                    (symbol (str current-ns) sym-name)))))
          ;; Java class?
          (sq-resolve-class sym)
-         ;; Host Clojure var (clojure.core etc.) — unless excluded via :refer-clojure :exclude
+         ;; Host Clojure var from standard namespaces (clojure.core etc.) only.
+         ;; We restrict to standard namespaces to avoid picking up host-level vars
+         ;; that happen to shadow SCI user-defined symbols (e.g. sci.copy-ns-test-ns/bar).
          (let [excluded? (when ns-atom
                            (let [excludes (get-in @ns-atom [current-ns :refer-clojure-excludes])]
                              (and excludes (contains? excludes (symbol sym-name)))))
                resolved (when-not excluded?
                           #?(:clj (clojure.core/resolve sym) :cljs nil))]
            (when resolved
-             (let [m (meta resolved)]
-               (symbol (str (:ns m)) (str (:name m))))))
+             (let [m (meta resolved)
+                   resolved-ns (str (:ns m))]
+               ;; Only use resolution from standard SCI-accessible namespaces
+               (when (contains? #{"clojure.core" "clojure.string" "clojure.set"
+                                  "clojure.walk" "clojure.edn" "clojure.repl"
+                                  "cljs.core" "cljs.string"}
+                                resolved-ns)
+                 (symbol resolved-ns (str (:name m)))))))
          ;; Default: qualify with current ns
          (symbol (str current-ns) sym-name)))))))
 
@@ -130,7 +140,8 @@
   "Create an SCI context (the machine's initial state)."
   [opts]
   (let [{:keys [bindings namespaces classes aliases ns-aliases imports
-                features load-fn readers deny allow file initial-ns]} opts
+                features load-fn readers deny allow file initial-ns
+                disable-arity-checks]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
         ;; Override satisfies? to handle SCI protocols
@@ -150,9 +161,11 @@
                                      (get impls :default))))
                               ;; Fall back to clojure.core/satisfies? for real protocols
                               (clojure.core/satisfies? protocol x)))
-                     :meta {:name 'satisfies?}
+                     :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs nil)}
                      :dynamic? false})
         ;; Install user bindings into heap as user/sym vars
+        ;; :dynamic? true so thread-local bindings (sci/binding, sci/with-bindings) work.
+        ;; Atom-backed vars (from new-dynamic-var) are stored as atoms; resolve-symbol derefs them.
         heap (reduce-kv
               (fn [h sym val]
                 (let [sym-name (if (symbol? sym) (name sym) (str sym))
@@ -162,16 +175,21 @@
                       actual-val (if sci-var? @val val)
                       vm (meta val)
                       is-macro? (or (:macro vm) (:sci/macro vm))
-                      is-dynamic? (or (boolean (:dynamic? val))
-                                      (boolean (:dynamic vm)))]
+                      ;; Check for :sci/built-in in DynamicVar meta-map
+                      built-in? (and (instance? sci.lang.DynamicVar val)
+                                     (:sci/built-in (meta val)))]
                   (assoc h qualified (cond-> {:val actual-val
                                               :meta (or vm {})
                                               :macro? (boolean is-macro?)
-                                              :dynamic? is-dynamic?}
-                                       is-macro? (assoc :host-macro? true)))))
+                                              :dynamic? true
+                                              ;; Mark as raw binding so (var x) doesn't inject :name/:ns
+                                              :user-binding? (not sci-var?)}
+                                       is-macro? (assoc :host-macro? true)
+                                       built-in? (assoc :sci/built-in true)))))
               heap
               (or bindings {}))
-        ;; Install custom namespaces
+        ;; Install custom namespaces — mark entries as user overrides so special forms
+        ;; like (ns ...) can be overridden: {:namespaces {'clojure.core {'ns inc}}}
         heap (reduce-kv
               (fn [h ns-sym ns-map]
                 (reduce-kv
@@ -188,7 +206,8 @@
                      (assoc h2 qualified (cond-> {:val actual-val
                                                    :meta (or vm {})
                                                    :macro? (boolean is-macro?)
-                                                   :dynamic? is-dynamic?}
+                                                   :dynamic? is-dynamic?
+                                                   :user-override? true}
                                            is-macro? (assoc :host-macro? true)))))
                  h
                  ns-map))
@@ -203,6 +222,7 @@
      :heap-atom (atom heap)
      :ns-table ns-table
      :ns-atom (atom ns-table)
+     :ns-objects (atom {})
      :current-ns-atom (atom (or initial-ns 'user))
      :classes (or classes {})
      :features (or features #{:clj})
@@ -211,7 +231,9 @@
      :ns-aliases ns-aliases
      :deny deny
      :allow allow
-     :file file}))
+     :file file
+     :disable-arity-checks (boolean disable-arity-checks)
+     #?@(:clj [:inverse-registry (host/inverse-registry heap)])}))
 
 (defn fork
   "Create a fork of a context — an independent copy."
@@ -278,11 +300,18 @@
 
 (defn- make-eval-fn [ctx heap-atom]
   (fn sci-eval [form]
-    (let [m2 (machine/make-machine {:heap        @heap-atom
-                                    :ns-table    (:ns-table ctx)
+    (let [ns-atom (:ns-atom ctx)
+          ns-table (if ns-atom @ns-atom (:ns-table ctx))
+          m2 (machine/make-machine {:heap        @heap-atom
+                                    :ns-table    ns-table
                                     :permissions {:allow (:allow ctx)
                                                   :deny  (:deny ctx)}})
-          m2 (assoc m2 :heap-atom heap-atom)
+          m2 (cond-> (assoc m2 :heap-atom heap-atom :ctx ctx)
+               ns-atom (assoc :ns-atom ns-atom)
+               (:current-ns-atom ctx) (assoc :current-ns-atom (:current-ns-atom ctx)
+                                             :current-ns @(:current-ns-atom ctx))
+               (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
+               (:classes ctx) (assoc :classes (:classes ctx)))
           m2 (machine/push-frame m2 {:op :eval :expr form})]
       (step/run m2))))
 
@@ -294,6 +323,12 @@
                                        (let [sym (var-qualified-sym v)]
                                          [sym (:val (get @heap-atom sym))]))
                                      sci-bindings))]
+      (doseq [[v _] sci-bindings]
+        (let [sym   (var-qualified-sym v)
+              entry (get @heap-atom sym)]
+          (when (:sci/built-in entry)
+            (throw (ex-info (str "Built-in var " sym " cannot be redefined")
+                            {:type :sci/error})))))
       (doseq [[v new-val] sci-bindings]
         (let [sym   (var-qualified-sym v)
               entry (assoc (get @heap-atom sym) :val new-val)]
@@ -314,14 +349,20 @@
             ns-str (when sym (namespace sym))]
         (when (and ns-str (contains? (set (map str host/default-namespaces)) ns-str))
           (throw (ex-info (str "Var " sym " is read-only") {:type :sci/error})))
-        (let [result (atom nil)]
+        (let [result (atom nil)
+              old-val-atom (atom nil)]
           (swap! heap-atom
                  (fn [h]
                    (let [entry   (get h sym)
                          old-val (:val entry)
                          new-val (apply f old-val args)]
                      (reset! result new-val)
+                     (reset! old-val-atom old-val)
                      (assoc h sym (assoc entry :val new-val)))))
+          ;; Notify watchers
+          (let [watchers (:watchers (get @heap-atom sym))]
+            (doseq [[k wf] watchers]
+              (wf k v @old-val-atom @result)))
           @result))
       (apply clojure.core/alter-var-root v f args))))
 
@@ -351,9 +392,18 @@
                    :cljs (= "." (subs n 0 1)))
                 (not= n "..")
                 (> (count n) 1))
-           (let [method       (symbol (subs n 1))
-                 [_ obj & args] form]
-             (list* '. obj method args))
+           (let [method         (symbol (subs n 1))
+                 [_ obj & args] form
+                 ;; Wrap obj in (clojure.core/identity ...) only when it's a class symbol
+                 ;; (uppercase initial letter), matching Clojure's macroexpand-1 behavior.
+                 wrapped-obj #?(:clj (if (and (symbol? obj)
+                                              (nil? (namespace obj))
+                                              (let [s (name obj)]
+                                                (Character/isUpperCase (.charAt s 0))))
+                                       (list 'clojure.core/identity obj)
+                                       obj)
+                                :cljs obj)]
+             (list* '. wrapped-obj method args))
 
            (and #?(:clj  (.endsWith ^String n ".")
                    :cljs (= "." (subs n (dec (count n)))))
@@ -372,8 +422,9 @@
              (if macro-entry
                (let [mv (:val macro-entry)
                      mf (if (var? mv) @mv mv)]
-                 (if (or (var? mv) (:sci/closure (meta mf)))
-                   ;; Host macros (Clojure vars) and SCI closures (defmacro) get &form &env
+                 (if (or (var? mv) (:sci/closure (meta mf)) (:host-macro? macro-entry))
+                   ;; Host macros (Clojure vars), SCI closures (defmacro), and
+                   ;; internal host-style macros (defrecord/deftype) get &form &env
                    (apply mf form {} (rest form))
                    ;; Internal SCI functions (not closures): just args
                    (apply mf (rest form))))
@@ -459,21 +510,41 @@
                        (assoc (:meta entry) :name name-sym :ns ns-sym :sci.impl/var-sym qualified)
                        (:dynamic? entry))))))
 
+(defn- get-or-create-ns-object
+  "Return a stable namespace object for the given sym from the ns-objects cache."
+  [ns-objects-atom sym]
+  (or (get @ns-objects-atom sym)
+      (let [obj (sci.lang/->Namespace sym {} {} {} {})]
+        (swap! ns-objects-atom assoc sym obj)
+        (get @ns-objects-atom sym))))
+
+(defn- sci-namespace?
+  "Duck-type check for sci.lang.Namespace records.
+   Uses field presence instead of instance? to avoid classloader identity issues
+   when the namespace is reloaded (e.g. :reload-all in tests)."
+  [x]
+  (and (map? x)
+       (contains? x :name)
+       (symbol? (:name x))
+       (contains? x :aliases)))
+
 (defn- make-find-ns-fn [ctx]
   (fn [sym]
     (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
           ns-info (get ns-data sym)]
       (when ns-info
-        (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
-          (if (seq ns-meta) (with-meta sym ns-meta) sym))))))
+        (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)))))
 
 (defn- make-the-ns-fn [ctx]
-  (fn [sym]
-    (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
+  (fn [sym-or-ns]
+    (let [sym (cond
+                (sci-namespace? sym-or-ns) (:name sym-or-ns)
+                (symbol? sym-or-ns) sym-or-ns
+                :else (throw (ex-info (str "Not a namespace or symbol: " sym-or-ns) {:type :sci/error})))
+          ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
           ns-info (get ns-data sym)]
       (if ns-info
-        (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
-          (if (seq ns-meta) (with-meta sym ns-meta) sym))
+        (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)
         (throw (ex-info (str "No namespace: " sym " found") {:type :sci/error}))))))
 
 (defn- make-create-ns-fn [ctx]
@@ -484,7 +555,7 @@
                    (if (get ns-table sym)
                      ns-table
                      (assoc ns-table sym {:aliases {} :refers {} :imports {}})))))
-      sym)))
+      (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym))))
 
 (defn- make-all-ns-fn [ctx]
   (fn []
@@ -495,12 +566,16 @@
   (fn sci-load-string [s]
     (let [forms (read-all s)
           expr  (if (= 1 (count forms)) (first forms) (cons 'do forms))
-          m2    (-> (machine/make-machine {:heap        @heap-atom
-                                           :ns-table    (:ns-table ctx)
-                                           :permissions {:allow (:allow ctx)
-                                                         :deny  (:deny ctx)}})
-                    (assoc :heap-atom heap-atom)
-                    (machine/push-frame {:op :eval :expr expr}))]
+          eval-file (when (= 1 (count forms))
+                      (get (meta (first forms)) :clojure.core/eval-file))
+          m2    (cond-> (machine/make-machine {:heap        @heap-atom
+                                               :ns-table    (:ns-table ctx)
+                                               :permissions {:allow (:allow ctx)
+                                                             :deny  (:deny ctx)}})
+                  true       (assoc :heap-atom heap-atom)
+                  eval-file  (assoc :current-file eval-file)
+                  eval-file  (update :dynamic-bindings assoc 'clojure.core/*file* eval-file)
+                  true       (machine/push-frame {:op :eval :expr expr}))]
       (step/run m2))))
 
 (defn- make-find-var-fn [ctx heap-atom]
@@ -518,11 +593,19 @@
                           (:dynamic? entry)))))))
 
 (defn- make-alias-fn [ctx]
-  (fn [alias-sym ns-sym]
-    (when-let [a (:ns-atom ctx)]
-      (let [current-ns (if-let [cna (:current-ns-atom ctx)] @cna 'user)]
-        (swap! a update-in [current-ns :aliases] assoc alias-sym ns-sym)))
-    nil))
+  (fn [alias-sym ns-sym-or-obj]
+    (let [ns-sym (if (sci-namespace? ns-sym-or-obj)
+                   (:name ns-sym-or-obj)
+                   ns-sym-or-obj)]
+      ;; Verify the namespace exists
+      (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
+        (when-not (or (get ns-data ns-sym)
+                      (contains? (set host/default-namespaces) ns-sym))
+          (throw (ex-info (str "No namespace: " ns-sym " found") {:type :sci/error}))))
+      (when-let [a (:ns-atom ctx)]
+        (let [current-ns (if-let [cna (:current-ns-atom ctx)] @cna 'user)]
+          (swap! a update-in [current-ns :aliases] assoc alias-sym ns-sym)))
+      nil)))
 
 (defn- make-ns-unalias-fn [ctx]
   (fn [ns-sym alias-sym]
@@ -542,7 +625,7 @@
                                     {} h))))
     nil))
 
-(defn- make-refer-fn [heap-atom]
+(defn- make-refer-fn [ctx heap-atom]
   (fn sci-refer
     ([ns-sym] (sci-refer ns-sym :only nil))
     ([ns-sym & filters]
@@ -552,12 +635,13 @@
            heap         @heap-atom
            ns-str       (str ns-sym)
            entries      (filter (fn [[k _]] (= ns-str (namespace k))) heap)
-           current-ns   'user]
+           current-ns   (if-let [a (:current-ns-atom ctx)] @a 'user)]
        (doseq [[k entry] entries]
          (let [sym-name (symbol (name k))]
            (when (and (or (nil? only-syms) (contains? (set only-syms) sym-name))
                       (not (contains? exclude-syms sym-name)))
-             (swap! heap-atom assoc (symbol (str current-ns) (str sym-name)) entry))))
+             (let [entry' (update entry :meta #(assoc (or % {}) :sci.impl/var-sym k))]
+               (swap! heap-atom assoc (symbol (str current-ns) (str sym-name)) entry')))))
        nil))))
 
 (defn- sci-print-doc
@@ -582,7 +666,7 @@
           entry        (some (fn [q] (when-let [e (get heap q)] [q e])) candidates)
           ns-data      (when-let [na (:ns-atom ctx)] (get @na sym-name))]
       (cond
-        entry
+        (and entry (not (:user-binding? (second entry))))
         (let [[qualified e] entry
               m (:meta e)
               doc-map (merge {:name (or (:name m) (symbol (name qualified)))
@@ -618,7 +702,10 @@
               (#'clojure.repl/print-doc {:name ns-sym :doc doc-str}))))))))
 
 (defn- make-defrecord-fn [ctx]
-  (fn [name-sym fields & specs]
+  ;; Called as a macro: (defrecord Name [fields] & specs)
+  ;; When invoked via (apply #'defrecord &form &env name fields & specs),
+  ;; the first two args are form/env and should be skipped.
+  (fn [_form _env name-sym fields & specs]
     (let [ns-sym     (if-let [a (:current-ns-atom ctx)] @a 'user)
           qualified  (symbol (str ns-sym) (str name-sym))
           dotted     (symbol (str ns-sym "." name-sym))
@@ -634,7 +721,10 @@
                   (list 'var (symbol (str ns-sym) (str "map->" name-sym))))))))
 
 (defn- make-deftype-fn [ctx]
-  (fn [name-sym fields & specs]
+  ;; Called as a macro: (deftype Name [fields] & specs)
+  ;; When invoked via (apply #'deftype &form &env name fields & specs),
+  ;; the first two args are form/env and should be skipped.
+  (fn [_form _env name-sym fields & specs]
     (let [ns-sym     (if-let [a (:current-ns-atom ctx)] @a 'user)
           qualified  (symbol (str ns-sym) (str name-sym))
           dotted     (symbol (str ns-sym "." name-sym))
@@ -675,19 +765,19 @@
                             (if (instance? sci.lang.Var v)
                               ;; Check dynamic bindings first, then heap
                               (let [sym (var-qualified-sym v)
-                                    dyn @step/current-dynamic-bindings]
+                                    dyn step/current-dynamic-bindings]
                                 (if (and dyn (contains? dyn sym))
                                   (get dyn sym)
                                   (let [entry (get @heap-atom sym)]
                                     (if entry (:val entry) (.-val ^sci.lang.Var v)))))
                               (var-get v)))
-                     :meta {:name 'var-get}}
+                     :meta {:name 'var-get :doc #?(:clj (:doc (meta #'clojure.core/var-get)) :cljs nil)}}
                     (symbol "clojure.core" "thread-bound?")
                     {:val (fn sci-thread-bound? [& vars]
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
                                         (let [sym (var-qualified-sym v)
-                                              dyn @step/current-dynamic-bindings]
+                                              dyn step/current-dynamic-bindings]
                                           (and dyn (contains? dyn sym)))
                                         (clojure.core/thread-bound? v)))
                                     vars))
@@ -696,31 +786,64 @@
                     {:val (fn sci-var-set [v val]
                             (if (instance? sci.lang.Var v)
                               (let [sym (var-qualified-sym v)
-                                    dyn @step/current-dynamic-bindings]
+                                    dyn step/current-dynamic-bindings]
                                 (if (and dyn (contains? dyn sym))
                                   ;; Update dynamic binding
-                                  (do (swap! step/current-dynamic-bindings assoc sym val)
+                                  (do (set! step/current-dynamic-bindings (assoc dyn sym val))
                                       val)
                                   ;; Update heap
                                   (let [entry (assoc (get @heap-atom sym) :val val)]
                                     (swap! heap-atom assoc sym entry)
                                     val)))
                               (var-set v val)))
-                     :meta {:name 'var-set}}
+                     :meta {:name 'var-set :doc #?(:clj (:doc (meta #'clojure.core/var-set)) :cljs nil)}}
+                    (symbol "clojure.core" "add-watch")
+                    {:val (fn sci-add-watch [ref key callback]
+                            (if (instance? sci.lang.Var ref)
+                              (let [sym (var-qualified-sym ref)]
+                                (swap! heap-atom update-in [sym :watchers] assoc key callback)
+                                ref)
+                              (clojure.core/add-watch ref key callback)))
+                     :meta {:name 'add-watch}}
+                    (symbol "clojure.core" "remove-watch")
+                    {:val (fn sci-remove-watch [ref key]
+                            (if (instance? sci.lang.Var ref)
+                              (let [sym (var-qualified-sym ref)]
+                                (swap! heap-atom update-in [sym :watchers] dissoc key)
+                                ref)
+                              (clojure.core/remove-watch ref key)))
+                     :meta {:name 'remove-watch}}
                     (symbol "clojure.core" "with-redefs-fn")
                     {:val (make-with-redefs-fn heap-atom) :meta {:name 'with-redefs-fn}}
                     (symbol "clojure.core" "alter-var-root")
                     {:val (make-alter-var-root-fn heap-atom) :meta {:name 'alter-var-root}}
                     (symbol "clojure.core" "meta")
                     {:val (fn sci-meta [obj]
-                            (let [m (meta obj)]
+                            (let [m (clojure.core/meta obj)]
                               (cond
-                                (:sci/closure m)
-                                (let [cleaned (dissoc m :sci/closure :type :name :ns :arities :env)]
-                                  (when (seq cleaned) cleaned))
+                                ;; SCI closures: user-visible meta is stored in :user-meta key
+                                (:sci/closure m) (:user-meta m)
+                                ;; SCI Vars: strip internal :sci.impl/var-sym key
                                 (:sci.impl/var-sym m) (dissoc m :sci.impl/var-sym)
                                 :else m)))
                      :meta {:name 'meta}}
+                    (symbol "clojure.core" "with-meta")
+                    {:val (fn sci-with-meta [obj new-meta]
+                            (let [m (clojure.core/meta obj)]
+                              (if (and (fn? obj) m (:sci/closure m))
+                                ;; SCI closure: update :user-meta, keep internal closure info intact
+                                (with-meta obj (assoc m :user-meta new-meta))
+                                (with-meta obj new-meta))))
+                     :meta {:name 'with-meta}}
+                    (symbol "clojure.core" "vary-meta")
+                    {:val (fn sci-vary-meta [obj f & args]
+                            (let [m (clojure.core/meta obj)]
+                              (if (and (fn? obj) m (:sci/closure m))
+                                ;; SCI closure: apply f to :user-meta only
+                                (let [new-user-meta (apply f (:user-meta m) args)]
+                                  (with-meta obj (assoc m :user-meta new-user-meta)))
+                                (apply clojure.core/vary-meta obj f args))))
+                     :meta {:name 'vary-meta}}
                     (symbol "clojure.core" "alter-meta!")
                     {:val (make-alter-meta!-fn heap-atom) :meta {:name 'alter-meta!}}
                     (symbol "clojure.core" "reset-meta!")
@@ -737,7 +860,7 @@
                     (symbol "clojure.core" "ns-resolve")
                     {:val (fn [ns-sym sym] (resolve-fn ns-sym sym)) :meta {:name 'ns-resolve}}
                     (symbol "clojure.core" "eval")
-                    {:val eval-fn :meta {:name 'eval}}
+                    {:val eval-fn :meta {:name 'eval :doc #?(:clj (:doc (meta #'clojure.core/eval)) :cljs nil)}}
                     (symbol "clojure.core" "macroexpand-1")
                     {:val (make-macroexpand-1-fn heap-atom) :meta {:name 'macroexpand-1}}
                     (symbol "clojure.core" "macroexpand")
@@ -746,14 +869,14 @@
                               (loop [f form]
                                 (let [expanded (me1-fn f)]
                                   (if (= expanded f) f (recur expanded))))))
-                     :meta {:name 'macroexpand}}
+                     :meta {:name 'macroexpand :doc #?(:clj (:doc (meta #'clojure.core/macroexpand)) :cljs nil)}}
                     (symbol "clojure.core" "bound?")
                     {:val (fn [& vars]
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
                                         (let [sym   (var-qualified-sym v)
                                               entry (get @heap-atom sym)
-                                              dyn   @step/current-dynamic-bindings]
+                                              dyn   step/current-dynamic-bindings]
                                           (or (:bound? entry)
                                               (and dyn (contains? dyn sym))
                                               (some? (.-val ^sci.lang.Var v))))
@@ -763,7 +886,7 @@
                     (symbol "clojure.core" "intern")
                     {:val (make-intern-fn heap-atom) :meta {:name 'intern}}
                     (symbol "clojure.core" "find-ns")
-                    {:val (make-find-ns-fn ctx) :meta {:name 'find-ns}}
+                    {:val (make-find-ns-fn ctx) :meta {:name 'find-ns :doc #?(:clj (:doc (meta #'clojure.core/find-ns)) :cljs nil)}}
                     (symbol "clojure.core" "create-ns")
                     {:val (make-create-ns-fn ctx) :meta {:name 'create-ns}}
                     (symbol "clojure.core" "the-ns")
@@ -771,6 +894,7 @@
                     (symbol "clojure.core" "ns-name")
                     {:val (fn [ns-sym]
                             (cond
+                              (sci-namespace? ns-sym) (:name ns-sym)
                               (symbol? ns-sym) ns-sym
                               (string? ns-sym) (symbol ns-sym)
                               :else (clojure.core/ns-name ns-sym)))
@@ -778,7 +902,7 @@
                     (symbol "clojure.core" "all-ns")
                     {:val (make-all-ns-fn ctx) :meta {:name 'all-ns}}
                     (symbol "clojure.core" "ns-publics")
-                    {:val ns-vars-fn :meta {:name 'ns-publics}}
+                    {:val ns-vars-fn :meta {:name 'ns-publics :doc #?(:clj (:doc (meta #'clojure.core/ns-publics)) :cljs nil)}}
                     (symbol "clojure.core" "ns-interns")
                     {:val ns-vars-fn :meta {:name 'ns-interns}}
                     (symbol "clojure.core" "*clojure-version*")
@@ -807,26 +931,114 @@
                     (symbol "clojure.core" "alias")
                     {:val (make-alias-fn ctx) :meta {:name 'alias}}
                     (symbol "clojure.core" "ns-unalias")
-                    {:val (make-ns-unalias-fn ctx) :meta {:name 'ns-unalias}}
+                    {:val (make-ns-unalias-fn ctx) :meta {:name 'ns-unalias :doc #?(:clj (:doc (meta #'clojure.core/ns-unalias)) :cljs nil)}}
                     (symbol "clojure.core" "ns-unmap")
                     {:val (fn [ns-sym sym]
                             (let [qualified (symbol (str ns-sym) (str sym))]
                               (swap! heap-atom dissoc qualified)
                               nil))
-                     :meta {:name 'ns-unmap}}
+                     :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs nil)}}
                     (symbol "clojure.core" "ns-imports")
                     {:val (fn [ns-sym]
                             {}) ;; TODO: track imports properly
                      :meta {:name 'ns-imports}}
                     (symbol "clojure.core" "remove-ns")
-                    {:val (make-remove-ns-fn ctx heap-atom) :meta {:name 'remove-ns}}
+                    {:val (make-remove-ns-fn ctx heap-atom) :meta {:name 'remove-ns :doc #?(:clj (:doc (meta #'clojure.core/remove-ns)) :cljs nil)}}
                     (symbol "clojure.core" "find-var")
-                    {:val (make-find-var-fn ctx heap-atom) :meta {:name 'find-var}}
+                    {:val (make-find-var-fn ctx heap-atom) :meta {:name 'find-var :doc #?(:clj (:doc (meta #'clojure.core/find-var)) :cljs nil)}}
                     (symbol "clojure.core" "refer")
-                    {:val (make-refer-fn heap-atom) :meta {:name 'refer}}
+                    {:val (make-refer-fn ctx heap-atom) :meta {:name 'refer :doc #?(:clj (:doc (meta #'clojure.core/refer)) :cljs nil)}}
                     (symbol "clojure.core" "ns-aliases")
-                    {:val (fn [ns-sym] (or (:aliases (get (:ns-table ctx) ns-sym)) {}))
+                    {:val (fn [ns-sym-or-obj]
+                            (let [ns-sym (if (sci-namespace? ns-sym-or-obj)
+                                           (:name ns-sym-or-obj)
+                                           ns-sym-or-obj)
+                                  ns-data (if-let [a (:ns-atom ctx)]
+                                            (get @a ns-sym)
+                                            (get (:ns-table ctx) ns-sym))
+                                  aliases (or (:aliases ns-data) {})
+                                  ns-objs (or (:ns-objects ctx) (atom {}))]
+                              ;; Return namespace objects as values (for identical? support)
+                              (reduce-kv (fn [m k v]
+                                           (assoc m k (get-or-create-ns-object ns-objs v)))
+                                         {} aliases)))
                      :meta {:name 'ns-aliases}}
+                    (symbol "clojure.core" "use")
+                    {:val (fn sci-use [& specs]
+                            (let [eval-f (fn [form]
+                                           (let [ns-atom (:ns-atom ctx)
+                                                 ns-table (if ns-atom @ns-atom (:ns-table ctx))
+                                                 m2 (machine/make-machine
+                                                     {:heap @heap-atom
+                                                      :ns-table ns-table
+                                                      :permissions {:allow (:allow ctx)
+                                                                    :deny  (:deny ctx)}})
+                                                 m2 (cond-> (assoc m2 :heap-atom heap-atom :ctx ctx)
+                                                      ns-atom (assoc :ns-atom ns-atom)
+                                                      (:current-ns-atom ctx)
+                                                      (assoc :current-ns-atom (:current-ns-atom ctx)
+                                                             :current-ns @(:current-ns-atom ctx))
+                                                      (:load-fn ctx) (assoc :load-fn (:load-fn ctx)))
+                                                 m2 (machine/push-frame m2 {:op :eval :expr form})]
+                                             (step/run m2)))]
+                              (doseq [spec specs]
+                                (let [spec (if (and (seq? spec) (= 'quote (first spec)))
+                                             (second spec)
+                                             spec)
+                                      [ns-sym opts] (if (sequential? spec)
+                                                      [(first spec) (apply hash-map (rest spec))]
+                                                      [spec {}])
+                                      only-syms (:only opts)
+                                      exclude-syms (set (:exclude opts))]
+                                  ;; Load the namespace via eval (uses SCI's require mechanism)
+                                  (eval-f (list 'require (list 'quote ns-sym)))
+                                  ;; Refer all public vars (or :only) to current ns
+                                  (let [current-ns (if-let [a (:current-ns-atom ctx)] @a 'user)
+                                        heap @heap-atom
+                                        ns-str (str ns-sym)]
+                                    (doseq [[k entry] heap
+                                            :when (= ns-str (namespace k))
+                                            :let [sym-name (symbol (name k))]
+                                            :when (and (or (nil? only-syms)
+                                                           (contains? (set only-syms) sym-name))
+                                                       (not (contains? exclude-syms sym-name)))]
+                                      (let [entry' (update entry :meta
+                                                           #(assoc (or % {}) :sci.impl/var-sym k))]
+                                        (swap! heap-atom assoc
+                                               (symbol (str current-ns) (str sym-name)) entry'))))))
+                              nil))
+                     :meta {:name 'use}}
+                    (symbol "clojure.core" "requiring-resolve")
+                    {:val (fn sci-requiring-resolve [sym]
+                            (when-not (qualified-symbol? sym)
+                              (throw (ex-info (str "Not a qualified symbol: " sym) {:type :sci/error})))
+                            (let [ns-sym (symbol (namespace sym))
+                                  eval-f (fn [form]
+                                           (let [ns-atom (:ns-atom ctx)
+                                                 ns-table (if ns-atom @ns-atom (:ns-table ctx))
+                                                 m2 (machine/make-machine
+                                                     {:heap @heap-atom
+                                                      :ns-table ns-table
+                                                      :permissions {:allow (:allow ctx)
+                                                                    :deny  (:deny ctx)}})
+                                                 m2 (cond-> (assoc m2 :heap-atom heap-atom :ctx ctx)
+                                                      ns-atom (assoc :ns-atom ns-atom)
+                                                      (:current-ns-atom ctx)
+                                                      (assoc :current-ns-atom (:current-ns-atom ctx)
+                                                             :current-ns @(:current-ns-atom ctx))
+                                                      (:load-fn ctx) (assoc :load-fn (:load-fn ctx)))
+                                                 m2 (machine/push-frame m2 {:op :eval :expr form})]
+                                             (step/run m2)))]
+                              ;; Load the namespace
+                              (eval-f (list 'require (list 'quote ns-sym)))
+                              ;; Resolve the var
+                              (let [heap @heap-atom
+                                    entry (get heap sym)]
+                                (when entry
+                                  (sci.lang/->Var (symbol (name sym)) (:val entry)
+                                                  (assoc (:meta entry) :sci.impl/var-sym sym)
+                                                  (:dynamic? entry))))))
+                     :meta {:name 'requiring-resolve}}
                     (symbol "clojure.core" "defonce")
                     {:val (fn sci-defonce [name expr]
                             (list 'do
@@ -851,25 +1063,46 @@
                     (symbol "clojure.core" "read-string")
                     {:val (fn sci-read-string
                             ([s]
-                             (let [default-fn (or (when *suppress-read*
-                                                    (fn [tag val] (tagged-literal tag val)))
-                                                  (when-let [f *default-data-reader-fn*]
-                                                    (fn [tag val] (f tag val))))
-                                   opts (cond-> (assoc (make-reader-opts)
-                                                       :location? (constantly false))
-                                          default-fn (assoc :default default-fn))]
+                             (let [suppress? *suppress-read*
+                                   re-val    (or *read-eval* @read-eval)
+                                   default-fn *default-data-reader-fn*
+                                   resolver  *reader-resolver*
+                                   opts (cond-> (assoc (make-reader-opts) :location? (constantly false))
+                                          suppress? (assoc :suppress-read true)
+                                          re-val    (assoc :read-eval clojure.core/eval)
+                                          default-fn (assoc :readers
+                                                        #?(:clj (fn [tag]
+                                                                   (or (get clojure.core/default-data-readers tag)
+                                                                       (fn [val] (default-fn tag val))))
+                                                           :cljs nil))
+                                          resolver  (assoc :auto-resolve
+                                                       #?(:clj (fn [alias]
+                                                                  (if (= alias :current)
+                                                                    (.currentNS ^clojure.lang.LispReader$Resolver resolver)
+                                                                    (.resolveAlias ^clojure.lang.LispReader$Resolver resolver alias)))
+                                                          :cljs nil)))]
                                (edamame/parse-string s opts)))
                             ([opts s]
-                             (let [eof-val (:eof opts ::none)
-                                   ;; Pick up dynamic vars from thread bindings
-                                   default-fn (or (when *suppress-read*
-                                                    (fn [tag val] (tagged-literal tag val)))
-                                                  (when-let [f *default-data-reader-fn*]
-                                                    (fn [tag val] (f tag val))))
-                                   reader-opts (cond-> (merge (assoc (make-reader-opts)
-                                                                     :location? (constantly false))
+                             (let [eof-val   (:eof opts ::none)
+                                   suppress? *suppress-read*
+                                   re-val    (or *read-eval* @read-eval)
+                                   default-fn *default-data-reader-fn*
+                                   resolver  *reader-resolver*
+                                   reader-opts (cond-> (merge (assoc (make-reader-opts) :location? (constantly false))
                                                               (dissoc opts :eof))
-                                                 default-fn (assoc :default default-fn))
+                                                 suppress? (assoc :suppress-read true)
+                                                 re-val    (assoc :read-eval clojure.core/eval)
+                                                 default-fn (assoc :readers
+                                                               #?(:clj (fn [tag]
+                                                                          (or (get clojure.core/default-data-readers tag)
+                                                                              (fn [val] (default-fn tag val))))
+                                                                  :cljs nil))
+                                                 resolver  (assoc :auto-resolve
+                                                              #?(:clj (fn [alias]
+                                                                         (if (= alias :current)
+                                                                           (.currentNS ^clojure.lang.LispReader$Resolver resolver)
+                                                                           (.resolveAlias ^clojure.lang.LispReader$Resolver resolver alias)))
+                                                                 :cljs nil)))
                                    result (try
                                             (edamame/parse-string s reader-opts)
                                             (catch Exception e
@@ -882,7 +1115,50 @@
                                         (clojure.string/blank? s))
                                  eof-val
                                  result))))
-                     :meta {:name 'read-string}}}
+                     :meta {:name 'read-string}}
+                    #?@(:clj
+                        [(symbol "clojure.core" "read")
+                         {:val (fn sci-read
+                                 ([]
+                                  (let [re-val (or *read-eval* @read-eval)
+                                        do-read (fn [] (if (and re-val (not *read-eval*))
+                                                         (clojure.core/binding [clojure.core/*read-eval* true]
+                                                           (clojure.core/read *in*))
+                                                         (clojure.core/read *in*)))]
+                                    (try (do-read)
+                                         (catch clojure.lang.LispReader$ReaderException e
+                                           (throw (or (.getCause ^Throwable e) e))))))
+                                 ([stream]
+                                  (let [re-val (or *read-eval* @read-eval)
+                                        do-read (fn [] (if (and re-val (not *read-eval*))
+                                                         (clojure.core/binding [clojure.core/*read-eval* true]
+                                                           (clojure.core/read stream))
+                                                         (clojure.core/read stream)))]
+                                    (try (do-read)
+                                         (catch clojure.lang.LispReader$ReaderException e
+                                           (throw (or (.getCause ^Throwable e) e))))))
+                                 ([stream eof-error? eof-value]
+                                  (let [re-val (or *read-eval* @read-eval)
+                                        do-read (fn [] (if (and re-val (not *read-eval*))
+                                                         (clojure.core/binding [clojure.core/*read-eval* true]
+                                                           (clojure.core/read stream eof-error? eof-value))
+                                                         (clojure.core/read stream eof-error? eof-value)))]
+                                    (try (do-read)
+                                         (catch clojure.lang.LispReader$ReaderException e
+                                           (throw (or (.getCause ^Throwable e) e))))))
+                                 ([opts stream]
+                                  ;; Normalize :features from vector/seq to set (Clojure requires a set)
+                                  (let [opts (cond-> opts
+                                               (:features opts) (update :features (fn [f] (if (set? f) f (set f)))))
+                                        re-val (or *read-eval* @read-eval)
+                                        do-read (fn [] (if (and re-val (not *read-eval*))
+                                                         (clojure.core/binding [clojure.core/*read-eval* true]
+                                                           (clojure.core/read opts stream))
+                                                         (clojure.core/read opts stream)))]
+                                    (try (do-read)
+                                         (catch clojure.lang.LispReader$ReaderException e
+                                           (throw (or (.getCause ^Throwable e) e)))))))
+                          :meta {:name 'read}}])}
         ns-atom (or (:ns-atom ctx) (atom (:ns-table ctx)))
         ;; Override ns-aliases to read from ns-atom
         heap (assoc (merge @heap-atom extra-heap)
@@ -892,11 +1168,13 @@
                     (symbol "clojure.core" "defrecord")
                     {:val (make-defrecord-fn ctx)
                      :meta {:macro true :name 'defrecord}
-                     :macro? true}
+                     :macro? true
+                     :host-macro? true}
                     (symbol "clojure.core" "deftype")
                     {:val (make-deftype-fn ctx)
                      :meta {:macro true :name 'deftype}
-                     :macro? true}
+                     :macro? true
+                     :host-macro? true}
                     ;; instance? — check SCI types too
                     (symbol "clojure.core" "instance?")
                     {:val (fn [cls obj]
@@ -940,20 +1218,38 @@
                             (or (clojure.core/class? x)
                                 (instance? sci.lang.Type x)))
                      :meta {:name 'class?}})
+        ;; Override pmap to capture SCI dynamic bindings at call time.
+        ;; pmap is lazy — futures may be created after the binding form exits, so we must
+        ;; snapshot current-dynamic-bindings when pmap is called and restore it in each thread.
+        heap #?(:clj (assoc heap
+                            (symbol "clojure.core" "pmap")
+                            {:val (fn sci-pmap [f & colls]
+                                    (let [dyn-bindings step/current-dynamic-bindings]
+                                      (apply clojure.core/pmap
+                                             (fn [& args]
+                                               (clojure.core/binding [step/current-dynamic-bindings dyn-bindings]
+                                                 (apply f args)))
+                                             colls)))
+                             :meta {:name 'pmap}})
+                 :cljs heap)
         m (machine/make-machine
            {:heap heap
             :ns-table @ns-atom
             :permissions {:allow (:allow ctx)
-                          :deny (:deny ctx)}})]
+                          :deny (:deny ctx)
+                          :disable-arity-checks (:disable-arity-checks ctx)}})]
     (let [expr (if (= 1 (count forms))
                  (first forms)
                  (cons 'do forms))
           current-ns-atom (or (:current-ns-atom ctx) (atom 'user))
           m (cond-> (assoc m :heap-atom heap-atom :ns-atom ns-atom
                              :current-ns-atom current-ns-atom
-                             :current-ns @current-ns-atom)
+                             :current-ns @current-ns-atom
+                             :ctx ctx)
                 (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
                 (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx))
+                (:classes ctx) (assoc :classes (:classes ctx))
+                (:inverse-registry ctx) (assoc :inverse-registry (:inverse-registry ctx))
                 true (as-> m' m'
                       (let [f (or (:file ctx) @(clojure.core/resolve 'sci.core/file))]
                         (if f (assoc m' :current-file f) m'))))]
@@ -966,8 +1262,10 @@
   ([s opts]
    (let [;; When sci/ns atom has been bound to a symbol (via sci/binding), use it
          ;; as the initial namespace for the context.
-         sci-ns-var sci.core/ns  ; the sci/ns atom — avoid collision with clojure.core/ns macro
-         sci-ns-val @sci-ns-var
+         ;; sci.core/ns is a var holding an atom — double deref: var→atom→value.
+         ;; Use find-var for runtime lookup to avoid compile-time "No such var: sci.core/ns"
+         ;; (sci.core/ns is defined later in this file)
+         sci-ns-val (some-> (clojure.core/find-var 'sci.core/ns) deref deref)
          initial-ns (when (symbol? sci-ns-val) sci-ns-val)
          ctx (if (and opts (:heap opts))
                opts  ;; already initialized
@@ -993,7 +1291,13 @@
            (if (and (map? result) (contains? #{:suspend :effect} (:status result)))
              result  ;; Return suspended machine as-is
              result)
-           (let [machine (make-machine-from-ctx ctx [form])
+           (let [eval-file (get (meta form) :clojure.core/eval-file)
+                 machine (make-machine-from-ctx ctx [form])
+                 machine (if eval-file
+                           (-> machine
+                               (assoc :current-file eval-file)
+                               (update :dynamic-bindings assoc 'clojure.core/*file* eval-file))
+                           machine)
                  res (step/run machine)]
              (recur res))))))))
 
@@ -1020,9 +1324,9 @@
   (edamame/reader s))
 
 (defn source-reader
-  "Create a source reader from a string."
+  "Create a source reader from a string that tracks original source text for parse-next+string."
   [s]
-  (reader s))
+  (edamame/source-reader s))
 
 (defn parse-next
   "Parse the next form from a reader."
@@ -1051,11 +1355,11 @@
    init-val))
 
 (defn new-dynamic-var
-  "Create a new dynamic SCI var."
+  "Create a new dynamic SCI var. Returns a DynamicVar that wraps an atom for thread-local storage."
   ([name] (new-dynamic-var name nil nil))
   ([name init-val] (new-dynamic-var name init-val nil))
   ([name init-val opts]
-   (atom init-val)))
+   (sci.lang/->DynamicVar (atom init-val) (or opts {}))))
 
 (defmacro copy-var
   "Copy a Clojure var into an SCI namespace."
@@ -1197,9 +1501,22 @@
                  ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs)))))))))
 
 (defmacro with-bindings
-  "Execute body with SCI var bindings."
+  "Execute body with SCI var bindings. Keys must be dynamic vars (atoms from new-dynamic-var)."
   [binding-map & body]
-  `(do ~@body))
+  `(let [bmap# ~binding-map]
+     (doseq [[k# _#] bmap#]
+       (when-not #?(:clj (or (instance? clojure.lang.Atom k#) (instance? sci.lang.DynamicVar k#))
+                    :cljs (or (instance? cljs.core/Atom k#) (instance? sci.lang.DynamicVar k#)))
+         (throw (ex-info (str "Cannot bind non-dynamic var: " k#)
+                         {:type :bind-non-dynamic}))))
+     (let [saved# (into {} (map (fn [[v# _#]] [v# @v#]) bmap#))]
+       (try
+         (doseq [[v# val#] bmap#]
+           (reset! v# val#))
+         ~@body
+         (finally
+           (doseq [[v# old#] saved#]
+             (reset! v# old#)))))))
 
 (defmacro with-redefs
   "Temporarily redefine vars."
@@ -1303,13 +1620,21 @@
 
 (defn format-stacktrace [st]
   (when st
-    (->> st
-         (filter :line) ;; only entries with source locations
-         (mapv (fn [{:keys [ns name line column file]}]
-                 (let [ns-str (str (or ns "user"))
-                       name-str (if name (str ns-str "/" name) (str ns-str))
-                       file-str (or file "NO_SOURCE_PATH")]
-                   (format "%-18s - %s:%s:%s" name-str file-str line column)))))))
+    (let [entries (->> st
+                       (filter :line)
+                       (mapv (fn [{:keys [ns name line column file]}]
+                               (let [ns-str (str (or ns "user"))
+                                     name-str (if name (str ns-str "/" name) ns-str)
+                                     file-str (or file "NO_SOURCE_PATH")]
+                                 {:name-str name-str
+                                  :loc (str file-str ":" line ":" column)}))))
+          max-len (reduce max 0 (map (comp count :name-str) entries))]
+      (mapv (fn [{:keys [name-str loc]}]
+              (str name-str
+                   (apply str (repeat (- max-len (count name-str)) " "))
+                   " - "
+                   loc))
+            entries))))
 
 ;; ============================================================
 ;; set! for dynamic vars
@@ -1318,7 +1643,8 @@
 (defn set!
   "Set a dynamic var's value."
   [v val]
-  (if (instance? #?(:clj clojure.lang.Atom :cljs Atom) v)
+  (if (or (instance? #?(:clj clojure.lang.Atom :cljs Atom) v)
+          (instance? sci.lang.DynamicVar v))
     (reset! v val)
     val))
 
@@ -1331,14 +1657,15 @@
 (def eof ::eof)
 
 (defn parse-next+string
-  "Parse the next form from a reader, returning [form string]."
+  "Parse the next form from a reader, returning [form string].
+   rdr must be created with source-reader to get the original source text."
   [ctx rdr]
-  (let [col-before (edamame/get-column-number rdr)
-        form (parse-next ctx rdr)
-        col-after (edamame/get-column-number rdr)]
-    ;; Return [form source-string]
-    ;; Note: exact source string reconstruction is limited
-    [form (pr-str form)]))
+  (let [eof ::eof
+        opts (edamame/normalize-opts (merge (make-reader-opts) {:eof eof}))
+        [form s] (edamame/parse-next+string rdr opts)]
+    (if (identical? form eof)
+      [::eof nil]
+      [form s])))
 
 ;; ============================================================
 ;; Additional API functions

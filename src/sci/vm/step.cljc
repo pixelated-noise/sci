@@ -8,8 +8,14 @@
 
 (declare match-arity bind-params run check-permission form-location do-extend)
 
-;; Shared dynamic bindings for closures called from host code (e.g. via map)
-(def current-dynamic-bindings (atom nil))
+;; Thread-local dynamic bindings for closures called from host code (e.g. via map).
+;; Using a dynamic var ensures each thread (future/test) has isolated bindings.
+(def ^:dynamic current-dynamic-bindings nil)
+
+;; Thread-local: most recent form location seen in step-eval (line/column map or nil).
+;; Updated before each form is processed so the exception handler can report the correct
+;; call-site location even when the exception is thrown inside the same step.
+(def ^:dynamic *current-form-loc* nil)
 
 ;; ============================================================
 ;; Helpers
@@ -30,7 +36,7 @@
      ns in-ns require letfn* binding
      defmulti defmethod remove-method prefer-method
      defprotocol extend extend-type extend-protocol
-     deftype* reify monitor-enter monitor-exit
+     deftype* reify* monitor-enter monitor-exit
      suspend!})
 
 ;; ============================================================
@@ -48,6 +54,7 @@
     #?@(:clj  [(char? form) :literal])
     (symbol? form)  :symbol
     (vector? form)  :vector
+    #?@(:clj [(record? form) :literal])
     (map? form)     :map
     (set? form)     :set
     (seq? form)
@@ -64,11 +71,12 @@
                        :cljs (= "." (subs n 0 1)))
                     (not= n "..")
                     (> (count n) 1)))) :dot-call
-        ;; ClassName. constructor call
+        ;; ClassName. constructor call (but not .. which is a macro)
         (and (symbol? head)
              (let [n (name head)]
-               #?(:clj (.endsWith ^String n ".")
-                  :cljs (= "." (subs n (dec (count n))))))) :new-call
+               (and #?(:clj (.endsWith ^String n ".")
+                       :cljs (= "." (subs n (dec (count n)))))
+                    (not= n "..")))) :new-call
         :else :invoke))
     :else :literal))
 
@@ -95,6 +103,24 @@
              (or (try (Class/forName (str (first prefixes) class-name))
                       (catch ClassNotFoundException _ nil))
                  (recur (rest prefixes)))))))))
+
+#?(:clj
+   (defn- check-class-access
+     "Check if a class is allowed by the :classes sandbox config.
+      Throws if not allowed."
+     [machine class-name klass]
+     (let [classes (:classes machine)]
+       (when (some? classes)
+         (let [allowed (or (= :all classes)
+                           (= :all (:allow classes))
+                           (contains? classes (symbol class-name))
+                           (contains? classes klass)
+                           (and (map? classes)
+                                (or (contains? classes (symbol class-name))
+                                    (contains? classes klass))))]
+           (when-not allowed
+             (throw (ex-info (str class-name " is not allowed!")
+                             {:type :sci/error}))))))))
 
 #?(:clj
    (defn- resolve-static-member
@@ -140,66 +166,74 @@
           (let [sym-ns (namespace sym)
                 ;; Use heap-atom for latest state (handles intern, defmacro etc.)
                 heap (if-let [a (:heap-atom machine)] @a (:heap machine))]
-        (if sym-ns
+            (if sym-ns
           ;; Qualified symbol
-          (let [ns-table (:ns machine)
-                current-ns (:current-ns machine)
-                current-ns-data (get ns-table current-ns)
-                resolved-ns (or (get (:aliases current-ns-data) (symbol sym-ns))
+              (let [ns-table (:ns machine)
+                    current-ns (:current-ns machine)
+                    current-ns-data (get ns-table current-ns)
+                    resolved-ns (or (get (:aliases current-ns-data) (symbol sym-ns))
                                 ;; Global ns-aliases
-                                (get (:ns-aliases machine) (symbol sym-ns))
-                                (symbol sym-ns))
+                                    (get (:ns-aliases machine) (symbol sym-ns))
+                                    (symbol sym-ns))
                 ;; Follow ns-aliases transitively
-                resolved-ns (or (get (:ns-aliases machine) resolved-ns)
-                                resolved-ns)
-                qualified (symbol (str resolved-ns) sym-name)
-                dyn (:dynamic-bindings machine)]
-            (if (and dyn (contains? dyn qualified))
-              (get dyn qualified)
-              (if (contains? heap qualified)
-                (let [entry (get heap qualified)]
-                  (if (and (not (:bound? entry true))
-                           (nil? (:val entry)))
-                    (sci.lang/->Unbound qualified)
-                    (:val entry)))
+                    resolved-ns (or (get (:ns-aliases machine) resolved-ns)
+                                    resolved-ns)
+                    qualified (symbol (str resolved-ns) sym-name)
+                    dyn (:dynamic-bindings machine)]
+                (if (and dyn (contains? dyn qualified))
+                  (get dyn qualified)
+                  (if (contains? heap qualified)
+                    (let [entry (get heap qualified)
+                          v (:val entry)
+                      ;; DynamicVar (from new-dynamic-var) wraps an atom for thread-local storage;
+                      ;; deref it to get the current value. Plain atoms are returned as-is.
+                          v (if (instance? sci.lang.DynamicVar v) @v v)]
+                      (if (and (not (:bound? entry true))
+                               (nil? v))
+                        (sci.lang/->Unbound qualified)
+                        v))
               ;; Check SCI types in the resolved namespace
-              (if-let [type-obj (get-in machine [:ns resolved-ns :types (symbol sym-name)])]
-                type-obj
-                ;; Try as Java static field/method
-                #?(:clj
-                   (if-let [klass (try-resolve-class sym-ns)]
-                     (resolve-static-member klass sym-name)
-                     (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                    {:type :sci/error :sym sym})))
-                   :cljs
-                   (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                   {:type :sci/error :sym sym})))))))
-          ;; Unqualified
-          (let [ns-sym (:current-ns machine)
-                qualified (symbol (str ns-sym) sym-name)
-                core-q (symbol "clojure.core" sym-name)
-                dyn (:dynamic-bindings machine)
-                ;; Check :refer-clojure :exclude
-                excludes (get-in machine [:ns ns-sym :refer-clojure-excludes])
-                core-excluded? (and excludes (contains? excludes (symbol sym-name)))]
-            ;; Use if-let chain instead of or — or treats false/nil as "not found"
-            (if (and dyn (contains? dyn qualified)) (get dyn qualified)
-              (if (and (not core-excluded?) dyn (contains? dyn core-q)) (get dyn core-q)
-                (if (contains? heap qualified)
-                  (let [entry (get heap qualified)]
-                    (if (and (not (:bound? entry true))
-                             (nil? (:val entry)))
-                      (sci.lang/->Unbound qualified)
-                      (:val entry)))
-                  (if (and (not core-excluded?) (contains? heap core-q)) (:val (get heap core-q))
-                    ;; Check types in namespace
-                    (if-let [type-obj (get-in machine [:ns ns-sym :types (symbol sym-name)])]
+                    (if-let [type-obj (get-in machine [:ns resolved-ns :types (symbol sym-name)])]
                       type-obj
-                      #?(:clj (or (try-resolve-class sym-name)
-                                  (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                                  {:type :sci/error :sym sym})))
-                         :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                               {:type :sci/error :sym sym}))))))))))))))))
+                ;; Try as Java static field/method
+                      #?(:clj
+                         (if-let [klass (try-resolve-class sym-ns)]
+                           (resolve-static-member klass sym-name)
+                           (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                           {:type :sci/error :sym sym :phase "analysis"})))
+                         :cljs
+                         (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                         {:type :sci/error :sym sym :phase "analysis"})))))))
+          ;; Unqualified
+              (let [ns-sym (:current-ns machine)
+                    qualified (symbol (str ns-sym) sym-name)
+                    core-q (symbol "clojure.core" sym-name)
+                    dyn (:dynamic-bindings machine)
+                ;; Check :refer-clojure :exclude
+                    excludes (get-in machine [:ns ns-sym :refer-clojure-excludes])
+                    core-excluded? (and excludes (contains? excludes (symbol sym-name)))]
+            ;; Use if-let chain instead of or — or treats false/nil as "not found"
+                (if (and dyn (contains? dyn qualified)) (get dyn qualified)
+                    (if (and (not core-excluded?) dyn (contains? dyn core-q)) (get dyn core-q)
+                        (if (contains? heap qualified)
+                          (let [entry (get heap qualified)
+                                v (:val entry)
+                        ;; DynamicVar (from new-dynamic-var) wraps an atom for thread-local storage;
+                        ;; deref it to get the current value. Plain atoms are returned as-is.
+                                v (if (instance? sci.lang.DynamicVar v) @v v)]
+                            (if (and (not (:bound? entry true))
+                                     (nil? v))
+                              (sci.lang/->Unbound qualified)
+                              v))
+                          (if (and (not core-excluded?) (contains? heap core-q)) (:val (get heap core-q))
+                    ;; Check types in namespace
+                              (if-let [type-obj (get-in machine [:ns ns-sym :types (symbol sym-name)])]
+                                type-obj
+                                #?(:clj (or (try-resolve-class sym-name)
+                                            (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                            {:type :sci/error :sym sym :phase "analysis"})))
+                                   :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                         {:type :sci/error :sym sym :phase "analysis"}))))))))))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
@@ -220,6 +254,11 @@
 
 (defn step-eval-symbol [machine frame]
   (let [sym (:expr frame)
+        _ (when (and (not (qualified-symbol? sym))
+                     (contains? special-forms sym)
+                     (not (contains? (:env machine) sym)))
+            (throw (ex-info (str "Unable to resolve symbol: " sym " in this context")
+                            {:type :sci/error :sym sym :phase "analysis"})))
         ;; Check if symbol resolves to a macro — can't use macro as value
         _ (when-not (contains? (:env machine) sym)
             (let [sym-name (name sym)
@@ -312,12 +351,15 @@
 
 (defn step-apply-meta [machine frame]
   (let [val (:value frame)
-        evaled-meta (:result machine)
-        ;; Merge with existing metadata (preserve :sci/closure etc.)
-        new-meta (if (meta val)
-                   (merge (meta val) evaled-meta)
-                   evaled-meta)]
-    (m/push-value machine (with-meta val new-meta))))
+        evaled-meta (:result machine)]
+    (if (and (fn? val) (:sci/closure (clojure.core/meta val)))
+      ;; SCI closure: store user meta in :user-meta key (keeps internal closure info intact)
+      (m/push-value machine (with-meta val (assoc (clojure.core/meta val) :user-meta evaled-meta)))
+      ;; Other values: merge normally
+      (let [new-meta (if (clojure.core/meta val)
+                       (merge (clojure.core/meta val) evaled-meta)
+                       evaled-meta)]
+        (m/push-value machine (with-meta val new-meta))))))
 
 ;; ============================================================
 ;; if
@@ -387,8 +429,8 @@
         (-> machine
             (update :env assoc sym val)
             (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
-                                          :bind-sym nil
-                                          :next-idx nil))))
+                                    :bind-sym nil
+                                    :next-idx nil))))
       (if (>= idx (count bindings))
         ;; All bindings done — evaluate body
         (let [body (:body frame)]
@@ -405,8 +447,8 @@
         (let [[sym expr] (nth bindings idx)]
           (-> machine
               (m/replace-frame (assoc frame :bind-idx nil
-                                            :bind-sym sym
-                                            :next-idx (inc idx)))
+                                      :bind-sym sym
+                                      :next-idx (inc idx)))
               (m/push-frame {:op :eval :expr expr})))))))
 
 ;; do-restore-env: like do but restores env when done
@@ -434,134 +476,134 @@
    Throws if recur is found in non-tail position or with wrong arity."
   ([form tail?] (check-recur-in-body form tail? nil))
   ([form tail? expected-argc]
-  (cond
+   (cond
     ;; Check inside vectors — not tail position
-    (vector? form) (doseq [e form] (check-recur-in-body e false))
+     (vector? form) (doseq [e form] (check-recur-in-body e false))
     ;; Check inside maps — not tail position
-    (map? form) (doseq [[k v] form]
-                  (check-recur-in-body k false)
-                  (check-recur-in-body v false))
+     (map? form) (doseq [[k v] form]
+                   (check-recur-in-body k false)
+                   (check-recur-in-body v false))
     ;; Check inside sets — not tail position
-    (set? form) (doseq [e form] (check-recur-in-body e false))
-    (not (seq? form)) nil
-    (empty? form) nil
-    :else
-    (let [raw-head (first form)
+     (set? form) (doseq [e form] (check-recur-in-body e false))
+     (not (seq? form)) nil
+     (empty? form) nil
+     :else
+     (let [raw-head (first form)
           ;; Strip namespace from head (e.g. clojure.core/let → let)
-          head (if (and (symbol? raw-head) (namespace raw-head))
-                 (symbol (name raw-head))
-                 raw-head)]
-      (cond
+           head (if (and (symbol? raw-head) (namespace raw-head))
+                  (symbol (name raw-head))
+                  raw-head)]
+       (cond
         ;; (recur ...) — check if we're in tail position and arity matches
-        (= 'recur head)
-        (do (when (= expected-argc :in-try)
-              (throw (ex-info "Cannot recur across try"
-                              {:type :sci/error})))
-            (when-not tail?
-              (throw (ex-info "Can only recur from tail position"
-                              {:type :sci/error})))
-            (when (and (number? expected-argc) (not= expected-argc (count (rest form))))
-              (throw (ex-info (str "Mismatched argument count to recur, expected: "
-                                   expected-argc " args, got: " (count (rest form)))
-                              {:type :sci/error}))))
+         (= 'recur head)
+         (do (when (= expected-argc :in-try)
+               (throw (ex-info "Cannot recur across try"
+                               {:type :sci/error})))
+             (when-not tail?
+               (throw (ex-info "Can only recur from tail position"
+                               {:type :sci/error})))
+             (when (and (number? expected-argc) (not= expected-argc (count (rest form))))
+               (throw (ex-info (str "Mismatched argument count to recur, expected: "
+                                    expected-argc " args, got: " (count (rest form)))
+                               {:type :sci/error}))))
 
         ;; (if test then else) — test is not tail, branches inherit tail?
-        (= 'if head)
-        (let [[_ test then else] form]
-          (check-recur-in-body test false)
-          (check-recur-in-body then tail? expected-argc)
-          (when else (check-recur-in-body else tail? expected-argc)))
+         (= 'if head)
+         (let [[_ test then else] form]
+           (check-recur-in-body test false)
+           (check-recur-in-body then tail? expected-argc)
+           (when else (check-recur-in-body else tail? expected-argc)))
 
         ;; (do expr...) — only last expr is tail
-        (= 'do head)
-        (let [exprs (rest form)]
-          (when (seq exprs)
-            (doseq [e (butlast exprs)]
-              (check-recur-in-body e false))
-            (check-recur-in-body (last exprs) tail? expected-argc)))
+         (= 'do head)
+         (let [exprs (rest form)]
+           (when (seq exprs)
+             (doseq [e (butlast exprs)]
+               (check-recur-in-body e false))
+             (check-recur-in-body (last exprs) tail? expected-argc)))
 
         ;; (let* [bindings...] body...) or (let ...) — only last body expr is tail
-        (contains? '#{let* let letfn*} head)
-        (let [[_ bindings & body] form]
-          (doseq [[_ init] (partition 2 bindings)]
-            (check-recur-in-body init false))
-          (when (seq body)
-            (doseq [e (butlast body)]
-              (check-recur-in-body e false))
-            (check-recur-in-body (last body) tail? expected-argc)))
+         (contains? '#{let* let letfn*} head)
+         (let [[_ bindings & body] form]
+           (doseq [[_ init] (partition 2 bindings)]
+             (check-recur-in-body init false))
+           (when (seq body)
+             (doseq [e (butlast body)]
+               (check-recur-in-body e false))
+             (check-recur-in-body (last body) tail? expected-argc)))
 
         ;; (loop* [bindings...] body...) — body is a new recur target
-        (= 'loop* head) nil
+         (= 'loop* head) nil
 
         ;; (fn* ...) / (fn ...) / (letfn* ...) — new recur context, don't descend
-        (contains? '#{fn* fn letfn* letfn reify} head) nil
+         (contains? '#{fn* fn letfn* letfn reify*} head) nil
 
         ;; (defn name [params] body) — new recur context, but check body
-        (contains? '#{defn defn-} head)
-        (let [args (rest form)
+         (contains? '#{defn defn-} head)
+         (let [args (rest form)
               ;; Skip name, docstring?, attr-map?
-              args (if (symbol? (first args)) (rest args) args)
-              args (if (string? (first args)) (rest args) args)
-              args (if (map? (first args)) (rest args) args)]
-          (when (vector? (first args))
+               args (if (symbol? (first args)) (rest args) args)
+               args (if (string? (first args)) (rest args) args)
+               args (if (map? (first args)) (rest args) args)]
+           (when (vector? (first args))
             ;; Single arity: [params] body...
-            (let [params (first args)
-                  body (rest args)
-                  argc (count (remove #{'&} params))]
-              (when (seq body)
-                (doseq [e (butlast body)]
-                  (check-recur-in-body e false))
-                (check-recur-in-body (last body) true argc)))))
+             (let [params (first args)
+                   body (rest args)
+                   argc (count (remove #{'&} params))]
+               (when (seq body)
+                 (doseq [e (butlast body)]
+                   (check-recur-in-body e false))
+                 (check-recur-in-body (last body) true argc)))))
 
         ;; (try ...) — recur not allowed across try
-        (= 'try head)
-        (doseq [expr (rest form)]
-          (if (and (seq? expr) (contains? #{'catch 'finally} (first expr)))
-            (doseq [e (rest expr)]
-              (check-recur-in-body e false :in-try))
-            (check-recur-in-body expr false :in-try)))
+         (= 'try head)
+         (doseq [expr (rest form)]
+           (if (and (seq? expr) (contains? #{'catch 'finally} (first expr)))
+             (doseq [e (rest expr)]
+               (check-recur-in-body e false :in-try))
+             (check-recur-in-body expr false :in-try)))
 
         ;; (case* ...) / (case ...) — result exprs inherit tail position
-        (contains? '#{case* case} head)
-        (let [[_ expr _ _ default case-map] form]
-          (check-recur-in-body expr false)
-          (check-recur-in-body default tail? expected-argc)
-          (when (map? case-map)
-            (doseq [[_ [_ result-expr]] case-map]
-              (check-recur-in-body result-expr tail? expected-argc))))
+         (contains? '#{case* case} head)
+         (let [[_ expr _ _ default case-map] form]
+           (check-recur-in-body expr false)
+           (check-recur-in-body default tail? expected-argc)
+           (when (map? case-map)
+             (doseq [[_ [_ result-expr]] case-map]
+               (check-recur-in-body result-expr tail? expected-argc))))
 
         ;; (def ...) — init expr is not tail
-        (= 'def head)
-        (when (> (count form) 2)
-          (check-recur-in-body (last form) false))
+         (= 'def head)
+         (when (> (count form) 2)
+           (check-recur-in-body (last form) false))
 
         ;; (binding [...] body...) — only last body is tail
-        (= 'binding head)
-        (let [[_ _ & body] form]
-          (when (seq body)
-            (doseq [e (butlast body)]
-              (check-recur-in-body e false))
-            (check-recur-in-body (last body) tail? expected-argc)))
+         (= 'binding head)
+         (let [[_ _ & body] form]
+           (when (seq body)
+             (doseq [e (butlast body)]
+               (check-recur-in-body e false))
+             (check-recur-in-body (last body) tail? expected-argc)))
 
         ;; Macros that pass tail position to their last arg
-        (contains? '#{or and when when-not when-first} head)
-        (let [args (rest form)]
-          (when (seq args)
-            (doseq [e (butlast args)]
-              (check-recur-in-body e false))
-            (check-recur-in-body (last args) tail? expected-argc)))
+         (contains? '#{or and when when-not when-first} head)
+         (let [args (rest form)]
+           (when (seq args)
+             (doseq [e (butlast args)]
+               (check-recur-in-body e false))
+             (check-recur-in-body (last args) tail? expected-argc)))
 
         ;; if-let/when-let/if-some/when-some — [binding] then else
-        (contains? '#{if-let when-let if-some when-some} head)
-        (let [[_ bindings & body] form]
-          (when (vector? bindings)
-            (doseq [e bindings] (check-recur-in-body e false)))
-          (doseq [e body] (check-recur-in-body e tail? expected-argc)))
+         (contains? '#{if-let when-let if-some when-some} head)
+         (let [[_ bindings & body] form]
+           (when (vector? bindings)
+             (doseq [e bindings] (check-recur-in-body e false)))
+           (doseq [e body] (check-recur-in-body e tail? expected-argc)))
 
         ;; Any other list form — args are not tail
-        :else
-        (doseq [arg (rest form)]
-          (check-recur-in-body arg false)))))))
+         :else
+         (doseq [arg (rest form)]
+           (check-recur-in-body arg false)))))))
 
 (defn- check-recur-tail-position
   "Check that recur is only used in tail position within fn/loop arities."
@@ -574,7 +616,59 @@
         (check-recur-in-body (last body) true argc)))))
 
 ;; ============================================================
-;; fn*
+;; ^:const inlining — substitute const var references in fn bodies
+;; ============================================================
+
+(defn- inline-const-syms
+  "Walk a form, replacing unqualified symbols that resolve to :const? vars with
+   their current values (wrapped in quote). Tracks local bindings introduced by
+   let*, loop*, fn*, destructuring etc. so they are NOT substituted."
+  [form heap current-ns locals]
+  (cond
+    (symbol? form)
+    (if (or (namespace form) (contains? locals form) (= '& form))
+      form
+      (let [qualified (symbol (str current-ns) (name form))
+            entry (or (get heap qualified) (get heap (symbol "clojure.core" (name form))))]
+        (if (:const? entry)
+          (list 'quote (:val entry))
+          form)))
+
+    (seq? form)
+    (case (first form)
+      quote  form
+      ;; fn* introduces new local scope — don't inline across fn boundary
+      fn*    form
+      ;; let*/loop*: walk binding values with outer locals, bodies with extended locals
+      (let* loop*)
+      (let [[head bindings & body] form
+            pairs (partition 2 bindings)
+            walked-pairs (mapcat (fn [[sym val]]
+                                   [sym (inline-const-syms val heap current-ns locals)])
+                                 pairs)
+            new-locals (into locals (map (fn [[sym _]] sym) pairs))
+            rebuilt (apply list head (vec walked-pairs)
+                           (map #(inline-const-syms % heap current-ns new-locals) body))]
+        (if (meta form) (with-meta rebuilt (meta form)) rebuilt))
+      ;; Default: walk all sub-forms, preserving source location metadata
+      (let [rebuilt (apply list (map #(inline-const-syms % heap current-ns locals) form))]
+        (if (meta form) (with-meta rebuilt (meta form)) rebuilt)))
+
+    (vector? form)
+    (mapv #(inline-const-syms % heap current-ns locals) form)
+
+    (map? form)
+    (into {} (map (fn [[k v]] [(inline-const-syms k heap current-ns locals)
+                               (inline-const-syms v heap current-ns locals)])
+                  form))
+
+    (set? form)
+    (into #{} (map #(inline-const-syms % heap current-ns locals) form))
+
+    :else form))
+
+;; ============================================================
+;; fn* parsing (needed by static analysis and fn* step handler)
 ;; ============================================================
 
 (defn parse-fn-form [form]
@@ -589,8 +683,8 @@
         ;; Skip optional attr-map
         [attr-map args] (if (and (map? (first args))
                                  (not (vector? (first args))))
-                           [(first args) (rest args)]
-                           [nil args])
+                          [(first args) (rest args)]
+                          [nil args])
         arities (if (vector? (first args))
                   [{:params (vec (first args)) :body (vec (rest args))}]
                   (mapv (fn [arity-form]
@@ -599,13 +693,26 @@
                         args))]
     {:name fname :arities arities :docstring docstring :attr-map attr-map}))
 
+;; Forward declarations for static analysis helpers (defined after macroexpand-form)
+(declare extract-param-hints analyze-form macroexpand-all)
+
+;; ============================================================
+;; fn*
+;; ============================================================
+
 (defn make-callable-closure
   "Create a closure that is both an IFn (so host code like `map` can call it)
    and carries closure metadata for the VM."
   [closure-map machine]
-  (let [f (fn callable-closure [& args]
+  (let [fn-name (let [n (:name closure-map)
+                      ns-sym (:ns closure-map)]
+                  (when n
+                    (if ns-sym
+                      (symbol (str ns-sym) (str n))
+                      n)))
+        f (fn callable-closure [& args]
             ;; Create a mini-machine and run the closure
-            (let [arity (match-arity (:arities closure-map) (count args) (:name closure-map))
+            (let [arity (match-arity (:arities closure-map) (count args) fn-name)
                   bindings (bind-params (:params arity) args)
                   fn-env (merge (:env closure-map)
                                 bindings
@@ -621,7 +728,7 @@
                                     :current-ns (:current-ns machine)
                                     :current-fn-name (:name closure-map)
                                     :heap-atom heap-atom
-                                    :dynamic-bindings @current-dynamic-bindings))]
+                                    :dynamic-bindings current-dynamic-bindings))]
               ;; Push fn-body frame with recur-target so recur works
               (let [body (:body arity)
                     m (-> mini-m
@@ -631,8 +738,8 @@
                                          :recur-target true
                                          :params (:params arity)
                                          :loop-body body
-                                         :closure closure-map})
-                          (m/push-frame {:op :eval :expr (first body)}))]
+                                         :closure closure-map}))]
+                ;; step-fn-body will push the eval frame for (first body)
                 (run m))))]
     (with-meta f (assoc closure-map :sci/closure true))))
 
@@ -663,11 +770,48 @@
         ;; Check recur tail position only for user-written fn* forms
         _ (when (:line (meta (:expr frame)))
             (check-recur-tail-position (:arities parsed)))
+        ;; Analyze fn bodies for undefined symbols / macro values / denied symbols.
+        ;; Only for user-written fn* forms (those with source :line from the reader).
+        _ (when (:line (meta (:expr frame)))
+            (let [base-env (cond-> (into {} (map (fn [[k _]] [k nil]) (:env machine)))
+                             (:name parsed) (assoc (:name parsed) nil))]
+              (doseq [{:keys [params body]} (:arities parsed)
+                      :let [fn-env (into base-env (extract-param-hints params))]]
+                (doseq [bf body]
+                  (analyze-form machine fn-env bf)))))
+        fn-meta (meta (:expr frame))
+        ;; Inline ^:const var references in fn bodies (Clojure semantics: const vars are
+        ;; substituted at compile time so redefinition of the var doesn't affect the fn).
+        heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+        current-ns (:current-ns machine)
+        ;; Build env-locals as ordered map: fn name first, then outer env locals.
+        ;; Order matters because macroexpand-all passes this as &env to macros,
+        ;; and Clojure preserves insertion order in &env (fn name, params, lets).
+        env-locals (cond-> (into {} (map (fn [[k _]] [k nil]) (:env machine)))
+                     (:name parsed) (as-> m (into {(:name parsed) nil} m)))
+        arities (mapv (fn [{:keys [params body] :as arity}]
+                        (let [;; param-map: ordered map used for macroexpand-all (&env)
+                              param-map (reduce (fn [m p] (assoc m p nil))
+                                                env-locals
+                                                (remove #{'&} params))
+                              ;; param-syms: set used for inline-const-syms (order irrelevant)
+                              param-syms (into #{} (keys param-map))]
+                          (assoc arity :body
+                                 (mapv (fn [bf]
+                                         ;; 1. Inline ^:const vars
+                                         (let [inlined (inline-const-syms bf heap current-ns param-syms)]
+                                           ;; 2. Expand macros at definition time (Clojure compile-time semantics)
+                                           (macroexpand-all machine inlined param-map)))
+                                       body))))
+                      (:arities parsed))
         closure-map {:type :closure
                      :name (:name parsed)
                      :ns (:current-ns machine)
-                     :arities (:arities parsed)
-                     :env (:env machine)}
+                     :arities arities
+                     :env (:env machine)
+                     :line (:line fn-meta)
+                     :column (:column fn-meta)
+                     :file (:current-file machine)}
         callable (make-callable-closure closure-map machine)
         ;; Check for user metadata on the fn form (e.g. ^{:foo 1} (fn []))
         form-meta (meta (:expr frame))
@@ -678,9 +822,9 @@
       (-> machine
           (m/replace-frame {:op :apply-meta :value callable})
           (m/push-frame {:op :eval :expr (into {} user-meta)}))
-      ;; Apply user metadata directly (merged with closure meta)
+      ;; Store user metadata in :user-meta key so meta/with-meta overrides can expose it
       (if (seq user-meta)
-        (m/push-value machine (vary-meta callable merge user-meta))
+        (m/push-value machine (with-meta callable (assoc (clojure.core/meta callable) :user-meta user-meta)))
         (m/push-value machine callable)))))
 
 ;; ============================================================
@@ -692,6 +836,8 @@
         f-expr (first form)
         arg-exprs (vec (rest form))
         loc (form-location form)
+        ;; Capture depth BEFORE pushing call-site frame (used to trim on fn return)
+        pre-call-depth (count (:callstack machine))
         ;; Push callstack entry for this call site
         machine (if loc
                   (update machine :callstack conj
@@ -706,7 +852,8 @@
                           :pending arg-exprs
                           :done []
                           :phase :eval-f
-                          :callstack-depth (count (:callstack machine))})
+                          :callstack-depth (count (:callstack machine))
+                          :pre-call-depth pre-call-depth})
         (m/push-frame {:op :eval :expr f-expr}))))
 
 (defn step-eval-args [machine frame]
@@ -725,30 +872,30 @@
                    (m/push-value machine (clojure.lang.Reflector/getStaticField ^Class f method-str))
                    ;; Try static field first, then no-arg static method
                    (m/push-value machine
-                     (try
-                       (clojure.lang.Reflector/getStaticField ^Class f method-str)
-                       (catch Exception _
-                         (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))))))
+                                 (try
+                                   (clojure.lang.Reflector/getStaticField ^Class f method-str)
+                                   (catch Exception _
+                                     (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))))))
                  ;; Instance access
                  (if (:field? frame)
                    (if (:type (clojure.core/meta f))
                      ;; SCI type instance — field access via keyword
                      (let [field-name (if (.startsWith ^String method-str "-")
-                                       (subs method-str 1)
-                                       method-str)]
+                                        (subs method-str 1)
+                                        method-str)]
                        (m/push-value machine (get f (keyword field-name))))
                      (m/push-value machine (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false)))
                    ;; Special methods for sci.lang.Var
                    (if (and (instance? sci.lang.Var f)
                             (contains? #{"hasRoot" "isBound" "isDynamic" "get"} method-str))
                      (m/push-value machine
-                       (case method-str
-                         "hasRoot" (some? (.-val ^sci.lang.Var f))
-                         "isBound" (some? (.-val ^sci.lang.Var f))
-                         "isDynamic" (boolean (.-dynamic? ^sci.lang.Var f))
-                         "get" (.-val ^sci.lang.Var f)))
+                                   (case method-str
+                                     "hasRoot" (some? (.-val ^sci.lang.Var f))
+                                     "isBound" (some? (.-val ^sci.lang.Var f))
+                                     "isDynamic" (boolean (.-dynamic? ^sci.lang.Var f))
+                                     "get" (.-val ^sci.lang.Var f)))
                      (m/push-value machine
-                       (clojure.lang.Reflector/invokeInstanceMethod f method-str (to-array [])))))))
+                                   (clojure.lang.Reflector/invokeInstanceMethod f method-str (to-array [])))))))
              :cljs
              (throw (ex-info "Interop not supported in CLJS" {})))
           (:new? frame)
@@ -764,15 +911,16 @@
               (m/push-value machine instance))
             #?(:clj
                (m/push-value machine
-                 (clojure.lang.Reflector/invokeConstructor
-                  ^Class f (to-array [])))
+                             (clojure.lang.Reflector/invokeConstructor
+                              ^Class f (to-array [])))
                :cljs
                (throw (ex-info "new not supported in CLJS" {}))))
           :else
-          (m/replace-frame machine {:op :apply :f f :args []}))
+          (m/replace-frame machine {:op :apply :f f :args []
+                                    :pre-call-depth (:pre-call-depth frame)}))
         (-> machine
             (m/replace-frame (assoc frame :f f :phase :eval-arg
-                                          :pending (subvec pending 1)))
+                                    :pending (subvec pending 1)))
             (m/push-frame {:op :eval :expr (nth pending 0)}))))
 
     :eval-arg
@@ -787,11 +935,22 @@
             #?(:clj
                (if (instance? Class obj)
                  ;; Static method call
-                 (m/push-value machine
-                   (clojure.lang.Reflector/invokeStaticMethod ^Class obj method-str (to-array args)))
+                 ;; Special case: PersistentHashMap.create with a single-element seq
+                 ;; containing a map is the Clojure 1.10 kwargs destructuring form.
+                 ;; In Clojure 1.11 this became seq-to-map-for-destructuring, which
+                 ;; allows a single map to be passed as kwargs. Replicate that here.
+                 (if (and (= ^Class obj clojure.lang.PersistentHashMap)
+                          (= "create" method-str)
+                          (= 1 (count args))
+                          (sequential? (first args))
+                          (= 1 (count (first args)))
+                          (map? (first (first args))))
+                   (m/push-value machine (first (first args)))
+                   (m/push-value machine
+                                 (clojure.lang.Reflector/invokeStaticMethod ^Class obj method-str (to-array args))))
                  ;; Instance method call
                  (m/push-value machine
-                   (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))))
+                               (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))))
                :cljs
                (throw (ex-info "Interop not supported in CLJS" {}))))
           (:new? frame)
@@ -807,14 +966,17 @@
                 (m/push-value machine instance))
               #?(:clj
                  (m/push-value machine
-                   (clojure.lang.Reflector/invokeConstructor
-                    ^Class f (to-array done)))
+                               (clojure.lang.Reflector/invokeConstructor
+                                ^Class f (to-array done)))
                  :cljs
                  (throw (ex-info "new not supported in CLJS" {})))))
           (:defmethod? frame)
           ;; f = multimethod, done = [dispatch-val method-fn]
           (let [mm (:f frame)
                 [dispatch-val method-fn] done]
+            ;; Check class access if dispatch-val is a Java class
+            #?(:clj (when (class? dispatch-val)
+                      (check-class-access machine (.getName ^Class dispatch-val) dispatch-val)))
             #?(:clj
                (if (instance? clojure.lang.MultiFn mm)
                  (.addMethod ^clojure.lang.MultiFn mm dispatch-val method-fn)
@@ -845,15 +1007,17 @@
             (do-extend protocol target-type impl-map)
             (m/push-value machine nil))
           :else
-          (m/replace-frame machine {:op :apply :f (:f frame) :args done}))
+          (m/replace-frame machine {:op :apply :f (:f frame) :args done
+                                    :pre-call-depth (:pre-call-depth frame)}))
         (-> machine
             (m/replace-frame (assoc frame :done done
-                                          :pending (subvec pending 1)))
+                                    :pending (subvec pending 1)))
             (m/push-frame {:op :eval :expr (nth pending 0)}))))))
 
 (defn match-arity
-  ([arities argc] (match-arity arities argc nil))
-  ([arities argc fn-name]
+  ([arities argc] (match-arity arities argc nil false))
+  ([arities argc fn-name] (match-arity arities argc fn-name false))
+  ([arities argc fn-name disable-arity-checks?]
    (or
     ;; Prefer exact match over variadic
     (first (filter (fn [{:keys [params]}]
@@ -869,16 +1033,19 @@
                                               nil params-vec)]
                        (and amp-pos (>= argc amp-pos))))
                    arities))
-    (let [arity-desc (if fn-name
-                       (str fn-name)
-                       (let [arity-counts (map (fn [{:keys [params]}]
-                                                 (let [pv (vec params)
-                                                       amp (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil)) nil pv)]
-                                                   (if amp amp (count params))))
-                                               arities)]
-                         (str "function of arity " (clojure.string/join ", " arity-counts))))]
-      (throw (ex-info (str "Wrong number of args (" argc ") passed to: " arity-desc)
-                      {:type :sci/error}))))))
+    (if fn-name
+      (throw (ex-info (if disable-arity-checks?
+                        (str "Cannot call " (name fn-name) " with " argc " arguments")
+                        (str "Wrong number of args (" argc ") passed to: " fn-name))
+                      {:type :sci/error}))
+      (let [arity-counts (map (fn [{:keys [params]}]
+                                (let [pv (vec params)
+                                      amp (reduce-kv (fn [_ i v] (if (= '& v) (reduced i) nil)) nil pv)]
+                                  (if amp amp (count params))))
+                              arities)]
+        (throw (ex-info (str "Wrong number of args (" argc ") passed to: function of arity "
+                             (clojure.string/join ", " arity-counts))
+                        {:type :sci/error})))))))
 
 (defn bind-params [params args]
   (let [params-vec (vec params)
@@ -889,9 +1056,16 @@
       (let [fixed-params (subvec params-vec 0 amp-pos)
             rest-param (nth params-vec (inc amp-pos))
             fixed-args (take amp-pos args)
-            rest-args (drop amp-pos args)]
+            rest-args (drop amp-pos args)
+            ;; Clojure 1.11 kwargs map support: if rest-param is a map destructuring form
+            ;; and the rest args are a single map, use the map directly as kwargs.
+            rest-val (if (and (map? rest-param)
+                              (= 1 (count rest-args))
+                              (map? (first rest-args)))
+                       (first rest-args)
+                       (seq rest-args))]
         (-> (zipmap fixed-params fixed-args)
-            (assoc rest-param (seq rest-args)))))))
+            (assoc rest-param rest-val))))))
 
 (defn step-apply [machine frame]
   (let [f (:f frame)
@@ -899,12 +1073,14 @@
     (cond
       ;; SCI Var — deref and re-apply with the var's value
       (instance? sci.lang.Var f)
-      (m/replace-frame machine {:op :apply :f (.-val ^sci.lang.Var f) :args args})
+      (m/replace-frame machine {:op :apply :f (.-val ^sci.lang.Var f) :args args
+                                :pre-call-depth (:pre-call-depth frame)})
 
       ;; SCI closure wrapped as IFn — unwrap and use VM stack path
       (and (fn? f) (:sci/closure (meta f)))
-      (let [closure-map (dissoc (meta f) :sci/closure)]
-        (m/replace-frame machine {:op :apply :f closure-map :args args}))
+      (let [closure-map (-> (meta f) (dissoc :sci/closure) (assoc :sci/self f))]
+        (m/replace-frame machine {:op :apply :f closure-map :args args
+                                  :pre-call-depth (:pre-call-depth frame)}))
 
       ;; Host function
       (fn? f)
@@ -919,24 +1095,39 @@
       (let [;; Qualify the name for error messages
             qualified-name (when-let [n (:name f)]
                              (if (qualified-symbol? n) n
-                               (let [ns-sym (or (:ns f) (:current-ns machine))]
-                                 (symbol (str ns-sym) (str n)))))
-            arity (match-arity (:arities f) (count args) qualified-name)
+                                 (let [ns-sym (or (:ns f) (:current-ns machine))]
+                                   (symbol (str ns-sym) (str n)))))
+            disable-arity-checks? (get-in machine [:permissions :disable-arity-checks])
+            arity (match-arity (:arities f) (count args) qualified-name disable-arity-checks?)
             bindings (bind-params (:params arity) args)
             fn-env (merge (:env f)
                           ;; Self-reference comes before params to match Clojure's &env order.
                           ;; Only for (fn name [x] ...) style, not (defn name [x] ...) which
                           ;; uses :sci/def-named to suppress this.
+                          ;; Use :sci/self (the IFn wrapper) if available so self-reference
+                          ;; returns the same object as the caller sees.
                           (when (and (:name f) (not (:sci/def-named f)))
-                            {(:name f) f})
-                          bindings)]
+                            {(:name f) (or (:sci/self f) f)})
+                          bindings)
+            ;; Use pre-call-depth (before call-site frame was pushed) as the saved depth.
+            ;; This ensures the call-site frame AND entry frame are removed on successful return.
+            pre-call-depth (or (:pre-call-depth frame) (count (:callstack machine)))
+            ;; Push function entry frame (definition location) if the fn has a name and location
+            machine (if (and (:name f) (:line f))
+                      (update machine :callstack conj
+                              {:ns (or (:ns f) (:current-ns machine))
+                               :name (:name f)
+                               :line (:line f)
+                               :column (:column f)
+                               :file (:file f)})
+                      machine)]
         (-> machine
             (m/replace-frame {:op :fn-body
                               :body (:body arity)
                               :loop-body (:body arity)
                               :saved-env (:env machine)
                               :saved-fn-name (:current-fn-name machine)
-                              :saved-callstack-depth (count (:callstack machine))
+                              :saved-callstack-depth pre-call-depth
                               :recur-target true
                               :params (:params arity)
                               :closure f})
@@ -967,8 +1158,8 @@
       #?@(:clj
           [(instance? Class f)
            (m/push-value machine
-             (clojure.lang.Reflector/invokeConstructor
-              ^Class f (to-array args)))])
+                         (clojure.lang.Reflector/invokeConstructor
+                          ^Class f (to-array args)))])
 
       ;; Unbound var
       (instance? sci.lang.Unbound f)
@@ -986,9 +1177,12 @@
 (defn step-fn-body [machine frame]
   (let [body (:body frame)]
     (if (empty? body)
-      (-> machine
-          (assoc :env (:saved-env frame))
-          (m/push-value nil))
+      (let [depth (:saved-callstack-depth frame)]
+        (-> machine
+            (assoc :env (:saved-env frame)
+                   :current-fn-name (:saved-fn-name frame))
+            (cond-> depth (update :callstack #(subvec (vec %) 0 (min depth (count %)))))
+            (m/push-value nil)))
       (if (= 1 (count body))
         ;; Single expression — tail position
         (-> machine
@@ -1033,12 +1227,28 @@
           (and (= 2 (count init)) (string? (first init)))
           [(first init) (second init) (merge (meta sym) {:doc (first init)})]
           :else               [nil (first init) (meta sym)])
-        ;; Add source location from the form metadata
+        ;; Add source location: use the outermost form's location (top-loc) which is the
+        ;; macro call site when inside a macro expansion. For direct (def ...) forms,
+        ;; top-loc equals the form's own location. Fall back to form's own metadata.
         form-meta (meta (:expr frame))
+        effective-loc (or (:top-loc machine) form-meta)
         meta-map (cond-> (or meta-map {})
-                   (:line form-meta) (assoc :line (:line form-meta)
-                                            :column (:column form-meta))
-                   (:current-file machine) (assoc :file (:current-file machine)))]
+                   (:line effective-loc) (assoc :line (:line effective-loc)
+                                                :column (:column effective-loc))
+                   (:current-file machine) (assoc :file (:current-file machine)))
+        ;; Analyze fn* init-expr bodies at definition time when the def form has source
+        ;; location (user-written or from defn macro expansion). This catches undefined
+        ;; symbols, macro references as values, and denied symbols.
+        _ (when (and (:line form-meta)
+                     (seq? init-expr)
+                     (= 'fn* (first init-expr)))
+            (let [fn-parsed (parse-fn-form init-expr)
+                  base-env (cond-> (into {} (map (fn [[k _]] [k nil]) (:env machine)))
+                             (:name fn-parsed) (assoc (:name fn-parsed) nil))]
+              (doseq [{:keys [params body]} (:arities fn-parsed)
+                      :let [fn-env (into base-env (extract-param-hints params))]]
+                (doseq [bf body]
+                  (analyze-form machine fn-env bf)))))]
     ;; If metadata contains unevaluated forms, evaluate the map first
     (if (meta-needs-eval? meta-map)
       (-> machine
@@ -1048,12 +1258,22 @@
                             :init-expr init-expr
                             :form-meta (meta (:expr frame))})
           (m/push-frame {:op :eval :expr (into {} meta-map)}))
-    (if (and (nil? init-expr) (empty? init))
+      (if (and (nil? init-expr) (empty? init))
       (let [ns-sym (:current-ns machine)
             qualified (symbol (str ns-sym) (str sym))
             ;; Only create entry if var doesn't already exist (declare semantics)
             heap (if-let [a (:heap-atom machine)] @a (:heap machine))
             existing (get heap qualified)
+            ;; Check if existing entry was referred from another namespace
+            ;; (i.e. has :sci.impl/var-sym pointing to a different ns)
+            referred-from (when existing
+                            (let [vs (get-in existing [:meta :sci.impl/var-sym])]
+                              (when (and vs (not= (str ns-sym) (namespace vs)))
+                                vs)))
+            _ (when referred-from
+                (throw (ex-info (str ns-sym " already refers to: " referred-from
+                                     ", being replaced by: " qualified)
+                                {:type :sci/error})))
             entry (if (and existing (:bound? existing))
                     ;; Var already bound — keep existing value, update meta
                     (assoc existing :meta meta-map)
@@ -1138,7 +1358,9 @@
               (vary-meta val assoc :name sym :ns ns-sym :sci/def-named true)
               val)
         meta-map (:meta-map frame)
-        entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true}]
+        entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true
+               :const? (boolean (:const meta-map))
+               :user-defined? true}]
     ;; Update both the immutable heap and the shared atom
     (when-let [a (:heap-atom machine)]
       (swap! a assoc qualified entry))
@@ -1182,7 +1404,7 @@
         (-> machine
             (update :env assoc sym val)
             (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
-                                          :bind-sym nil :next-idx nil))))
+                                    :bind-sym nil :next-idx nil))))
       (if (>= idx (count bindings))
         ;; All bound — start body
         (let [body (:body frame)
@@ -1205,8 +1427,8 @@
         (let [[sym expr] (nth bindings idx)]
           (-> machine
               (m/replace-frame (assoc frame :bind-idx nil
-                                            :bind-sym sym
-                                            :next-idx (inc idx)))
+                                      :bind-sym sym
+                                      :next-idx (inc idx)))
               (m/push-frame {:op :eval :expr expr})))))))
 
 (defn step-eval-recur [machine frame]
@@ -1226,7 +1448,7 @@
       (m/replace-frame machine {:op :recur :args done})
       (-> machine
           (m/replace-frame (assoc frame :done done
-                                        :pending (subvec pending 1)))
+                                  :pending (subvec pending 1)))
           (m/push-frame {:op :eval :expr (nth pending 0)})))))
 
 (defn step-recur [machine frame]
@@ -1268,10 +1490,10 @@
                   (throw (ex-info (str "Unable to resolve classname: " class-sym)
                                   {:type :sci/error}))))))
     (let [m (m/replace-frame machine {:op :try
-                                       :catches catches
-                                       :finally finally-form
-                                       :body body
-                                       :phase :body})]
+                                      :catches catches
+                                      :finally finally-form
+                                      :body body
+                                      :phase :body})]
       (if (seq body)
         (m/push-frame m {:op :eval :expr (first body)})
         m))))
@@ -1284,7 +1506,7 @@
         (if (:finally frame)
           (-> machine
               (m/replace-frame (assoc frame :phase :finally
-                                            :body-result (:result machine)))
+                                      :body-result (:result machine)))
               (m/push-frame {:op :eval :expr (cons 'do (rest (:finally frame)))}))
           (m/pop-frame machine))
         (-> machine
@@ -1300,7 +1522,7 @@
     (if (:finally frame)
       (-> machine
           (m/replace-frame (assoc frame :phase :finally
-                                        :body-result (:result machine)))
+                                  :body-result (:result machine)))
           (m/push-frame {:op :eval :expr (cons 'do (rest (:finally frame)))}))
       (m/pop-frame machine))))
 
@@ -1328,13 +1550,19 @@
                                 core-q
                                 local-q)))))
             entry (get heap qualified)
+            ;; For raw :bindings entries (:user-binding? true), don't inject :name/:ns
+            ;; so that clojure.repl/doc produces no output for undocumented plain bindings.
+            extra-meta (if (:user-binding? entry)
+                         {:sci.impl/var-sym qualified
+                          :file (or (:file (:meta entry)) (:current-file machine))}
+                         {:name (symbol (name qualified))
+                          :ns (symbol (namespace qualified))
+                          :sci.impl/var-sym qualified
+                          :file (or (:file (:meta entry)) (:current-file machine))})
             var-obj (sci.lang/->Var (symbol (name qualified))
-                                   (:val entry)
-                                   (merge (:meta entry)
-                                          {:name (symbol (name qualified))
-                                           :ns (symbol (namespace qualified))
-                                           :sci.impl/var-sym qualified})
-                                   (:dynamic? entry))]
+                                    (:val entry)
+                                    (merge (:meta entry) extra-meta)
+                                    (:dynamic? entry))]
         (m/push-value machine var-obj)))))
 
 ;; ============================================================
@@ -1404,7 +1632,7 @@
         (-> machine
             (assoc-in [:dynamic-bindings qualified] val)
             (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
-                                          :bind-sym nil :next-idx nil))))
+                                    :bind-sym nil :next-idx nil))))
       (if (>= idx (count pairs))
         (let [body (:body frame)
               ;; Push real JVM thread bindings for vars like *print-length*
@@ -1435,8 +1663,8 @@
         (let [[sym expr] (nth pairs idx)]
           (-> machine
               (m/replace-frame (assoc frame :bind-idx nil
-                                            :bind-sym sym
-                                            :next-idx (inc idx)))
+                                      :bind-sym sym
+                                      :next-idx (inc idx)))
               (m/push-frame {:op :eval :expr expr})))))))
 
 (defn step-binding-body [machine frame]
@@ -1466,18 +1694,19 @@
       (-> machine
           (assoc-in [:dynamic-bindings qualified] val)
           (m/push-value val))
-      ;; Check if this is a dynamic var being set outside binding
+      ;; Check if this is a dynamic var — if so, set! is only allowed inside binding
       (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
             entry (get heap qualified)]
-        (if (:dynamic? entry)
-          (throw (ex-info (str "Can't change/establish root binding of: #'" qualified
-                               " with set")
+        (if (and (:dynamic? entry) (:user-defined? entry))
+          ;; User-defined dynamic var: set! outside binding is an error (Clojure semantics)
+          (throw (ex-info (str "Can't set! root binding of dynamic var: " qualified)
                           {:type :sci/error}))
-          (let [entry (assoc entry :val val)]
+          ;; Non-dynamic var: update root binding in heap
+          (let [new-entry (assoc entry :val val)]
             (when-let [a (:heap-atom machine)]
-              (swap! a assoc qualified entry))
+              (swap! a assoc qualified new-entry))
             (-> machine
-                (assoc-in [:heap qualified] entry)
+                (assoc-in [:heap qualified] new-entry)
                 (m/push-value val))))))))
 
 ;; ============================================================
@@ -1584,9 +1813,9 @@
                    method (or (get methods dispatch-val)
                               ;; Check hierarchy (isa?)
                               (first (filter some?
-                                       (map (fn [[k v]]
-                                              (when (isa? dispatch-val k) v))
-                                            methods)))
+                                             (map (fn [[k v]]
+                                                    (when (isa? dispatch-val k) v))
+                                                  methods)))
                               (get methods :default))]
                (if method
                  (apply method args)
@@ -1630,10 +1859,10 @@
                   (list* 'fn* fn-parts)
                   ;; Multi-arity: (defmethod foo :bar ([x] body1) ([x y] body2))
                   (list* 'fn* fn-parts))]
-    ;; Evaluate the multimethod reference and the method fn
+    ;; Evaluate the multimethod reference, dispatch-val, and the method fn
     (-> machine
         (m/replace-frame {:op :eval-args
-                          :pending [(list 'quote dispatch-val) fn-form]
+                          :pending [dispatch-val fn-form]
                           :done []
                           :phase :eval-f
                           :defmethod? true})
@@ -1712,8 +1941,8 @@
                                                     (get impls Object)
                                                     (get impls :default))]
                                        (if-let [f (or (get impl mname)
-                                                       (get impl (keyword mname))
-                                                       (get impl (symbol mname)))]
+                                                           (get impl (keyword mname))
+                                                           (get impl (symbol mname)))]
                                          (apply f args)
                                          (throw (ex-info (str "No implementation of method: " mname
                                                               " of protocol: " proto-name
@@ -1769,12 +1998,12 @@
         ;; Build a do form that evaluates extend for each protocol
         extend-forms (mapv (fn [{:keys [proto methods]}]
                              (let [impl-map (into {}
-                                             (map (fn [method-form]
-                                                    (let [mname (first method-form)
-                                                          args-body (rest method-form)]
-                                                      [(list 'quote mname)
-                                                       (list* 'fn* args-body)]))
-                                                  methods))]
+                                                  (map (fn [method-form]
+                                                         (let [mname (first method-form)
+                                                               args-body (rest method-form)]
+                                                           [(list 'quote mname)
+                                                            (list* 'fn* args-body)]))
+                                                       methods))]
                                (list 'extend type-sym proto impl-map)))
                            groups)
         do-form (cons 'do extend-forms)]
@@ -1814,8 +2043,8 @@
         ;; Build a do form: (do (def name1 (fn* ...)) (def name2 (fn* ...)) ... body...)
         defs (mapv (fn [[fname fn-form]]
                      (let [fn-form (if (and (seq loc-meta) (not (meta fn-form)))
-                                    (with-meta fn-form loc-meta)
-                                    fn-form)]
+                                     (with-meta fn-form loc-meta)
+                                     fn-form)]
                        (list 'def fname fn-form)))
                    pairs)
         ;; Wrap names in let bindings after defs so they're in local scope
@@ -1835,16 +2064,17 @@
         ;; Parse like fn — then prepend &form and &env to each arity's params
         parsed (parse-fn-form (list* 'fn* rest-form))
         ;; Prepend &form &env to all arities so macros can use &form and &env
+        ns-sym (:current-ns machine)
         arities-with-implicit (mapv (fn [arity]
                                       (update arity :params #(into ['&form '&env] %)))
                                     (:arities parsed))
         closure-map {:type :closure
                      :name macro-name
+                     :ns ns-sym
                      :arities arities-with-implicit
                      :env (:env machine)}
         ;; Callable takes &form &env then the real args
         callable (make-callable-closure closure-map machine)
-        ns-sym (:current-ns machine)
         qualified (symbol (str ns-sym) (str macro-name))
         macro-meta (merge {:macro true
                            :name macro-name
@@ -1893,50 +2123,76 @@
 
 (defn- load-ns-if-needed
   "If the namespace isn't loaded and a load-fn is available, load it."
-  [machine ns-sym]
-  (let [ns-table (:ns machine)
-        loaded? (contains? ns-table ns-sym)
-        ns-str (str ns-sym)]
-    (if (and (or loaded?
-                 (contains? (set host/default-namespaces) ns-sym)
-                 (get (:ns-aliases machine) ns-sym))
-             (not (:force-reload machine)))
-      machine ;; already loaded or aliased
-      (if-let [load-fn (:load-fn machine)]
-        (let [result (load-fn {:namespace ns-sym})]
-          (if result
-            ;; Evaluate the loaded source
-            (let [source (:source result)
-                  forms (edamame/parse-string-all source
-                          {:all true :read-cond :allow :features #{:clj}
-                           :fn true :quote true :var true :deref true :regex true
-                           :location? seq? :row-key :line :col-key :column})
-                  expr (if (= 1 (count forms)) (first forms) (cons 'do forms))
-                  heap-atom (:heap-atom machine)
-                  m2 (-> (m/make-machine {:heap (if heap-atom @heap-atom (:heap machine))
-                                           :ns-table (:ns machine)})
-                         (assoc :heap-atom heap-atom
-                                :ns-atom (:ns-atom machine)
-                                :load-fn load-fn
-                                :current-ns ns-sym)
-                         ;; Propagate reload-all to sub-machine so transitive deps reload
-                         (cond-> (:reload-all machine)
-                                 (assoc :force-reload true :reload-all true))
-                         (m/push-frame {:op :eval :expr expr}))]
-              (run m2)
-              ;; Return machine with updated heap and ns table
-              ;; Merge ns-atom changes (from sub-machine's ns form and transitive requires)
-              (let [loaded-ns (when-let [a (:ns-atom machine)] @a)]
-                (cond-> machine
-                  heap-atom (assoc :heap @heap-atom)
-                  loaded-ns (assoc :ns (merge (:ns machine) loaded-ns))
-                  (not loaded-ns) (update :ns assoc ns-sym {:aliases {} :refers {} :imports {}}))))
-            (throw (ex-info (str "Could not locate " (clojure.string/replace ns-str "." "/")
+  ([machine ns-sym] (load-ns-if-needed machine ns-sym nil))
+  ([machine ns-sym require-opts]
+   (let [ns-table (:ns machine)
+         loaded? (contains? ns-table ns-sym)
+         ns-str (str ns-sym)]
+     (if (and (or loaded?
+                  (contains? (set host/default-namespaces) ns-sym)
+                  (get (:ns-aliases machine) ns-sym))
+              (not (:force-reload machine)))
+       machine ;; already loaded or aliased
+       ;; Cyclic load detection
+       (let [loading (or (:loading machine) #{})
+             _ (when (contains? loading ns-sym)
+                 (let [chain (:loading-chain machine)
+                       ;; Find where ns-sym first appears in chain
+                       cycle-start (or (some (fn [i] (when (= (get chain i) ns-sym) i))
+                                             (range (count chain)))
+                                       0)
+                       cycle-chain (subvec chain cycle-start)
+                       middle (clojure.string/join "->" (map str (rest cycle-chain)))]
+                   (throw (ex-info (str "Cyclic load dependency: [ " (first cycle-chain) " ]->"
+                                        middle "->[ " ns-sym " ]")
+                                   {:type :sci/error}))))]
+         (if-let [load-fn (:load-fn machine)]
+           (let [current-ns (:current-ns machine)
+                 result (load-fn {:namespace ns-sym
+                                  :libname ns-sym
+                                  :ctx (or (:ctx machine) machine)
+                                  :ns current-ns
+                                  :opts (or require-opts {})})]
+             (if result
+               ;; Evaluate the loaded source
+               (let [source (:source result)
+                     forms (edamame/parse-string-all source
+                                                     {:all true :read-cond :allow :features #{:clj}
+                                                      :fn true :quote true :var true :deref true :regex true
+                                                      :location? seq? :row-key :line :col-key :column})
+                     expr (if (= 1 (count forms)) (first forms) (cons 'do forms))
+                     heap-atom (:heap-atom machine)
+                     m2 (-> (m/make-machine {:heap (if heap-atom @heap-atom (:heap machine))
+                                             :ns-table (:ns machine)})
+                            (assoc :heap-atom heap-atom
+                                   :ns-atom (:ns-atom machine)
+                                   :load-fn load-fn
+                                   :ctx (:ctx machine)
+                                   :loading (conj loading ns-sym)
+                                   :loading-chain (conj (or (:loading-chain machine) []) ns-sym)
+                                   :current-ns ns-sym)
+                            ;; Propagate reload-all to sub-machine so transitive deps reload
+                            (cond-> (:reload-all machine)
+                              (assoc :force-reload true :reload-all true))
+                            (m/push-frame {:op :eval :expr expr}))]
+                 (run m2)
+                 ;; Return machine with updated heap and ns table
+                 ;; Merge ns-atom changes (from sub-machine's ns form and transitive requires)
+                 (let [loaded-ns (when-let [a (:ns-atom machine)] @a)]
+                   (cond-> machine
+                     heap-atom (assoc :heap @heap-atom)
+                     loaded-ns (assoc :ns (merge (:ns machine) loaded-ns))
+                     (not loaded-ns) (update :ns assoc ns-sym {:aliases {} :refers {} :imports {}}))))
+               (throw (ex-info (str "Could not locate " (clojure.string/replace ns-str "." "/")
+                                    "__init.class, " (clojure.string/replace ns-str "." "/")
+                                    ".clj or " (clojure.string/replace ns-str "." "/")
+                                    ".cljc on classpath.")
+                               {:type :sci/error}))))
+           (throw (ex-info (str "Could not locate " (clojure.string/replace ns-str "." "/")
                                 "__init.class, " (clojure.string/replace ns-str "." "/")
                                 ".clj or " (clojure.string/replace ns-str "." "/")
                                 ".cljc on classpath.")
-                           {:type :sci/error}))))
-        machine))))
+                           {:type :sci/error}))))))))
 
 (defn- process-require-spec
   "Process a single require spec and update the machine's ns table."
@@ -1969,42 +2225,52 @@
           ;; Normal: [ns-sym :as alias :refer [syms] :as-alias alias]
           (let [ns-sym first-elem
                 opts (apply hash-map (rest spec))
+                refers (:refer opts)
+                rename-map (or (:rename opts) {})
+                _ (when (and refers (not= refers :all) (not (sequential? refers)))
+                    (throw (ex-info (str ":refer must be a sequential collection, got: " (pr-str refers))
+                                    {:type :sci/error})))
                 as-alias-sym (:as-alias opts)
                 ;; Don't load the namespace if only :as-alias is used
-                machine (if (and as-alias-sym (not (:as opts)) (not (:refer opts)))
+                machine (if (and as-alias-sym (not (:as opts)) (not refers))
                           machine  ;; :as-alias only — skip loading
-                          (load-ns-if-needed machine ns-sym))
-                alias-sym (or (:as opts) as-alias-sym)
-                refers (:refer opts)]
+                          (load-ns-if-needed machine ns-sym (dissoc opts :as :refer :rename :as-alias)))
+                alias-sym (or (:as opts) as-alias-sym)]
             (cond-> machine
               alias-sym (update-in [:ns current-ns :aliases] assoc alias-sym ns-sym)
               (= :all refers)
               (as-> m
-                (let [heap (if-let [a (:heap-atom m)] @a (:heap m))
-                      ns-str (str ns-sym)
-                      entries (filter (fn [[k _]] (= ns-str (namespace k))) heap)]
-                  (reduce (fn [m [k entry]]
-                            (let [target-sym (symbol (str current-ns) (name k))]
-                              (when-let [a (:heap-atom m)]
-                                (swap! a assoc target-sym entry))
-                              (assoc-in m [:heap target-sym] entry)))
-                          m entries)))
+                    (let [heap (if-let [a (:heap-atom m)] @a (:heap m))
+                          ns-str (str ns-sym)
+                          entries (filter (fn [[k _]] (= ns-str (namespace k))) heap)]
+                      (reduce (fn [m [k entry]]
+                                (let [sym-name (symbol (name k))
+                                      renamed (get rename-map sym-name)
+                                      target-name (or renamed sym-name)
+                                      target-sym (symbol (str current-ns) (str target-name))]
+                                  (when-let [a (:heap-atom m)]
+                                    (swap! a assoc target-sym entry))
+                                  (assoc-in m [:heap target-sym] entry)))
+                              m entries)))
               (sequential? refers)
               (as-> m
-                (reduce (fn [m sym]
-                          (let [qualified (symbol (str ns-sym) (str sym))
-                                heap (if-let [a (:heap-atom m)] @a (:heap m))]
-                            (if-let [entry (get heap qualified)]
-                              (let [target-sym (symbol (str current-ns) (str sym))
+                    (reduce (fn [m sym]
+                              (let [qualified (symbol (str ns-sym) (str sym))
+                                    heap (if-let [a (:heap-atom m)] @a (:heap m))]
+                                (if-let [entry (get heap qualified)]
+                                  (let [renamed (get rename-map sym)
+                                        target-name (or renamed sym)
+                                        target-sym (symbol (str current-ns) (str target-name))
                                     ;; Tag referred entries with original var-sym for syntax-quote
-                                    entry' (update entry :meta
-                                                   #(assoc (or % {}) :sci.impl/var-sym qualified))]
-                                (when-let [a (:heap-atom m)]
-                                  (swap! a assoc target-sym entry'))
-                                (assoc-in m [:heap target-sym] entry'))
-                              m)))
-                        m
-                        refers))))))
+                                        entry' (update entry :meta
+                                                       #(assoc (or % {}) :sci.impl/var-sym qualified))]
+                                    (when-let [a (:heap-atom m)]
+                                      (swap! a assoc target-sym entry'))
+                                    (assoc-in m [:heap target-sym] entry'))
+                                  (throw (ex-info (str sym " does not exist in " ns-sym)
+                                                  {:type :sci/error})))))
+                            m
+                            refers))))))
 
       :else machine)))
 
@@ -2038,8 +2304,8 @@
         ;; Skip optional attr-map
         [attr-map refs] (if (and (map? (first rest-form))
                                  (not (keyword? (ffirst rest-form))))
-                           [(first rest-form) (next rest-form)]
-                           [nil rest-form])
+                          [(first rest-form) (next rest-form)]
+                          [nil rest-form])
         _ (when-let [a (:current-ns-atom machine)]
             (reset! a ns-sym))
         ns-meta (merge (meta ns-sym) attr-map (when docstring {:doc docstring}))
@@ -2047,7 +2313,7 @@
                     (assoc :current-ns ns-sym)
                     (update :ns #(let [existing (get % ns-sym)
                                           ;; Preserve structural data, replace metadata
-                                          structural (select-keys existing [:aliases :refers :imports])]
+                                       structural (select-keys existing [:aliases :refers :imports])]
                                    (assoc % ns-sym
                                           (merge {:aliases {} :refers {} :imports {}}
                                                  structural
@@ -2076,19 +2342,50 @@
                                                                     sci-type (-> m''
                                                                                  (update :env assoc short sci-type)
                                                                                  (update-in [:ns ns-sym :types] assoc short sci-type))
-                                                                    :else (throw (ex-info (str "Unable to resolve classname: " fqn)
-                                                                                          {:type :sci/error}))))
+                                                                    :else (let [ref-loc (form-location ref)]
+                                                                            (throw (ex-info (str "Unable to resolve classname: " fqn)
+                                                                                            (merge {:type :sci/error
+                                                                                                    :sci.impl/callstack (when ref-loc
+                                                                                                                          [{:ns (:current-ns m'')
+                                                                                                                            :name (:current-fn-name m'')
+                                                                                                                            :line (:line ref-loc)
+                                                                                                                            :column (:column ref-loc)
+                                                                                                                            :file (:current-file m'')}])}
+                                                                                                   (when ref-loc
+                                                                                                     {:line (:line ref-loc)
+                                                                                                      :column (:column ref-loc)})))))))
                                                                 :cljs m'')))
                                                          m' classes))
                                                m'))
                                            m ref-specs)
                            :refer-clojure
                            (let [opts (apply hash-map ref-specs)
-                                 exclude-syms (set (:exclude opts))]
-                             (if (seq exclude-syms)
-                               (update-in m [:ns ns-sym :refer-clojure-excludes]
-                                          (fnil into #{}) exclude-syms)
-                               m))
+                                 exclude-syms (set (:exclude opts))
+                                 rename-map (or (:rename opts) {})]
+                             (as-> m m'
+                               (if (seq exclude-syms)
+                                 (update-in m' [:ns ns-sym :refer-clojure-excludes]
+                                            (fnil into #{}) exclude-syms)
+                                 m')
+                               ;; :rename — add renamed aliases + exclude originals
+                               (if (seq rename-map)
+                                 (let [heap-atom (:heap-atom m')
+                                       heap (if heap-atom @heap-atom (:heap m'))]
+                                   (reduce (fn [m'' [orig-sym new-sym]]
+                                             (let [qualified (symbol "clojure.core" (str orig-sym))]
+                                               (if-let [entry (get heap qualified)]
+                                                 (let [target (symbol (str ns-sym) (str new-sym))
+                                                       entry' (update entry :meta
+                                                                      #(assoc (or % {}) :sci.impl/var-sym qualified))]
+                                                   (when heap-atom (swap! heap-atom assoc target entry'))
+                                                   (-> m''
+                                                       (assoc-in [:heap target] entry')
+                                                       (update-in [:ns ns-sym :refer-clojure-excludes]
+                                                                  (fnil conj #{}) orig-sym)))
+                                                 m'')))
+                                           m'
+                                           rename-map))
+                                 m')))
                            :use
                            (reduce (fn [m' use-spec]
                                      ;; (use 'clojure.set) or (use '[clojure.set :only [union]])
@@ -2241,10 +2538,10 @@
         ctor-fn (if is-record?
                   (fn [& args]
                     (with-meta (zipmap field-keywords args)
-                               {:type type-obj :sci.impl/record true}))
+                      {:type type-obj :sci.impl/record true}))
                   (fn [& args]
                     (with-meta (zipmap field-keywords args)
-                               {:type type-obj})))
+                      {:type type-obj})))
         ctor-sym      (symbol (str "->" type-name))
         ctor-qualified (symbol (str ns-sym) (str ctor-sym))
         ctor-entry    {:val ctor-fn
@@ -2259,7 +2556,7 @@
         machine (if is-record?
                   (let [map-ctor-fn (fn [m]
                                       (with-meta (merge (zipmap field-keywords (repeat nil)) m)
-                                                 {:type type-obj :sci.impl/record true}))
+                                        {:type type-obj :sci.impl/record true}))
                         map-ctor-sym (symbol (str "map->" type-name))
                         map-ctor-q   (symbol (str ns-sym) (str map-ctor-sym))
                         map-ctor-entry {:val map-ctor-fn :meta {:name map-ctor-sym} :bound? true}]
@@ -2275,11 +2572,11 @@
                                                    (namespace proto-sym))
                                     proto-name   (name proto-sym)
                                     proto (or (get env proto-sym)
-                                             (let [the-ns (or proto-ns-str (str ns-sym))
-                                                   q  (symbol the-ns proto-name)
-                                                   cq (symbol "clojure.core" proto-name)]
-                                               (or (:val (get heap q))
-                                                   (:val (get heap cq)))))]
+                                              (let [the-ns (or proto-ns-str (str ns-sym))
+                                                    q  (symbol the-ns proto-name)
+                                                    cq (symbol "clojure.core" proto-name)]
+                                                (or (:val (get heap q))
+                                                    (:val (get heap cq)))))]
                                 (if (and (map? proto) (= :sci/protocol (:type proto)))
                                   (let [proto-methods (:methods proto)
                                         impl-fns (reduce (fn [acc [mname _]]
@@ -2297,6 +2594,57 @@
       (swap! a update-in [ns-sym :types] assoc type-name type-obj))
     (m/push-value machine type-obj)))
 
+(defn step-eval-reify* [machine frame]
+  ;; (reify* [Interface1 ...] (method1 [this] body) (method2 [this a] body) ...)
+  (let [form (:expr frame)
+        parts (vec (rest form))
+        interfaces-vec (nth parts 0)
+        method-forms (drop 1 parts)
+        ns-sym (:current-ns machine)
+        ;; Build method-map
+        method-map (reduce (fn [acc mform]
+                             (if (seq? mform)
+                               (let [mname (first mform)
+                                     params (second mform)
+                                     body (vec (drop 2 mform))]
+                                 (assoc acc mname {:params params :body body}))
+                               acc))
+                           {} method-forms)
+        ;; Build closures — normalize to unqualified names
+        method-fns (reduce-kv (fn [acc mname {:keys [params body]}]
+                                (assoc acc (symbol (name mname))
+                                       (make-deftype-method-fn machine ns-sym [] params body)))
+                              {} method-map)
+        ;; Create anonymous Type object
+        type-obj (sci.lang/->Type "reified" [] {} method-fns {})
+        ;; Register protocol implementations
+        machine (if (seq interfaces-vec)
+                  (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                        env (:env machine)]
+                    (reduce (fn [m proto-sym]
+                              (let [proto-ns-str (when (qualified-symbol? proto-sym)
+                                                   (namespace proto-sym))
+                                    proto-name (name proto-sym)
+                                    proto (or (get env proto-sym)
+                                              (let [the-ns (or proto-ns-str (str ns-sym))
+                                                    q (symbol the-ns proto-name)
+                                                    cq (symbol "clojure.core" proto-name)]
+                                                (or (:val (get heap q))
+                                                    (:val (get heap cq)))))]
+                                (if (and (map? proto) (= :sci/protocol (:type proto)))
+                                  (let [proto-methods (:methods proto)
+                                        impl-fns (reduce (fn [acc [mname _]]
+                                                           (if-let [f (get method-fns mname)]
+                                                             (assoc acc mname f)
+                                                             acc))
+                                                         {} proto-methods)]
+                                    (when (seq impl-fns) (do-extend proto type-obj impl-fns))
+                                    m)
+                                  m)))
+                            machine interfaces-vec))
+                  machine)]
+    (m/push-value machine type-obj)))
+
 ;; ============================================================
 ;; Special form dispatch
 ;; ============================================================
@@ -2305,51 +2653,76 @@
   (let [raw-head (first (:expr frame))
         head (if (qualified-symbol? raw-head)
                (symbol (name raw-head))
-               raw-head)]
-    ;; Only check permissions for user-written forms (with :line metadata).
-    ;; Macro-expanded special forms (e.g. loop*/recur from doseq) should not
-    ;; be blocked by deny lists since the user didn't write them directly.
-    (when (:line (meta (:expr frame)))
-      (check-permission machine head))
-    (case head
-      if       (step-eval-if machine frame)
-      do       (step-eval-do machine frame)
-      let*     (step-eval-let machine frame)
-      fn*      (step-eval-fn machine frame)
-      def      (step-eval-def machine frame)
-      quote    (step-eval-quote machine frame)
-      loop*    (step-eval-loop machine frame)
-      recur    (step-eval-recur machine frame)
-      try      (step-eval-try machine frame)
-      throw    (-> machine
-                   (m/replace-frame {:op :throw})
-                   (m/push-frame {:op :eval :expr (second (:expr frame))}))
-      var      (step-eval-var machine frame)
-      case*    (step-eval-case machine frame)
-      set!     (step-eval-set! machine frame)
-      new      (step-eval-new machine frame)
-      .        (step-eval-dot machine frame)
-      import*  (step-eval-import machine frame)
-      letfn*   (step-eval-letfn machine frame)
-      ns       (step-eval-ns machine frame)
-      in-ns    (step-eval-in-ns machine frame)
-      require  (step-eval-require machine frame)
-      defmacro (step-eval-defmacro machine frame)
-      defmulti (step-eval-defmulti machine frame)
-      defmethod (step-eval-defmethod machine frame)
-      remove-method (step-eval-remove-method machine frame)
-      prefer-method (step-eval-prefer-method machine frame)
-      defprotocol (step-eval-defprotocol machine frame)
-      extend   (step-eval-extend machine frame)
-      extend-type (step-eval-extend-type machine frame)
-      extend-protocol (step-eval-extend-protocol machine frame)
-      binding  (step-eval-binding machine frame)
-      deftype* (step-eval-deftype* machine frame)
-      monitor-enter (m/push-value machine nil)
-      monitor-exit  (m/push-value machine nil)
-      suspend! (step-eval-suspend machine frame)
-      (throw (ex-info (str "Special form not yet implemented: " head)
-                      {:type :sci/error :form head})))))
+               raw-head)
+        ;; Check if the special form symbol has been overridden.
+        ;; Check current namespace first, then clojure.core — but only apply
+        ;; clojure.core overrides that were explicitly provided by the user
+        ;; (marked :user-override? true). Default host heap entries like
+        ;; clojure.core/require must NOT shadow SCI's special-form handlers.
+        heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+        current-ns-override (get heap (symbol (str (:current-ns machine)) (str head)))
+        core-override (get heap (symbol "clojure.core" (str head)))
+        override-entry (or current-ns-override
+                           (when (:user-override? core-override) core-override))]
+    (if (and override-entry (not (:macro? override-entry)))
+      ;; Override found — apply override value as a function (skip special form handling)
+      (let [override-val (:val override-entry)
+            arg-exprs (vec (rest (:expr frame)))]
+        (-> machine
+            (m/replace-frame {:op :eval-args
+                              :pending arg-exprs
+                              :done []
+                              :phase :eval-f
+                              :callstack-depth (count (:callstack machine))})
+            (assoc :result override-val)))
+      ;; No override — proceed with special form dispatch
+      (do
+        ;; Only check permissions for user-written forms (with :line metadata).
+        ;; Macro-expanded special forms (e.g. loop*/recur from doseq) should not
+        ;; be blocked by deny lists since the user didn't write them directly.
+        (when (:line (meta (:expr frame)))
+          (check-permission machine head))
+        (case head
+          if       (step-eval-if machine frame)
+          do       (step-eval-do machine frame)
+          let*     (step-eval-let machine frame)
+          fn*      (step-eval-fn machine frame)
+          def      (step-eval-def machine frame)
+          quote    (step-eval-quote machine frame)
+          loop*    (step-eval-loop machine frame)
+          recur    (step-eval-recur machine frame)
+          try      (step-eval-try machine frame)
+          throw    (let [throw-loc (form-location (:expr frame))]
+                     (-> machine
+                         (m/replace-frame (merge {:op :throw} (when throw-loc {:throw-loc throw-loc})))
+                         (m/push-frame {:op :eval :expr (second (:expr frame))})))
+          var      (step-eval-var machine frame)
+          case*    (step-eval-case machine frame)
+          set!     (step-eval-set! machine frame)
+          new      (step-eval-new machine frame)
+          .        (step-eval-dot machine frame)
+          import*  (step-eval-import machine frame)
+          letfn*   (step-eval-letfn machine frame)
+          ns       (step-eval-ns machine frame)
+          in-ns    (step-eval-in-ns machine frame)
+          require  (step-eval-require machine frame)
+          defmacro (step-eval-defmacro machine frame)
+          defmulti (step-eval-defmulti machine frame)
+          defmethod (step-eval-defmethod machine frame)
+          remove-method (step-eval-remove-method machine frame)
+          prefer-method (step-eval-prefer-method machine frame)
+          defprotocol (step-eval-defprotocol machine frame)
+          extend   (step-eval-extend machine frame)
+          extend-type (step-eval-extend-type machine frame)
+          extend-protocol (step-eval-extend-protocol machine frame)
+          binding  (step-eval-binding machine frame)
+          deftype* (step-eval-deftype* machine frame)
+          reify*   (step-eval-reify* machine frame)
+          monitor-enter (m/push-value machine nil)
+          monitor-exit  (m/push-value machine nil)
+          suspend! (step-eval-suspend machine frame)
+          (throw (ex-info (str "Special form not yet implemented: " head)
+                          {:type :sci/error :form head})))))))
 
 ;; ============================================================
 ;; Macro expansion
@@ -2404,29 +2777,265 @@
             [true (if (meta form) (with-meta rewritten (meta form)) rewritten)]))
 
         (if (and (symbol? head) (contains? (:env machine) head))
-        ;; Head is a local binding — don't macro-expand
-        [false form]
-      (if-let [[macro-val is-host-macro?] (try-resolve-macro machine head)]
-          (let [macro-fn (if (var? macro-val) @macro-val macro-val)
+          ;; Head is a local binding — don't macro-expand
+          [false form]
+          (if-let [[macro-val is-host-macro?] (try-resolve-macro machine head)]
+            (let [macro-fn (if (var? macro-val) @macro-val macro-val)
                 ;; All macros get &form and &env:
                 ;; - host Clojure vars: the fn itself takes [&form &env ...args]
                 ;; - SCI closures (defmacro in scripts): closure params have &form &env prepended
                 ;; - internal SCI macros (doc, defonce, etc.): take just args (no &form &env)
-                current-env (:env machine)
-                expanded (if is-host-macro?
-                           (apply macro-fn form current-env (rest form))
-                           ;; SCI closures from defmacro: also get &form and &env
-                           (if (:sci/closure (meta macro-val))
+                  current-env (:env machine)
+                  expanded (if is-host-macro?
                              (apply macro-fn form current-env (rest form))
+                           ;; SCI closures from defmacro: also get &form and &env
+                             (if (:sci/closure (meta macro-val))
+                               (apply macro-fn form current-env (rest form))
                              ;; Internal SCI macros: just args
-                             (apply macro-fn (rest form))))
+                               (apply macro-fn (rest form))))
                 ;; Preserve source location from original form on expanded form
-                expanded (if (and (seq? expanded) (:line (meta form)))
-                           (with-meta expanded
-                             (merge (meta expanded) (select-keys (meta form) [:line :column])))
-                           expanded)]
-            [true expanded])
-          [false form]))))))
+                  expanded (if (and (seq? expanded) (:line (meta form)))
+                             (with-meta expanded
+                               (merge (meta expanded) (select-keys (meta form) [:line :column])))
+                             expanded)]
+              [true expanded])
+            [false form]))))))
+
+;; ============================================================
+;; Macro expansion at definition time (Clojure semantics)
+;; ============================================================
+
+(defn- macroexpand-all
+  "Fully expand all macros in a form at definition time (Clojure compile-time semantics).
+   locals is an ordered map {sym nil} used both for local-shadowing checks and as &env."
+  [machine form locals]
+  (cond
+    (not (seq? form)) form
+
+    ;; Quoted forms: don't expand inside
+    (= 'quote (first form)) form
+
+    ;; fn*/letfn*: new scope — each inner fn will expand itself when created
+    (= 'fn* (first form)) form
+    (= 'letfn* (first form)) form
+
+    ;; let*/loop*: expand binding values, then body with extended locals
+    (or (= 'let* (first form)) (= 'loop* (first form)))
+    (let [[head bindings & body] form
+          pairs (partition 2 bindings)
+          [exp-pairs new-locals]
+          (reduce (fn [[acc locs] [sym val]]
+                    [(conj acc sym (macroexpand-all machine val locs))
+                     (assoc locs sym nil)])
+                  [[] locals] pairs)
+          exp-body (map #(macroexpand-all machine % new-locals) body)
+          rebuilt (apply list head (vec exp-pairs) exp-body)]
+      (if (meta form) (with-meta rebuilt (meta form)) rebuilt))
+
+    :else
+    ;; Try to expand the head as a macro (fixed point)
+    (let [expanded
+          (loop [f form]
+            (let [head (first f)]
+              (if (and (symbol? head) (not (contains? locals head)))
+                (let [[did-expand? new-f] (macroexpand-form (assoc machine :env locals) f)]
+                  (if did-expand? (recur new-f) f))
+                f)))]
+      (if (identical? expanded form)
+        ;; Not a macro call — recurse into sub-forms, preserving source location metadata
+        (let [rebuilt (apply list (map #(macroexpand-all machine % locals) form))]
+          (if (meta form)
+            (with-meta rebuilt (meta form))
+            rebuilt))
+        ;; Was expanded — re-process result
+        (macroexpand-all machine expanded locals)))))
+
+;; ============================================================
+;; Static analysis helpers (fn body checking at definition time)
+;; ============================================================
+
+(defn- extract-param-hints
+  "Extract {sym type-hint-symbol-or-nil} from a destructuring parameter list or single param.
+   The type hint is taken from (:tag (meta sym)) when the symbol has a type annotation."
+  [params]
+  (reduce (fn [hints p]
+            (cond
+              (= '& p) hints
+              (symbol? p) (assoc hints p (some-> (meta p) :tag))
+              (vector? p)
+              (into hints (extract-param-hints (remove #{'& :as} p)))
+              (map? p)
+              (let [k (concat (:keys p) (:strs p) (:syms p))
+                    as (:as p)]
+                (cond-> (into hints (map (fn [s] [s (some-> (meta s) :tag)]) (filter symbol? k)))
+                  (symbol? as) (assoc as nil)))
+              :else hints))
+          {}
+          params))
+
+(defn- analyze-form
+  "Walk a form at fn-definition time to catch obvious static errors:
+   undefined free variables, macro-value references, and denied symbols.
+   env: map of {sym type-hint-symbol-or-nil} for locally-in-scope symbols.
+   Throws with :phase \"analysis\" if a problem is found."
+  [machine env form]
+  (letfn [(lookup [sym]
+            ;; Returns heap entry or nil
+            (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                  ns-sym (:current-ns machine)
+                  sym-name (name sym)
+                  sym-ns (namespace sym)
+                  q-local (symbol (str ns-sym) sym-name)
+                  q-core (symbol "clojure.core" sym-name)
+                  q-qual (when sym-ns (symbol sym-ns sym-name))]
+              (or (when q-qual (get heap q-qual))
+                  (get heap q-local)
+                  (get heap q-core))))
+          (check [env frm]
+            (cond
+              ;; Nil / literals: ignore
+              (nil? frm) nil
+              (or (boolean? frm) (number? frm) (string? frm)
+                  (keyword? frm) (char? frm)) nil
+
+              ;; Symbol reference
+              (symbol? frm)
+              (when-not (contains? env frm)
+                (let [entry (lookup frm)]
+                  (cond
+                    (nil? entry)
+                    ;; Not in heap — check if it's a Java class
+                    #?(:clj
+                       (when-not (try-resolve-class (name frm))
+                         (throw (ex-info (str "Unable to resolve symbol: " frm " in this context")
+                                         {:type :sci/error :sym frm :phase "analysis"})))
+                       :cljs
+                       (throw (ex-info (str "Unable to resolve symbol: " frm " in this context")
+                                       {:type :sci/error :sym frm :phase "analysis"})))
+                    ;; In heap but is a macro — can't take value
+                    (:macro? entry)
+                    (throw (ex-info (str "Can't take value of a macro: " frm)
+                                    {:type :sci/error :phase "analysis"})))))
+
+              ;; Seq forms
+              (seq? frm)
+              (let [head (first frm)]
+                (cond
+                  ;; Quoted: don't analyze
+                  (= 'quote head) nil
+
+                  ;; var special form: check accessibility of the var name
+                  (= 'var head)
+                  (let [sym (second frm)
+                        perms (:permissions machine)
+                        deny (:deny perms)]
+                    ;; Deny-list check
+                    (when (and deny (seq deny))
+                      (let [sym-name (name sym)
+                            bare (symbol sym-name)
+                            core-q (symbol "clojure.core" sym-name)]
+                        (when (or (contains? (set deny) sym)
+                                  (contains? (set deny) bare)
+                                  (contains? (set deny) core-q))
+                          (throw (ex-info (str sym " is not allowed!")
+                                          {:type :sci/error})))))
+                    ;; Existence check (unless it's a local)
+                    (when-not (contains? env sym)
+                      (when-not (lookup sym)
+                        (throw (ex-info (str "Unable to resolve var: " sym " in this context")
+                                        {:type :sci/error :sym sym :phase "analysis"})))))
+
+                  ;; fn* — new scope with params
+                  (= 'fn* head)
+                  (let [fn-parsed (parse-fn-form frm)
+                        fn-name (:name fn-parsed)
+                        base (cond-> env fn-name (assoc fn-name nil))]
+                    (doseq [{:keys [params body]} (:arities fn-parsed)
+                            :let [new-env (into base (extract-param-hints params))]]
+                      (doseq [bf body] (check new-env bf))))
+
+                  ;; let* — sequential bindings
+                  (= 'let* head)
+                  (let [raw-bindings (vec (second frm))
+                        pairs (partition 2 raw-bindings)
+                        body (drop 2 frm)]
+                    (loop [rem pairs cur-env env]
+                      (if (empty? rem)
+                        (doseq [bf body] (check cur-env bf))
+                        (let [[sym init] (first rem)]
+                          (check cur-env init)
+                          (recur (rest rem)
+                                 (into cur-env (extract-param-hints [sym])))))))
+
+                  ;; loop* — like let* for init vals, then body with all bindings
+                  (= 'loop* head)
+                  (let [pairs (partition 2 (second frm))
+                        body (drop 2 frm)
+                        loop-env (into env (extract-param-hints (map first pairs)))]
+                    (doseq [[_ init] pairs] (check env init))
+                    (doseq [bf body] (check loop-env bf)))
+
+                  ;; letfn* — all fns are mutually visible; skip detailed analysis
+                  (= 'letfn* head) nil
+
+                  ;; try / catch / finally
+                  (= 'catch head)
+                  (let [ex-sym (nth frm 2 nil)
+                        body (drop 3 frm)
+                        new-env (if (symbol? ex-sym) (assoc env ex-sym nil) env)]
+                    (doseq [bf body] (check new-env bf)))
+
+                  ;; (. target method-or-list args...) — canonical dot special form
+                  ;; The target is a symbol/class; method is NOT a free variable
+                  (= '. head)
+                  (let [[_ target method-or-list & margs] frm]
+                    (check env target)
+                    (if (list? method-or-list)
+                      ;; (. obj (method args...)) — args are inside the list
+                      (doseq [a (rest method-or-list)] (check env a))
+                      ;; (. obj method args...) — method is a symbol (skip it), args follow
+                      (doseq [a margs] (check env a))))
+
+                  ;; (.method obj args...) — instance dot call: check type hint
+                  #?(:clj
+                     (and (symbol? head)
+                          (.startsWith ^String (name head) ".")
+                          (not (.startsWith ^String (name head) ".-")))
+                     :cljs false)
+                  #?(:clj
+                     (let [method-str (subs (name head) 1)
+                           obj-expr (second frm)]
+                       ;; Check all args
+                       (doseq [arg (rest frm)] (check env arg))
+                       ;; Type-hint check: if obj is a local with a known class hint, verify method
+                       (when (symbol? obj-expr)
+                         (when-let [tag (get env obj-expr)]
+                           (when-let [klass (and (symbol? tag) (try-resolve-class (name tag)))]
+                             (when-not (seq (filter #(= method-str (.getName ^java.lang.reflect.Method %))
+                                                    (.getMethods ^Class klass)))
+                               (throw (ex-info method-str
+                                               {:type :sci/error :message method-str
+                                                :phase "analysis"})))))))
+                     :cljs nil)
+
+                  ;; Default: try macro expansion; if expanded, re-check; else check sub-forms
+                  :else
+                  (let [[expanded? new-form] (try
+                                               (macroexpand-form machine frm)
+                                               (catch #?(:clj Throwable :cljs :default) _ [false frm]))]
+                    (if expanded?
+                      (check env new-form)
+                      ;; Regular call — skip head (it may be a macro or special form symbol),
+                      ;; check arg sub-forms
+                      (doseq [sub (rest frm)] (check env sub))))))
+
+              ;; Collections
+              (vector? frm) (doseq [sub frm] (check env sub))
+              (map? frm) (doseq [[k v] frm] (check env k) (check env v))
+              (set? frm) (doseq [sub frm] (check env sub))
+
+              :else nil))]
+    (check env form)))
 
 ;; ============================================================
 ;; Permission checking
@@ -2482,6 +3091,7 @@
         ;; :last-loc = most recent form with location (innermost)
         ;; :top-loc = outermost form with location (for error reporting)
         loc (and (seq? form) (form-location form))
+        _ (when loc (set! *current-form-loc* loc))
         machine (if loc
                   (-> machine
                       (assoc :last-loc loc)
@@ -2597,12 +3207,12 @@
                              (throw v)
                              (let [loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
                                (throw (ex-info (str v)
-                                              (merge {:type :sci/error
-                                                      :sci.impl/callstack (:callstack machine)}
-                                                     (when loc
-                                                       {:line (:line loc)
-                                                        :column (:column loc)
-                                                        :file (:file loc)})))))))
+                                               (merge {:type :sci/error
+                                                       :sci.impl/callstack (:callstack machine)}
+                                                      (when loc
+                                                        {:line (:line loc)
+                                                         :column (:column loc)
+                                                         :file (:file loc)})))))))
         (throw (ex-info (str "Unknown op: " (:op frame))
                         {:type :sci/error}))))))
 
@@ -2623,6 +3233,11 @@
 (defn- handle-exception
   "Handle an exception by looking for a matching catch clause on the stack."
   [machine ^Throwable ex]
+  ;; Unwrap ExecutionException (Clojure 1.10.x future.get wraps exceptions in ExecutionException)
+  (let [ex #?(:clj (if (instance? java.util.concurrent.ExecutionException ex)
+                     (or (.getCause ^java.util.concurrent.ExecutionException ex) ex)
+                     ex)
+              :cljs ex)])
   (if-let [[idx try-frame] (find-try-frame (:stack machine))]
     ;; Found a try frame — look for matching catch
     (let [catches (:catches try-frame)
@@ -2639,16 +3254,31 @@
                                 :cljs true)))
                          catches))]
       (if match
-        (let [[_ _class-sym binding-sym & body] match
+        (let [[_ catch-class-sym binding-sym & body] match
               ;; Truncate stack to the try frame
               new-stack (subvec (vec (:stack machine)) 0 idx)
-              ;; Restore env and bind exception (use cause if wrapper didn't match directly)
-              [_ catch-class-sym] match
-              bound-ex #?(:clj (let [klass (or (try-resolve-class (str catch-class-sym)) Exception)]
-                                 (if (instance? klass ex)
-                                   ex
-                                   (or (ex-cause ex) ex)))
-                          :cljs ex)
+              ;; ^:sci/error on catch class: bind the SCI-wrapped exception using last-loc
+              sci-error? #?(:clj (and (symbol? catch-class-sym)
+                                      (:sci/error (meta catch-class-sym)))
+                            :cljs false)
+              bound-ex (if sci-error?
+                         ;; Wrap exception as SCI error using last-loc for accurate location
+                         (let [loc (or (:last-loc machine) (:top-loc machine)
+                                       (first (:callstack machine)))]
+                           (ex-info (or (ex-message ex)
+                                        #?(:clj (.getName (class ex)) :cljs "Error"))
+                                    (merge {:type :sci/error
+                                            :message (ex-message ex)
+                                            :sci.impl/callstack (:callstack machine)}
+                                           (when loc {:line (:line loc) :column (:column loc)
+                                                      :file (:file loc)}))
+                                    ex))
+                         ;; Normal: bind original exception (or cause if class didn't match directly)
+                         #?(:clj (let [klass (or (try-resolve-class (str catch-class-sym)) Exception)]
+                                   (if (instance? klass ex)
+                                     ex
+                                     (or (ex-cause ex) ex)))
+                            :cljs ex))
               m (-> machine
                     (assoc :stack new-stack
                            :status :running)
@@ -2679,24 +3309,94 @@
             (handle-exception machine-without-try ex)
             (handle-exception machine-without-try ex)))))
     ;; No try frame — wrap with location info and rethrow
-    ;; Prefer top-loc (outermost form) for the reported error location
-    (let [loc (or (:top-loc machine) (:last-loc machine) (first (:callstack machine)))
+    (let [;; Prefer throw-loc (saved from :throw special form) for accurate error location
+          top-frame (peek (vec (:stack machine)))
+          throw-loc (when (= :throw (:op top-frame)) (:throw-loc top-frame))
           already-wrapped? (and (instance? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) ex)
-                                (= :sci/error (:type (ex-data ex))))]
+                                (= :sci/error (:type (ex-data ex))))
+          ;; For SCI errors: use *current-form-loc* for the most specific sub-form location.
+          ;; For host Java exceptions: if there is an :eval-args frame in the stack the error
+          ;; occurred while evaluating a function argument, so use *current-form-loc* for the
+          ;; argument's location; otherwise (body/implicit-do context) use :top-loc so the error
+          ;; is attributed to the outermost enclosing form rather than a macro-expansion sub-form.
+          loc (if already-wrapped?
+                (or throw-loc *current-form-loc* (:last-loc machine) (:top-loc machine) (first (:callstack machine)))
+                (let [has-eval-args? (some #(= :eval-args (:op %)) (:stack machine))]
+                  (if has-eval-args?
+                    (or throw-loc *current-form-loc* (:last-loc machine) (:top-loc machine) (first (:callstack machine)))
+                    (or throw-loc (:top-loc machine) *current-form-loc* (:last-loc machine) (first (:callstack machine))))))]
       (if (and already-wrapped? (:line (ex-data ex)))
-        ;; Already has location info
+        ;; Already has location info — rethrow unchanged
         (throw ex)
         ;; Wrap or re-wrap with location info
-        (throw (ex-info (or (ex-message ex) (str #?(:clj (.getName (class ex)) :cljs "Error")))
-                        (merge (when already-wrapped? (ex-data ex))
-                               {:type :sci/error
-                                :message (ex-message ex)
-                                :sci.impl/callstack (:callstack machine)}
-                               (when loc
-                                 {:line (:line loc)
-                                  :column (:column loc)
-                                  :file (:file loc)}))
-                        (if already-wrapped? (ex-cause ex) ex)))))))
+        (let [original-raw-callstack (:callstack machine)
+              raw-callstack original-raw-callstack
+              ;; Synthesize callstack from loc when empty (e.g. analysis-phase errors)
+              raw-callstack (if (and (empty? raw-callstack) loc)
+                              [{:ns (:current-ns machine)
+                                :name (:current-fn-name machine)
+                                :line (:line loc)
+                                :column (:column loc)
+                                :file (:current-file machine)}]
+                              raw-callstack)
+              ;; Reverse: callstack is stored outermost-first; tests expect innermost-first
+              callstack (vec (rseq (vec raw-callstack)))
+              ;; For SCI internal errors (no :line in ex-data), prepend a no-loc frame for
+              ;; the current function — indicates where the error occurred
+              callstack (if (and (not-empty callstack)
+                                 already-wrapped?
+                                 (not (:line (ex-data ex)))
+                                 (:current-fn-name machine))
+                          (into [{:ns (:current-ns machine)
+                                  :name (:current-fn-name machine)
+                                  :file (:current-file machine)}]
+                                callstack)
+                          callstack)
+              ;; Prepend built-in host function frame when the top stack frame is :apply
+              ;; with a known host fn (looked up via inverse-registry)
+              builtin-frame #?(:clj
+                               (when-let [ir (:inverse-registry machine)]
+                                 (let [tf (peek (vec (:stack machine)))]
+                                   (when (and (= :apply (:op tf)) (fn? (:f tf)))
+                                     (when-let [sym (.get ^java.util.IdentityHashMap ir (:f tf))]
+                                       (let [entry (get @(:heap-atom machine) sym)
+                                             m (or (:meta entry) {})]
+                                         {:ns (symbol (str (or (:ns m) (namespace (str sym)))))
+                                          :name (or (:name m) (symbol (name (str sym))))
+                                          :file (:file m)
+                                          :line (:line m)
+                                          :column (or (:column m) 1)})))))
+                               :cljs nil)
+              callstack (if builtin-frame
+                          (into [builtin-frame] callstack)
+                          callstack)
+              ;; If the outermost callstack entry is deeper than :top-loc, it means the top-level
+              ;; form was a macro call that didn't push a callstack entry. Add a synthetic frame
+              ;; for the top-level form so the full call chain is visible.
+              callstack (if (and (not-empty original-raw-callstack)
+                                 (not-empty callstack)
+                                 (:top-loc machine))
+                          (let [top-loc (:top-loc machine)
+                                last-e (peek callstack)]
+                            (if (and (= (:line top-loc) (:line last-e))
+                                     (= (:column top-loc) (:column last-e)))
+                              callstack
+                              (conj callstack {:ns (:current-ns machine)
+                                               :name nil
+                                               :line (:line top-loc)
+                                               :column (:column top-loc)
+                                               :file (:current-file machine)})))
+                          callstack)]
+          (throw (ex-info (or (ex-message ex) (str #?(:clj (.getName (class ex)) :cljs "Error")))
+                          (merge (when already-wrapped? (ex-data ex))
+                                 {:type :sci/error
+                                  :message (ex-message ex)
+                                  :sci.impl/callstack callstack}
+                                 (when loc
+                                   {:line (:line loc)
+                                    :column (:column loc)})
+                                 {:file (or (:file loc) (:current-file machine))})
+                          (if already-wrapped? (ex-cause ex) ex))))))))
 
 (def ^:dynamic *max-steps*
   "Maximum number of VM steps before throwing. nil = unlimited.
@@ -2705,27 +3405,29 @@
 
 (defn run [machine]
   (let [max-steps *max-steps*]
-    (loop [m machine
-           steps 0]
-      (case (:status m)
-        :running (do
-                   (when (and max-steps (>= steps max-steps))
-                     (throw (ex-info "Execution limit reached"
-                                     {:type :sci/error :steps steps})))
-                   (let [pre-dyn (:dynamic-bindings m)
-                         _ (reset! current-dynamic-bindings pre-dyn)
-                         next-m (try
-                                  (step m)
-                                  (catch #?(:clj Throwable :cljs :default) ex
-                                    (handle-exception m ex)))
-                         ;; Sync back var-set changes: only if a host fn modified
-                         ;; current-dynamic-bindings (not if step itself changed it)
-                         post-dyn @current-dynamic-bindings
-                         next-m (if (identical? post-dyn pre-dyn)
-                                  next-m ;; No host-side changes
-                                  ;; Host fn modified bindings — merge into step result
-                                  (assoc next-m :dynamic-bindings post-dyn))]
-                     (recur next-m (unchecked-inc steps))))
-        :done    (:result m)
-        :suspend m
-        :effect  m))))
+    (binding [current-dynamic-bindings nil
+              *current-form-loc* nil]
+      (loop [m machine
+             steps 0]
+        (case (:status m)
+          :running (do
+                     (when (and max-steps (>= steps max-steps))
+                       (throw (ex-info "Execution limit reached"
+                                       {:type :sci/error :steps steps})))
+                     (let [pre-dyn (:dynamic-bindings m)
+                           _ (set! current-dynamic-bindings pre-dyn)
+                           next-m (try
+                                    (step m)
+                                    (catch #?(:clj Throwable :cljs :default) ex
+                                      (handle-exception m ex)))
+                           ;; Sync back var-set changes: only if a host fn modified
+                           ;; current-dynamic-bindings (not if step itself changed it)
+                           post-dyn current-dynamic-bindings
+                           next-m (if (identical? post-dyn pre-dyn)
+                                    next-m ;; No host-side changes
+                                    ;; Host fn modified bindings — merge into step result
+                                    (assoc next-m :dynamic-bindings post-dyn))]
+                       (recur next-m (unchecked-inc steps))))
+          :done    (:result m)
+          :suspend m
+          :effect  m)))))

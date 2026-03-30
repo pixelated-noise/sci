@@ -9,7 +9,7 @@
   (let [ctx (sci/init {:bindings {'foo 1}})
         v (parser/parse-string ctx s)
         a (ana/analyze ctx v)
-        e (types/eval a ctx nil)]
+        e (types/eval a)]
     [e
      #?(:clj (instance? sci.impl.types.ConstantNode a)
         :cljs (not (instance? sci.impl.types.NodeR a)))]))
