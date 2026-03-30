@@ -121,7 +121,7 @@
   "Create an SCI context (the machine's initial state)."
   [opts]
   (let [{:keys [bindings namespaces classes aliases ns-aliases imports
-                features load-fn readers deny allow file]} opts
+                features load-fn readers deny allow file initial-ns]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
         ;; Override satisfies? to handle SCI protocols
@@ -194,7 +194,7 @@
      :heap-atom (atom heap)
      :ns-table ns-table
      :ns-atom (atom ns-table)
-     :current-ns-atom (atom 'user)
+     :current-ns-atom (atom (or initial-ns 'user))
      :classes (or classes {})
      :features (or features #{:clj})
      :load-fn load-fn
@@ -953,9 +953,15 @@
   "Evaluate a string of Clojure code."
   ([s] (eval-string s nil))
   ([s opts]
-   (let [ctx (if (and opts (:heap opts))
+   (let [;; When sci/ns atom has been bound to a symbol (via sci/binding), use it
+         ;; as the initial namespace for the context.
+         sci-ns-var sci.core/ns  ; the sci/ns atom — avoid collision with clojure.core/ns macro
+         sci-ns-val @sci-ns-var
+         initial-ns (when (symbol? sci-ns-val) sci-ns-val)
+         ctx (if (and opts (:heap opts))
                opts  ;; already initialized
-               (init (or opts {})))
+               (init (cond-> (or opts {})
+                       initial-ns (assoc :initial-ns initial-ns))))
          current-ns-atom (or (:current-ns-atom ctx) (atom 'user))
          reader-extra (cond-> {}
                         (:features ctx) (assoc :features (:features ctx))
