@@ -924,11 +924,12 @@
             arity (match-arity (:arities f) (count args) qualified-name)
             bindings (bind-params (:params arity) args)
             fn-env (merge (:env f)
-                          bindings
-                          ;; Only add self-reference binding for (fn name [x] ...) style,
-                          ;; not for (defn name [x] ...) which uses :sci/def-named.
+                          ;; Self-reference comes before params to match Clojure's &env order.
+                          ;; Only for (fn name [x] ...) style, not (defn name [x] ...) which
+                          ;; uses :sci/def-named to suppress this.
                           (when (and (:name f) (not (:sci/def-named f)))
-                            {(:name f) f}))]
+                            {(:name f) f})
+                          bindings)]
         (-> machine
             (m/replace-frame {:op :fn-body
                               :body (:body arity)
@@ -2225,8 +2226,10 @@
                                acc))
                            {} method-forms)
         ;; Build closures for all defined methods — used for Object dispatch (toString etc.)
+        ;; Normalize keys to unqualified so protocol dispatch works even when method names
+        ;; are backtick-qualified (e.g. user/proto from `(defrecord ...)).
         method-fns (reduce-kv (fn [acc mname {:keys [params body fields]}]
-                                (assoc acc mname
+                                (assoc acc (symbol (name mname))
                                        (make-deftype-method-fn machine ns-sym fields params body)))
                               {} method-map)
         ;; Create the Type object — store method fns so str/prn can call them
@@ -2265,10 +2268,13 @@
                   (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
                         env  (:env machine)]
                     (reduce (fn [m proto-sym]
-                              (let [proto (or (get env proto-sym)
-                                             (let [ns-str (str ns-sym)
-                                                   q  (symbol ns-str (str proto-sym))
-                                                   cq (symbol "clojure.core" (str proto-sym))]
+                              (let [proto-ns-str (when (qualified-symbol? proto-sym)
+                                                   (namespace proto-sym))
+                                    proto-name   (name proto-sym)
+                                    proto (or (get env proto-sym)
+                                             (let [the-ns (or proto-ns-str (str ns-sym))
+                                                   q  (symbol the-ns proto-name)
+                                                   cq (symbol "clojure.core" proto-name)]
                                                (or (:val (get heap q))
                                                    (:val (get heap cq)))))]
                                 (if (and (map? proto) (= :sci/protocol (:type proto)))
