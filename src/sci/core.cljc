@@ -163,6 +163,23 @@
                               (clojure.core/satisfies? protocol x)))
                      :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs nil)}
                      :dynamic? false})
+        ;; Override deref to handle SCI type instances with deref methods
+        heap (assoc heap (symbol "clojure.core" "deref")
+                    {:val (fn sci-deref
+                            ([ref]
+                             (if-let [type-obj (:type (clojure.core/meta ref))]
+                               (if (instance? sci.lang.Type type-obj)
+                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                       deref-fn (get methods 'deref)]
+                                   (if deref-fn
+                                     (deref-fn ref)
+                                     (clojure.core/deref ref)))
+                                 (clojure.core/deref ref))
+                               (clojure.core/deref ref)))
+                            ([ref timeout-ms timeout-val]
+                             (clojure.core/deref ref timeout-ms timeout-val)))
+                     :meta {:name 'deref}
+                     :dynamic? false})
         ;; Install user bindings into heap as user/sym vars
         ;; :dynamic? true so thread-local bindings (sci/binding, sci/with-bindings) work.
         ;; Atom-backed vars (from new-dynamic-var) are stored as atoms; resolve-symbol derefs them.

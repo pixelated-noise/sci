@@ -145,10 +145,16 @@
        (try
          (clojure.lang.Reflector/getStaticField klass member-name)
          (catch Exception _
-           ;; Try as static method — return a wrapper function
-           (fn [& args]
+           ;; Try as zero-arg static method call (Clojure semantics:
+           ;; Class/method resolves as a zero-arg call, not a fn reference)
+           (try
              (clojure.lang.Reflector/invokeStaticMethod
-              klass member-name (to-array args))))))))
+              klass member-name (to-array []))
+             (catch Exception _
+               ;; Fall back to wrapper fn for multi-arg static methods
+               (fn [& args]
+                 (clojure.lang.Reflector/invokeStaticMethod
+                  klass member-name (to-array args))))))))))
 
 (defn resolve-symbol [machine sym]
   (let [env (:env machine)]
@@ -1894,17 +1900,24 @@
 
 (defn- make-protocol
   "Create a protocol record."
-  [proto-name method-sigs ns-sym]
+  [proto-name method-sigs ns-sym opts]
   {:type :sci/protocol
    :name proto-name
    :ns ns-sym
    :methods method-sigs
+   :extend-via-metadata (:extend-via-metadata opts)
    :impls (atom {})}) ;; type -> {method-name -> fn}
 
 (defn step-eval-defprotocol [machine frame]
-  ;; (defprotocol Name (method1 [this]) (method2 [this x]))
+  ;; (defprotocol Name :extend-via-metadata true (method1 [this]) (method2 [this x]))
   (let [[_ proto-name & method-defs] (:expr frame)
         ns-sym (:current-ns machine)
+        ;; Parse options like :extend-via-metadata true
+        [opts method-defs] (loop [opts {} remaining method-defs]
+                             (if (keyword? (first remaining))
+                               (recur (assoc opts (first remaining) (second remaining))
+                                      (drop 2 remaining))
+                               [opts remaining]))
         ;; Parse method signatures
         method-sigs (into {} (keep (fn [md]
                                      (when (seq? md)
@@ -1914,27 +1927,39 @@
                                              arglists (remove string? arglists)]
                                          [mname {:arglists (vec arglists)}])))
                                    method-defs))
-        protocol (make-protocol proto-name method-sigs ns-sym)
+        protocol (make-protocol proto-name method-sigs ns-sym opts)
         qualified (symbol (str ns-sym) (str proto-name))
         ;; Create dispatch functions for each protocol method
         machine (reduce
                  (fn [m [mname {:keys [arglists]}]]
-                   (let [method-fn (fn protocol-dispatch [& args]
+                   (let [extend-via-meta? (:extend-via-metadata protocol)
+                         mname-qualified (symbol (str ns-sym) (str mname))
+                         method-fn (fn protocol-dispatch [& args]
                                      (let [target (first args)
-                                           ;; For SCI type instances (maps with :type meta), use SCI type
+                                           ;; extend-via-metadata: check target's metadata first
+                                           meta-fn (when extend-via-meta?
+                                                     (when-let [m (clojure.core/meta target)]
+                                                       (or (get m mname-qualified)
+                                                           (get m (symbol (name mname))))))]
+                                       (if meta-fn
+                                         (apply meta-fn args)
+                                     (let [;; For SCI type instances (maps with :type meta), use SCI type
                                            sci-type (when (map? target) (:type (clojure.core/meta target)))
                                            target-type (or sci-type (type target))
                                            impls @(:impls protocol)
-                                           ;; Look up implementation: exact type match first, then supers
+                                           ;; Look up implementation: exact type, then IRecord, then interfaces, then Object
                                            impl (or (get impls target-type)
-                                                    (some (fn [[t impl]]
-                                                            (when (and (class? t) (instance? t target))
-                                                              impl))
-                                                          impls)
-                                                    ;; For SCI records: check clojure.lang.IRecord / IPersistentMap
+                                                    ;; SCI records: check IRecord/IPersistentMap before Object
                                                     (when (:sci.impl/record (clojure.core/meta target))
                                                       (or (get impls clojure.lang.IRecord)
                                                           (get impls clojure.lang.IPersistentMap)))
+                                                    ;; Check interfaces (excluding Object — handled below)
+                                                    (some (fn [[t impl]]
+                                                            (when (and (class? t)
+                                                                       (not= t Object)
+                                                                       (instance? t target))
+                                                              impl))
+                                                          impls)
                                                     ;; Try nil
                                                     (when (nil? target) (get impls nil))
                                                     ;; Try Object/:default
@@ -1947,7 +1972,7 @@
                                          (throw (ex-info (str "No implementation of method: " mname
                                                               " of protocol: " proto-name
                                                               " found for: " (type target))
-                                                         {:type :sci/error})))))
+                                                         {:type :sci/error})))))))
                          mq (symbol (str ns-sym) (str mname))
                          entry {:val method-fn :meta {:protocol protocol} :dynamic? false}]
                      (when-let [a (:heap-atom m)]
@@ -2516,21 +2541,37 @@
         type-name     (symbol (name qualified-sym))
         clean-fields  (mapv #(with-meta % nil) fields-vec)
         field-keywords (mapv keyword clean-fields)
-        ;; Build method-map: mname -> {:params [...] :body [...] :fields [...]}
+        ;; Build method-map: mname -> [{:params [...] :body [...] :fields [...]} ...]
+        ;; Collect all arities per method name for multi-arity support.
         method-map (reduce (fn [acc mform]
                              (if (seq? mform)
                                (let [mname  (first mform)
                                      params (second mform)
                                      body   (vec (drop 2 mform))]
-                                 (assoc acc mname {:params params :body body :fields clean-fields}))
+                                 (update acc mname (fnil conj [])
+                                         {:params params :body body :fields clean-fields}))
                                acc))
                            {} method-forms)
         ;; Build closures for all defined methods — used for Object dispatch (toString etc.)
         ;; Normalize keys to unqualified so protocol dispatch works even when method names
         ;; are backtick-qualified (e.g. user/proto from `(defrecord ...)).
-        method-fns (reduce-kv (fn [acc mname {:keys [params body fields]}]
-                                (assoc acc (symbol (name mname))
-                                       (make-deftype-method-fn machine ns-sym fields params body)))
+        method-fns (reduce-kv (fn [acc mname arities]
+                                (let [fns (mapv (fn [{:keys [params body fields]}]
+                                                  {:fn (make-deftype-method-fn machine ns-sym fields params body)
+                                                   :arity (count params)})
+                                                arities)
+                                      ;; If single arity, use the fn directly; otherwise dispatch by arity
+                                      method-fn (if (= 1 (count fns))
+                                                  (:fn (first fns))
+                                                  (fn [& args]
+                                                    (let [n (count args)
+                                                          match (first (filter #(= n (:arity %)) fns))]
+                                                      (if match
+                                                        (apply (:fn match) args)
+                                                        (throw (ex-info (str "No matching arity for method " mname
+                                                                             ", got " n " args")
+                                                                        {:type :sci/error}))))))]
+                                  (assoc acc (symbol (name mname)) method-fn)))
                               {} method-map)
         ;; Create the Type object — store method fns so str/prn can call them
         type-obj (sci.lang/->Type dotted-sym clean-fields {} method-fns {:record? is-record?})
@@ -2815,9 +2856,11 @@
     ;; Quoted forms: don't expand inside
     (= 'quote (first form)) form
 
-    ;; fn*/letfn*: new scope — each inner fn will expand itself when created
+    ;; fn*/letfn*/deftype*/reify*: new scope — each inner fn will expand itself when created
     (= 'fn* (first form)) form
     (= 'letfn* (first form)) form
+    (= 'deftype* (first form)) form
+    (= 'reify* (first form)) form
 
     ;; let*/loop*: expand binding values, then body with extended locals
     (or (= 'let* (first form)) (= 'loop* (first form)))
