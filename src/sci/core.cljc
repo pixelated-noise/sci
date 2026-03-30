@@ -17,11 +17,75 @@
 ;; Reader
 ;; ============================================================
 
+(def ^:private special-forms-sq
+  #{'if 'do 'let 'fn 'def 'quote 'var 'loop 'recur
+    'try 'catch 'finally 'throw 'new 'set! 'monitor-enter
+    'monitor-exit '& 'binding})
+
+(defn- sq-resolve-class
+  "Try to resolve sym as a Java class; returns fully-qualified symbol or nil."
+  [sym]
+  #?(:clj (let [resolved (clojure.core/resolve sym)]
+             (when (instance? Class resolved)
+               (symbol (.getName ^Class resolved))))
+     :cljs nil))
+
+(defn- make-syntax-quote-resolver
+  "Returns a :resolve-symbol fn for edamame syntax-quote.
+   heap-atom may be nil (for contexts without a live heap)."
+  [current-ns heap-atom]
+  (fn [sym]
+    (let [sym-name (name sym)]
+      (cond
+        ;; Already namespace-qualified → keep as-is
+        (namespace sym) sym
+
+        ;; Special forms → keep as-is
+        (contains? special-forms-sq sym) sym
+
+        ;; Constructor form: Foo. → resolve class, add . back
+        #?(:clj  (.endsWith sym-name ".")
+           :cljs (= "." (last sym-name)))
+        (let [class-sym (symbol (subs sym-name 0 (dec (count sym-name))))]
+          (if-let [fq (sq-resolve-class class-sym)]
+            (symbol (str (name fq) "."))
+            (symbol (str current-ns "." sym-name))))
+
+        ;; Already has dots in the middle → fully qualified host class, keep as-is
+        #?(:clj  (> (.indexOf sym-name ".") -1)
+           :cljs (clojure.string/includes? sym-name "."))
+        sym
+
+        ;; Fallback: heap → Java class → host Clojure var → current-ns qualify
+        :else
+        (or
+         ;; Check SCI heap: sym defined/referred in current ns?
+         (when heap-atom
+           (let [h     @heap-atom
+                 entry (get h (symbol (str current-ns) sym-name))]
+             (when entry
+               (or (when-let [orig (:sci.impl/var-sym (:meta entry))]
+                     ;; referred from another ns
+                     (when (not= (namespace orig) (str current-ns))
+                       (symbol (namespace orig) sym-name)))
+                   ;; defined in current ns
+                   (symbol (str current-ns) sym-name)))))
+         ;; Java class?
+         (sq-resolve-class sym)
+         ;; Host Clojure var (clojure.core etc.)
+         (let [resolved #?(:clj (clojure.core/resolve sym) :cljs nil)]
+           (when resolved
+             (let [m (meta resolved)]
+               (symbol (str (:ns m)) (str (:name m))))))
+         ;; Default: qualify with current ns
+         (symbol (str current-ns) sym-name))))))
+
 (defn- make-reader-opts
   "Create edamame reader options, optionally with a current namespace for ::keyword resolution."
-  ([] (make-reader-opts 'user nil))
-  ([current-ns] (make-reader-opts current-ns nil))
-  ([current-ns ns-aliases]
+  ([] (make-reader-opts 'user nil nil))
+  ([current-ns] (make-reader-opts current-ns nil nil))
+  ([current-ns ns-aliases] (make-reader-opts current-ns ns-aliases nil))
+  ([current-ns ns-aliases heap-atom]
    {:all true
     :row-key :line
     :col-key :column
@@ -32,22 +96,7 @@
     :features #{:clj}
     :fn true
     :quote true
-    :syntax-quote {:resolve-symbol
-                    (fn [sym]
-                      (if (or (namespace sym)
-                              (contains? #{'if 'do 'let 'fn 'def 'quote 'var 'loop 'recur
-                                           'try 'catch 'finally 'throw 'new 'set! 'monitor-enter
-                                           'monitor-exit '& 'binding} sym)
-                              ;; Don't qualify special symbols
-                              (.contains (str sym) "."))
-                        sym
-                        ;; Check if it resolves in clojure.core
-                        (let [core-var (clojure.core/resolve sym)]
-                          (if core-var
-                            (let [m (meta core-var)]
-                              (symbol (str (:ns m)) (str (:name m))))
-                            ;; Qualify with current namespace
-                            (symbol (str current-ns) (str sym))))))}
+    :syntax-quote {:resolve-symbol (make-syntax-quote-resolver current-ns heap-atom)}
     :var true
     :deref true
     :regex true
@@ -98,10 +147,19 @@
         heap (reduce-kv
               (fn [h sym val]
                 (let [sym-name (if (symbol? sym) (name sym) (str sym))
-                      qualified (symbol "user" sym-name)]
-                  (assoc h qualified {:val val
-                                      :meta {}
-                                      :dynamic? true})))
+                      qualified (symbol "user" sym-name)
+                      ;; Unwrap sci.lang.Var (from copy-var) to get actual value + meta
+                      sci-var? (instance? sci.lang.Var val)
+                      actual-val (if sci-var? @val val)
+                      vm (meta val)
+                      is-macro? (or (:macro vm) (:sci/macro vm))
+                      is-dynamic? (or (boolean (:dynamic? val))
+                                      (boolean (:dynamic vm)))]
+                  (assoc h qualified (cond-> {:val actual-val
+                                              :meta (or vm {})
+                                              :macro? (boolean is-macro?)
+                                              :dynamic? is-dynamic?}
+                                       is-macro? (assoc :host-macro? true)))))
               heap
               (or bindings {}))
         ;; Install custom namespaces
@@ -110,10 +168,19 @@
                 (reduce-kv
                  (fn [h2 sym val]
                    (let [sym-name (if (symbol? sym) (name sym) (str sym))
-                         qualified (symbol (str ns-sym) sym-name)]
-                     (assoc h2 qualified {:val val
-                                          :meta {}
-                                          :dynamic? false})))
+                         qualified (symbol (str ns-sym) sym-name)
+                         ;; Unwrap sci.lang.Var (from copy-var) to get actual value + meta
+                         sci-var? (instance? sci.lang.Var val)
+                         actual-val (if sci-var? @val val)
+                         vm (meta val)
+                         is-macro? (or (:macro vm) (:sci/macro vm))
+                         is-dynamic? (or (boolean (:dynamic? val))
+                                         (boolean (:dynamic vm)))]
+                     (assoc h2 qualified (cond-> {:val actual-val
+                                                   :meta (or vm {})
+                                                   :macro? (boolean is-macro?)
+                                                   :dynamic? is-dynamic?}
+                                           is-macro? (assoc :host-macro? true)))))
                  h
                  ns-map))
               heap
@@ -159,49 +226,426 @@
   (or (:sci.impl/var-sym (.-meta-map v))
       (.-sym v)))
 
+;; ============================================================
+;; make-machine-from-ctx helpers — extracted top-level functions
+;; ============================================================
+
+(defn- make-resolve-fn [ctx heap-atom]
+  (fn sci-resolve
+    ([sym]
+     (let [ns-sym (if-let [a (:current-ns-atom ctx)] @a 'user)]
+       (sci-resolve ns-sym sym)))
+    ([ns-sym sym]
+     (let [heap     @heap-atom
+           ns-data  (if-let [a (:ns-atom ctx)]
+                      (get @a ns-sym)
+                      (get (:ns-table ctx) ns-sym))
+           excludes (:refer-clojure-excludes ns-data)
+           [qualified core-q]
+           (if (qualified-symbol? sym)
+             [sym nil]
+             [(symbol (str ns-sym) (str sym))
+              (when-not (and excludes (contains? excludes sym))
+                (symbol "clojure.core" (str sym)))])
+           entry    (or (get heap qualified) (when core-q (get heap core-q)))
+           type-obj (when-not entry
+                      (let [ns-d (if-let [a (:ns-atom ctx)]
+                                   (get @a ns-sym)
+                                   (get (:ns-table ctx) ns-sym))]
+                        (get (:types ns-d) (if (qualified-symbol? sym)
+                                             (symbol (name sym))
+                                             sym))))]
+       (cond
+         entry
+         (let [found-key (if (get heap qualified) qualified core-q)]
+           (sci.lang/->Var (symbol (name found-key))
+                           (:val entry)
+                           (assoc (:meta entry)
+                                  :name (symbol (name found-key))
+                                  :ns (symbol (namespace found-key))
+                                  :sci.impl/var-sym found-key)
+                           (:dynamic? entry)))
+         type-obj type-obj)))))
+
+(defn- make-eval-fn [ctx heap-atom]
+  (fn sci-eval [form]
+    (let [m2 (machine/make-machine {:heap        @heap-atom
+                                    :ns-table    (:ns-table ctx)
+                                    :permissions {:allow (:allow ctx)
+                                                  :deny  (:deny ctx)}})
+          m2 (assoc m2 :heap-atom heap-atom)
+          m2 (machine/push-frame m2 {:op :eval :expr form})]
+      (step/run m2))))
+
+(defn- make-with-redefs-fn [heap-atom]
+  (fn sci-with-redefs-fn [binding-map func]
+    (let [sci-bindings (filter (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
+          clj-bindings (remove (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
+          old-vals     (into {} (map (fn [[v _]]
+                                       (let [sym (var-qualified-sym v)]
+                                         [sym (:val (get @heap-atom sym))]))
+                                     sci-bindings))]
+      (doseq [[v new-val] sci-bindings]
+        (let [sym   (var-qualified-sym v)
+              entry (assoc (get @heap-atom sym) :val new-val)]
+          (swap! heap-atom assoc sym entry)))
+      (try
+        (if (seq clj-bindings)
+          (with-redefs-fn (into {} clj-bindings) func)
+          (func))
+        (finally
+          (doseq [[sym old-val] old-vals]
+            (let [entry (assoc (get @heap-atom sym) :val old-val)]
+              (swap! heap-atom assoc sym entry))))))))
+
+(defn- make-alter-var-root-fn [heap-atom]
+  (fn sci-alter-var-root [v f & args]
+    (if (instance? sci.lang.Var v)
+      (let [sym    (var-qualified-sym v)
+            ns-str (when sym (namespace sym))]
+        (when (and ns-str (contains? (set (map str host/default-namespaces)) ns-str))
+          (throw (ex-info (str "Var " sym " is read-only") {:type :sci/error})))
+        (let [result (atom nil)]
+          (swap! heap-atom
+                 (fn [h]
+                   (let [entry   (get h sym)
+                         old-val (:val entry)
+                         new-val (apply f old-val args)]
+                     (reset! result new-val)
+                     (assoc h sym (assoc entry :val new-val)))))
+          @result))
+      (apply clojure.core/alter-var-root v f args))))
+
+(defn- make-alter-meta!-fn [heap-atom]
+  (fn sci-alter-meta! [ref f & args]
+    (if (instance? sci.lang.Var ref)
+      (let [qualified (var-qualified-sym ref)
+            ns-str    (when qualified (namespace qualified))]
+        (when (and ns-str (contains? (set (map str host/default-namespaces)) ns-str))
+          (throw (ex-info (str "Var " qualified " is read-only") {:type :sci/error})))
+        (let [old-meta (.-meta-map ^sci.lang.Var ref)
+              new-meta (apply f old-meta args)
+              entry    (get @heap-atom qualified)]
+          (swap! heap-atom assoc qualified (assoc entry :meta new-meta))
+          new-meta))
+      (apply clojure.core/alter-meta! ref f args))))
+
+(defn- make-macroexpand-1-fn [heap-atom]
+  (fn sci-macroexpand-1
+    ([form]
+     (if-not (and (seq? form) (symbol? (first form)))
+       form
+       (let [head (first form)
+             n    (name head)]
+         (cond
+           (and #?(:clj  (.startsWith ^String n ".")
+                   :cljs (= "." (subs n 0 1)))
+                (not= n "..")
+                (> (count n) 1))
+           (let [method       (symbol (subs n 1))
+                 [_ obj & args] form]
+             (list* '. obj method args))
+
+           (and #?(:clj  (.endsWith ^String n ".")
+                   :cljs (= "." (subs n (dec (count n)))))
+                (not= n "..")
+                (> (count n) 1))
+           (let [class-name (symbol (subs n 0 (dec (count n))))]
+             (list* 'new class-name (rest form)))
+
+           :else
+           (let [heap        @heap-atom
+                 sym-ns      (clojure.core/namespace head)
+                 candidates  (if sym-ns
+                               [(symbol sym-ns n)]
+                               [(symbol "user" n) (symbol "clojure.core" n)])
+                 macro-entry (some #(let [e (get heap %)] (when (:macro? e) e)) candidates)]
+             (if macro-entry
+               (let [mv (:val macro-entry)
+                     mf (if (var? mv) @mv mv)]
+                 (if (var? mv)
+                   (apply mf form {} (rest form))
+                   (apply mf (rest form))))
+               form))))))
+    ([env form]
+     (if (and (seq? form) (symbol? (first form)) (contains? env (first form)))
+       form
+       (sci-macroexpand-1 form)))))
+
+(defn- make-ns-vars-fn
+  "Returns a function that collects all vars for a given namespace from heap."
+  [heap-atom]
+  (fn [ns-sym]
+    (let [heap   @heap-atom
+          ns-str (str ns-sym)]
+      (reduce-kv (fn [m k v]
+                   (if (= ns-str (namespace k))
+                     (let [var-meta (merge {:name (symbol (name k))
+                                            :ns   (symbol (namespace k))}
+                                           (:meta v)
+                                           {:sci.impl/var-sym k})]
+                       (assoc m (symbol (name k))
+                              (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
+                     m))
+                 {} heap))))
+
+(defn- make-ns-map-fn [heap-atom]
+  (fn [ns-sym]
+    (let [heap   @heap-atom
+          ns-str (str ns-sym)]
+      (reduce-kv (fn [m k v]
+                   (let [k-ns (namespace k)]
+                     (if (or (= ns-str k-ns) (= "clojure.core" k-ns))
+                       (let [var-meta (merge {:name (symbol (name k))
+                                              :ns   (symbol (namespace k))}
+                                             (:meta v)
+                                             {:sci.impl/var-sym k})]
+                         (assoc m (symbol (name k))
+                                (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
+                       m)))
+                 {} heap))))
+
+(defn- make-ns-refers-fn [heap-atom]
+  (fn [ns-sym]
+    (let [heap   @heap-atom
+          ns-str (str ns-sym)]
+      (reduce-kv (fn [m k v]
+                   (let [k-ns   (namespace k)
+                         k-name (name k)]
+                     (if (and (not= ns-str k-ns)
+                              (or (= "clojure.core" k-ns)
+                                  (get heap (symbol ns-str k-name))))
+                       (let [var-meta (merge {:name (symbol k-name) :ns (symbol k-ns)}
+                                             (:meta v)
+                                             {:sci.impl/var-sym k})]
+                         (assoc m (symbol k-name)
+                                (sci.lang/->Var (symbol k-name) (:val v) var-meta (:dynamic? v))))
+                       m)))
+                 {} heap))))
+
+(defn- make-intern-fn [heap-atom]
+  (fn sci-intern
+    ([ns-sym name-sym]
+     (let [qualified  (symbol (str ns-sym) (str name-sym))
+           existing   (get @heap-atom qualified)
+           name-meta  (meta name-sym)
+           entry      (if existing
+                        (update existing :meta merge name-meta)
+                        {:val nil :meta (or name-meta {}) :dynamic? false :bound? false})]
+       (swap! heap-atom assoc qualified entry)
+       (sci.lang/->Var (symbol (str name-sym)) (:val entry)
+                       (assoc (:meta entry) :name name-sym :ns ns-sym :sci.impl/var-sym qualified)
+                       (:dynamic? entry))))
+    ([ns-sym name-sym val]
+     (let [qualified  (symbol (str ns-sym) (str name-sym))
+           existing   (get @heap-atom qualified)
+           name-meta  (meta name-sym)
+           entry      (if existing
+                        (-> existing (assoc :val val) (update :meta merge name-meta))
+                        {:val val :meta (or name-meta {}) :dynamic? false})]
+       (swap! heap-atom assoc qualified entry)
+       (sci.lang/->Var (symbol (str name-sym)) val
+                       (assoc (:meta entry) :name name-sym :ns ns-sym :sci.impl/var-sym qualified)
+                       (:dynamic? entry))))))
+
+(defn- make-find-ns-fn [ctx]
+  (fn [sym]
+    (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
+          ns-info (get ns-data sym)]
+      (when ns-info
+        (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
+          (if (seq ns-meta) (with-meta sym ns-meta) sym))))))
+
+(defn- make-the-ns-fn [ctx]
+  (fn [sym]
+    (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
+          ns-info (get ns-data sym)]
+      (if ns-info
+        (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
+          (if (seq ns-meta) (with-meta sym ns-meta) sym))
+        (throw (ex-info (str "No namespace: " sym " found") {:type :sci/error}))))))
+
+(defn- make-create-ns-fn [ctx]
+  (fn [sym]
+    (let [sym (if (string? sym) (symbol sym) sym)]
+      (when-let [a (:ns-atom ctx)]
+        (swap! a (fn [ns-table]
+                   (if (get ns-table sym)
+                     ns-table
+                     (assoc ns-table sym {:aliases {} :refers {} :imports {}})))))
+      sym)))
+
+(defn- make-all-ns-fn [ctx]
+  (fn []
+    (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
+      (keys ns-data))))
+
+(defn- make-load-string-fn [ctx heap-atom]
+  (fn sci-load-string [s]
+    (let [forms (read-all s)
+          expr  (if (= 1 (count forms)) (first forms) (cons 'do forms))
+          m2    (-> (machine/make-machine {:heap        @heap-atom
+                                           :ns-table    (:ns-table ctx)
+                                           :permissions {:allow (:allow ctx)
+                                                         :deny  (:deny ctx)}})
+                    (assoc :heap-atom heap-atom)
+                    (machine/push-frame {:op :eval :expr expr}))]
+      (step/run m2))))
+
+(defn- make-find-var-fn [ctx heap-atom]
+  (fn [sym]
+    (when-not (qualified-symbol? sym)
+      (throw (ex-info (str "Not a qualified symbol: " sym) {:type :sci/error})))
+    (let [ns-sym  (symbol (namespace sym))
+          ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
+      (when-not (get ns-data ns-sym)
+        (throw (ex-info (str "No such namespace: " ns-sym) {:type :sci/error})))
+      (let [entry (get @heap-atom sym)]
+        (when entry
+          (sci.lang/->Var (symbol (name sym)) (:val entry)
+                          (assoc (:meta entry) :sci.impl/var-sym sym)
+                          (:dynamic? entry)))))))
+
+(defn- make-alias-fn [ctx]
+  (fn [alias-sym ns-sym]
+    (when-let [a (:ns-atom ctx)]
+      (let [current-ns (if-let [cna (:current-ns-atom ctx)] @cna 'user)]
+        (swap! a update-in [current-ns :aliases] assoc alias-sym ns-sym)))
+    nil))
+
+(defn- make-ns-unalias-fn [ctx]
+  (fn [ns-sym alias-sym]
+    (let [ns-sym (if (symbol? ns-sym) ns-sym (clojure.core/ns-name ns-sym))]
+      (when-let [a (:ns-atom ctx)]
+        (swap! a update-in [ns-sym :aliases] dissoc alias-sym))
+      nil)))
+
+(defn- make-remove-ns-fn [ctx heap-atom]
+  (fn [ns-sym]
+    (when-let [a (:ns-atom ctx)]
+      (swap! a dissoc ns-sym))
+    (let [ns-str (str ns-sym)]
+      (swap! heap-atom (fn [h]
+                         (reduce-kv (fn [acc k v]
+                                      (if (= ns-str (namespace k)) acc (assoc acc k v)))
+                                    {} h))))
+    nil))
+
+(defn- make-refer-fn [heap-atom]
+  (fn sci-refer
+    ([ns-sym] (sci-refer ns-sym :only nil))
+    ([ns-sym & filters]
+     (let [opts         (apply hash-map filters)
+           only-syms    (:only opts)
+           exclude-syms (set (:exclude opts))
+           heap         @heap-atom
+           ns-str       (str ns-sym)
+           entries      (filter (fn [[k _]] (= ns-str (namespace k))) heap)
+           current-ns   'user]
+       (doseq [[k entry] entries]
+         (let [sym-name (symbol (name k))]
+           (when (and (or (nil? only-syms) (contains? (set only-syms) sym-name))
+                      (not (contains? exclude-syms sym-name)))
+             (swap! heap-atom assoc (symbol (str current-ns) (str sym-name)) entry))))
+       nil))))
+
+(defn- sci-print-doc
+  "Print documentation for a SCI var entry's metadata, compatible with
+   clojure.repl/print-doc but using SCI-side symbol/string instead of Clojure namespace."
+  [{:keys [ns name arglists macro doc special-form]}]
+  (println "-------------------------")
+  (println (str (when ns (str (clojure.core/name (clojure.core/symbol (str ns))) "/")) name))
+  (when arglists (println (pr-str arglists)))
+  (when macro (println "Macro"))
+  (when special-form (println "Special Form"))
+  (when doc (println " " doc))
+  nil)
+
+(defn- make-doc-fn [ctx heap-atom]
+  (fn sci-doc [sym-name]
+    (let [heap         @heap-atom
+          sym-str      (str sym-name)
+          candidates   (if (qualified-symbol? sym-name)
+                         [sym-name]
+                         [(symbol "user" sym-str) (symbol "clojure.core" sym-str)])
+          entry        (some (fn [q] (when-let [e (get heap q)] [q e])) candidates)
+          ns-data      (when-let [na (:ns-atom ctx)] (get @na sym-name))]
+      (cond
+        entry
+        (let [[qualified e] entry
+              m (:meta e)
+              doc-map (merge {:name (or (:name m) (symbol (name qualified)))
+                               :ns (symbol (namespace qualified))}
+                              (select-keys m [:arglists :macro :doc :special-form]))]
+          (list 'do
+                (list (list 'var 'sci.core/sci-print-doc)
+                      (list 'quote doc-map))
+                nil))
+        ns-data
+        (list 'do
+              (list (list 'var 'sci.core/sci-print-doc)
+                    (list 'quote {:name sym-name :doc (:doc ns-data)}))
+              nil)
+        :else nil))))
+
+(defn- make-find-doc-fn [ctx heap-atom]
+  (fn sci-find-doc [re-string-or-pattern]
+    (let [re      (re-pattern re-string-or-pattern)
+          heap    @heap-atom
+          matches (->> heap
+                       (filter (fn [[_ entry]]
+                                 (let [m (:meta entry)]
+                                   (and m (or (when-let [d (:doc m)] (re-find re d))
+                                              (re-find re (str (:name m))))))))
+                       (sort-by first))]
+      (doseq [[qualified-sym entry] matches]
+        (#'clojure.repl/print-doc (merge (dissoc (:meta entry) :ns) {:name qualified-sym})))
+      (when-let [ns-data @(or (:ns-atom ctx) (atom {}))]
+        (doseq [[ns-sym ns-info] (sort-by first ns-data)]
+          (when-let [doc-str (:doc ns-info)]
+            (when (re-find re doc-str)
+              (#'clojure.repl/print-doc {:name ns-sym :doc doc-str}))))))))
+
+(defn- make-defrecord-fn [ctx]
+  (fn [name-sym fields & specs]
+    (let [ns-sym     (if-let [a (:current-ns-atom ctx)] @a 'user)
+          qualified  (symbol (str ns-sym) (str name-sym))
+          dotted     (symbol (str ns-sym "." name-sym))
+          proto-syms (vec (keep #(when (symbol? %) %) specs))
+          methods    (vec (keep #(when (seq? %) %) specs))]
+      (list 'do
+            (with-meta
+              (apply list 'deftype* qualified dotted fields :implements proto-syms methods)
+              {:sci.impl/record true})
+            (list 'def (symbol (str "->" name-sym))
+                  (list 'var (symbol (str ns-sym) (str "->" name-sym))))
+            (list 'def (symbol (str "map->" name-sym))
+                  (list 'var (symbol (str ns-sym) (str "map->" name-sym))))))))
+
+(defn- make-deftype-fn [ctx]
+  (fn [name-sym fields & specs]
+    (let [ns-sym     (if-let [a (:current-ns-atom ctx)] @a 'user)
+          qualified  (symbol (str ns-sym) (str name-sym))
+          dotted     (symbol (str ns-sym "." name-sym))
+          proto-syms (vec (keep #(when (symbol? %) %) specs))
+          methods    (vec (keep #(when (seq? %) %) specs))]
+      (list 'do
+            (apply list 'deftype* qualified dotted fields :implements proto-syms methods)
+            (list 'def (symbol (str "->" name-sym))
+                  (list 'var (symbol (str ns-sym) (str "->" name-sym))))))))
+
+;; ============================================================
+
 (defn- make-machine-from-ctx
   "Create a fresh machine from a context and a list of forms."
   [ctx forms]
-  (let [heap-atom (or (:heap-atom ctx) (atom (:heap ctx)))
-        ;; Inject VM-aware functions that need heap access
-        resolve-fn (fn sci-resolve
-                     ([sym]
-                      ;; Use current-ns from current-ns-atom if available
-                      (let [ns-sym (if-let [a (:current-ns-atom ctx)] @a 'user)]
-                        (sci-resolve ns-sym sym)))
-                     ([ns-sym sym]
-                      (let [heap @heap-atom
-                            ;; Check :refer-clojure :exclude
-                            ns-data (if-let [a (:ns-atom ctx)]
-                                      (get @a ns-sym)
-                                      (get (:ns-table ctx) ns-sym))
-                            excludes (:refer-clojure-excludes ns-data)
-                            ;; Handle already-qualified symbols
-                            [qualified core-q]
-                            (if (qualified-symbol? sym)
-                              [sym nil]
-                              [(symbol (str ns-sym) (str sym))
-                               (when-not (and excludes (contains? excludes sym))
-                                 (symbol "clojure.core" (str sym)))])
-                            entry (or (get heap qualified) (when core-q (get heap core-q)))]
-                        (when entry
-                          (let [found-key (if (get heap qualified) qualified core-q)]
-                            (sci.lang/->Var (symbol (name found-key))
-                                           (:val entry)
-                                           (assoc (:meta entry)
-                                                  :name (symbol (name found-key))
-                                                  :ns (symbol (namespace found-key))
-                                                  :sci.impl/var-sym found-key)
-                                           (:dynamic? entry)))))))
-        eval-fn (fn sci-eval [form]
-                  (let [m2 (machine/make-machine {:heap @heap-atom
-                                                   :ns-table (:ns-table ctx)
-                                                   :permissions {:allow (:allow ctx)
-                                                                  :deny (:deny ctx)}})
-                        m2 (assoc m2 :heap-atom heap-atom)
-                        m2 (machine/push-frame m2 {:op :eval :expr form})]
-                    (step/run m2)))
-        extra-heap {(symbol "clojure.core" "symbol")
+  (let [heap-atom   (or (:heap-atom ctx) (atom (:heap ctx)))
+        resolve-fn  (make-resolve-fn ctx heap-atom)
+        eval-fn     (make-eval-fn ctx heap-atom)
+        ns-vars-fn  (make-ns-vars-fn heap-atom)
+        extra-heap  {(symbol "sci.core" "sci-print-doc")
+                    {:val sci-print-doc :meta {:name 'sci-print-doc}}
+                    (symbol "clojure.core" "symbol")
                     {:val (fn sci-symbol
                             ([name]
                              (if (instance? sci.lang.Var name)
@@ -253,51 +697,9 @@
                               (var-set v val)))
                      :meta {:name 'var-set}}
                     (symbol "clojure.core" "with-redefs-fn")
-                    {:val (fn sci-with-redefs-fn [binding-map func]
-                            (let [sci-bindings (filter (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
-                                  clj-bindings (remove (fn [[v _]] (instance? sci.lang.Var v)) binding-map)
-                                  ;; Save old values for SCI vars
-                                  old-vals (into {} (map (fn [[v _]]
-                                                           (let [sym (var-qualified-sym v)]
-                                                             [sym (:val (get @heap-atom sym))]))
-                                                         sci-bindings))]
-                              ;; Set new values
-                              (doseq [[v new-val] sci-bindings]
-                                (let [sym (var-qualified-sym v)
-                                      entry (assoc (get @heap-atom sym) :val new-val)]
-                                  (swap! heap-atom assoc sym entry)))
-                              (try
-                                (if (seq clj-bindings)
-                                  (with-redefs-fn (into {} clj-bindings) func)
-                                  (func))
-                                (finally
-                                  ;; Restore old values
-                                  (doseq [[sym old-val] old-vals]
-                                    (let [entry (assoc (get @heap-atom sym) :val old-val)]
-                                      (swap! heap-atom assoc sym entry)))))))
-                     :meta {:name 'with-redefs-fn}}
+                    {:val (make-with-redefs-fn heap-atom) :meta {:name 'with-redefs-fn}}
                     (symbol "clojure.core" "alter-var-root")
-                    {:val (fn sci-alter-var-root [v f & args]
-                            (if (instance? sci.lang.Var v)
-                              (let [sym (var-qualified-sym v)
-                                    ns-str (when sym (namespace sym))]
-                                ;; Check if built-in/read-only
-                                (when (and ns-str
-                                           (contains? (set (map str host/default-namespaces)) ns-str))
-                                  (throw (ex-info (str "Var " sym " is read-only")
-                                                  {:type :sci/error})))
-                                (let [result (atom nil)]
-                                  ;; Atomic read-modify-write in single swap!
-                                  (swap! heap-atom
-                                         (fn [h]
-                                           (let [entry (get h sym)
-                                                 old-val (:val entry)
-                                                 new-val (apply f old-val args)]
-                                             (reset! result new-val)
-                                             (assoc h sym (assoc entry :val new-val)))))
-                                  @result))
-                              (apply clojure.core/alter-var-root v f args)))
-                     :meta {:name 'alter-var-root}}
+                    {:val (make-alter-var-root-fn heap-atom) :meta {:name 'alter-var-root}}
                     (symbol "clojure.core" "meta")
                     {:val (fn sci-meta [obj]
                             (let [m (meta obj)]
@@ -305,28 +707,11 @@
                                 (:sci/closure m)
                                 (let [cleaned (dissoc m :sci/closure :type :name :ns :arities :env)]
                                   (when (seq cleaned) cleaned))
-                                ;; Strip internal SCI keys from var/other metadata
-                                (:sci.impl/var-sym m)
-                                (dissoc m :sci.impl/var-sym)
+                                (:sci.impl/var-sym m) (dissoc m :sci.impl/var-sym)
                                 :else m)))
                      :meta {:name 'meta}}
                     (symbol "clojure.core" "alter-meta!")
-                    {:val (fn sci-alter-meta! [ref f & args]
-                            (if (instance? sci.lang.Var ref)
-                              (let [qualified (var-qualified-sym ref)
-                                    ns-str (when qualified (namespace qualified))]
-                                ;; Check if built-in/read-only
-                                (when (and ns-str
-                                           (contains? (set (map str host/default-namespaces)) ns-str))
-                                  (throw (ex-info (str "Var " qualified " is read-only")
-                                                  {:type :sci/error})))
-                                (let [old-meta (.-meta-map ^sci.lang.Var ref)
-                                      new-meta (apply f old-meta args)
-                                      entry (get @heap-atom qualified)]
-                                  (swap! heap-atom assoc qualified (assoc entry :meta new-meta))
-                                  new-meta))
-                              (apply clojure.core/alter-meta! ref f args)))
-                     :meta {:name 'alter-meta!}}
+                    {:val (make-alter-meta!-fn heap-atom) :meta {:name 'alter-meta!}}
                     (symbol "clojure.core" "reset-meta!")
                     {:val (fn sci-reset-meta! [ref m]
                             (if (instance? sci.lang.Var ref)
@@ -343,140 +728,35 @@
                     (symbol "clojure.core" "eval")
                     {:val eval-fn :meta {:name 'eval}}
                     (symbol "clojure.core" "macroexpand-1")
-                    {:val (fn sci-macroexpand-1
-                            ([form]
-                             (if-not (and (seq? form) (symbol? (first form)))
-                               form
-                               (let [head (first form)
-                                     n (name head)]
-                                 (cond
-                                   ;; .method sugar → (. obj method args...)
-                                   (and #?(:clj (.startsWith ^String n ".")
-                                           :cljs (= "." (subs n 0 1)))
-                                        (not= n "..")
-                                        (> (count n) 1))
-                                   (let [method (symbol (subs n 1))
-                                         [_ obj & args] form]
-                                     (list* '. obj method args))
-
-                                   ;; Constructor. sugar → (new ClassName args...)
-                                   (and #?(:clj (.endsWith ^String n ".")
-                                           :cljs (= "." (subs n (dec (count n)))))
-                                        (not= n "..")
-                                        (> (count n) 1))
-                                   (let [class-name (symbol (subs n 0 (dec (count n))))]
-                                     (list* 'new class-name (rest form)))
-
-                                   ;; Macro expansion
-                                   :else
-                                   (let [heap @heap-atom
-                                         sym-ns (clojure.core/namespace head)
-                                         candidates (if sym-ns
-                                                      [(symbol sym-ns n)]
-                                                      [(symbol "user" n)
-                                                       (symbol "clojure.core" n)])
-                                         macro-entry (some #(let [e (get heap %)]
-                                                              (when (:macro? e) e))
-                                                           candidates)]
-                                     (if macro-entry
-                                       (let [mv (:val macro-entry)
-                                             mf (if (var? mv) @mv mv)]
-                                         (if (var? mv)
-                                           (apply mf form {} (rest form))
-                                           (apply mf (rest form))))
-                                       form))))))
-                            ([env form]
-                             ;; If the head symbol is in the env, don't expand
-                             (if (and (seq? form) (symbol? (first form))
-                                      (contains? env (first form)))
-                               form
-                               (sci-macroexpand-1 form))))
-                     :meta {:name 'macroexpand-1}}
+                    {:val (make-macroexpand-1-fn heap-atom) :meta {:name 'macroexpand-1}}
                     (symbol "clojure.core" "macroexpand")
                     {:val (fn sci-macroexpand [form]
                             (let [me1-fn (:val (get @heap-atom (symbol "clojure.core" "macroexpand-1")))]
                               (loop [f form]
                                 (let [expanded (me1-fn f)]
-                                  (if (= expanded f)
-                                    f
-                                    (recur expanded))))))
+                                  (if (= expanded f) f (recur expanded))))))
                      :meta {:name 'macroexpand}}
                     (symbol "clojure.core" "bound?")
                     {:val (fn [& vars]
                             (every? (fn [v]
                                       (if (instance? sci.lang.Var v)
-                                        (let [sym (var-qualified-sym v)
+                                        (let [sym   (var-qualified-sym v)
                                               entry (get @heap-atom sym)
-                                              dyn @step/current-dynamic-bindings]
+                                              dyn   @step/current-dynamic-bindings]
                                           (or (:bound? entry)
-                                              ;; Check if currently dynamically bound
                                               (and dyn (contains? dyn sym))
-                                              ;; Fallback: check val directly
                                               (some? (.-val ^sci.lang.Var v))))
                                         (clojure.core/bound? v)))
                                     vars))
                      :meta {:name 'bound?}}
                     (symbol "clojure.core" "intern")
-                    {:val (fn
-                            ([ns-sym name-sym]
-                             (let [qualified (symbol (str ns-sym) (str name-sym))
-                                   existing (get @heap-atom qualified)
-                                   name-meta (meta name-sym)
-                                   entry (if existing
-                                           (update existing :meta merge name-meta)
-                                           {:val nil :meta (or name-meta {}) :dynamic? false :bound? false})]
-                               (swap! heap-atom assoc qualified entry)
-                               (sci.lang/->Var (symbol (str name-sym)) (:val entry)
-                                               (assoc (:meta entry) :name name-sym :ns ns-sym
-                                                      :sci.impl/var-sym qualified)
-                                               (:dynamic? entry))))
-                            ([ns-sym name-sym val]
-                             (let [qualified (symbol (str ns-sym) (str name-sym))
-                                   existing (get @heap-atom qualified)
-                                   name-meta (meta name-sym)
-                                   entry (if existing
-                                           (-> existing (assoc :val val) (update :meta merge name-meta))
-                                           {:val val :meta (or name-meta {}) :dynamic? false})]
-                               (swap! heap-atom assoc qualified entry)
-                               (sci.lang/->Var (symbol (str name-sym)) val
-                                               (assoc (:meta entry) :name name-sym :ns ns-sym
-                                                      :sci.impl/var-sym qualified)
-                                               (:dynamic? entry)))))
-                     :meta {:name 'intern}}
+                    {:val (make-intern-fn heap-atom) :meta {:name 'intern}}
                     (symbol "clojure.core" "find-ns")
-                    {:val (fn [sym]
-                            (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
-                                  ns-info (get ns-data sym)]
-                              (when ns-info
-                                ;; Return symbol with namespace metadata
-                                (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
-                                  (if (seq ns-meta)
-                                    (with-meta sym ns-meta)
-                                    sym)))))
-                     :meta {:name 'find-ns}}
+                    {:val (make-find-ns-fn ctx) :meta {:name 'find-ns}}
                     (symbol "clojure.core" "create-ns")
-                    {:val (fn [sym]
-                            ;; Create namespace if it doesn't exist
-                            (let [sym (if (string? sym) (symbol sym) sym)]
-                              (when-let [a (:ns-atom ctx)]
-                                (swap! a (fn [ns-table]
-                                           (if (get ns-table sym)
-                                             ns-table
-                                             (assoc ns-table sym {:aliases {} :refers {} :imports {}})))))
-                              sym))
-                     :meta {:name 'create-ns}}
+                    {:val (make-create-ns-fn ctx) :meta {:name 'create-ns}}
                     (symbol "clojure.core" "the-ns")
-                    {:val (fn [sym]
-                            (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
-                                  ns-info (get ns-data sym)]
-                              (if ns-info
-                                (let [ns-meta (dissoc ns-info :aliases :refers :imports)]
-                                  (if (seq ns-meta)
-                                    (with-meta sym ns-meta)
-                                    sym))
-                                (throw (ex-info (str "No namespace: " sym " found")
-                                                {:type :sci/error})))))
-                     :meta {:name 'the-ns}}
+                    {:val (make-the-ns-fn ctx) :meta {:name 'the-ns}}
                     (symbol "clojure.core" "ns-name")
                     {:val (fn [ns-sym]
                             (cond
@@ -485,40 +765,11 @@
                               :else (clojure.core/ns-name ns-sym)))
                      :meta {:name 'ns-name}}
                     (symbol "clojure.core" "all-ns")
-                    {:val (fn [] (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
-                                   (keys ns-data)))
-                     :meta {:name 'all-ns}}
+                    {:val (make-all-ns-fn ctx) :meta {:name 'all-ns}}
                     (symbol "clojure.core" "ns-publics")
-                    {:val (fn [ns-sym]
-                            (let [heap @heap-atom
-                                  ns-str (str ns-sym)]
-                              (reduce-kv (fn [m k v]
-                                           (if (= ns-str (namespace k))
-                                             (let [var-meta (merge {:name (symbol (name k))
-                                                                    :ns (symbol (namespace k))}
-                                                                   (:meta v)
-                                                                   {:sci.impl/var-sym k})]
-                                               (assoc m (symbol (name k))
-                                                      (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
-                                             m))
-                                         {} heap)))
-                     :meta {:name 'ns-publics}}
+                    {:val ns-vars-fn :meta {:name 'ns-publics}}
                     (symbol "clojure.core" "ns-interns")
-                    {:val (fn [ns-sym]
-                            ;; In SCI, ns-interns is the same as ns-publics
-                            (let [heap @heap-atom
-                                  ns-str (str ns-sym)]
-                              (reduce-kv (fn [m k v]
-                                           (if (= ns-str (namespace k))
-                                             (let [var-meta (merge {:name (symbol (name k))
-                                                                    :ns (symbol (namespace k))}
-                                                                   (:meta v)
-                                                                   {:sci.impl/var-sym k})]
-                                               (assoc m (symbol (name k))
-                                                      (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
-                                             m))
-                                         {} heap)))
-                     :meta {:name 'ns-interns}}
+                    {:val ns-vars-fn :meta {:name 'ns-interns}}
                     (symbol "clojure.core" "*clojure-version*")
                     {:val {:major (:major *clojure-version*)
                            :minor (:minor *clojure-version*)
@@ -527,54 +778,14 @@
                      :meta {:name '*clojure-version*}
                      :dynamic? true}
                     (symbol "clojure.core" "clojure-version")
-                    {:val (fn [] (str (:major *clojure-version*) "."
+                    {:val (fn [] (clojure.core/str (:major *clojure-version*) "."
                                       (:minor *clojure-version*) "."
                                       (:incremental *clojure-version*) "-SCI"))
                      :meta {:name 'clojure-version}}
                     (symbol "clojure.core" "ns-map")
-                    {:val (fn [ns-sym]
-                            (let [heap @heap-atom
-                                  ns-str (str ns-sym)]
-                              ;; Include both ns-specific and clojure.core vars
-                              (reduce-kv (fn [m k v]
-                                           (let [k-ns (namespace k)]
-                                             (if (or (= ns-str k-ns)
-                                                     (= "clojure.core" k-ns))
-                                               (let [var-meta (merge {:name (symbol (name k))
-                                                                      :ns (symbol (namespace k))}
-                                                                     (:meta v)
-                                                                     {:sci.impl/var-sym k})]
-                                                 (assoc m (symbol (name k))
-                                                        (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
-                                               m)))
-                                         {} heap)))
-                     :meta {:name 'ns-map}}
+                    {:val (make-ns-map-fn heap-atom) :meta {:name 'ns-map}}
                     (symbol "clojure.core" "ns-refers")
-                    {:val (fn [ns-sym]
-                            ;; Returns all referred vars (clojure.core + explicit refers)
-                            (let [heap @heap-atom
-                                  ns-str (str ns-sym)]
-                              (reduce-kv (fn [m k v]
-                                           (let [k-ns (namespace k)
-                                                 k-name (name k)]
-                                             ;; Include clojure.core vars and vars from
-                                             ;; other namespaces that were referred into this ns
-                                             (if (and (not= ns-str k-ns)
-                                                      (or (= "clojure.core" k-ns)
-                                                          ;; Check if this var appears in this ns too
-                                                          ;; (from explicit refer)
-                                                          (get heap (symbol ns-str k-name))))
-                                               (let [var-meta (merge {:name (symbol k-name)
-                                                                      :ns (symbol k-ns)}
-                                                                     (:meta v)
-                                                                     {:sci.impl/var-sym k})]
-                                                 (assoc m (symbol k-name)
-                                                        (sci.lang/->Var (symbol k-name) (:val v)
-                                                                        var-meta (:dynamic? v))))
-                                               m)))
-                                         {} heap)))
-                     :meta {:name 'ns-refers}}
-                    ;; Override with-in-str to use VM binding (not host push-thread-bindings)
+                    {:val (make-ns-refers-fn heap-atom) :meta {:name 'ns-refers}}
                     (symbol "clojure.core" "with-in-str")
                     {:val (fn sci-with-in-str [s & body]
                             (list 'let ['s__in (list 'new 'clojure.lang.LineNumberingPushbackReader
@@ -583,19 +794,9 @@
                      :meta {:macro true :name 'with-in-str}
                      :macro? true}
                     (symbol "clojure.core" "alias")
-                    {:val (fn [alias-sym ns-sym]
-                            (when-let [a (:ns-atom ctx)]
-                              (let [current-ns (if-let [cna (:current-ns-atom ctx)] @cna 'user)]
-                                (swap! a update-in [current-ns :aliases] assoc alias-sym ns-sym)))
-                            nil)
-                     :meta {:name 'alias}}
+                    {:val (make-alias-fn ctx) :meta {:name 'alias}}
                     (symbol "clojure.core" "ns-unalias")
-                    {:val (fn [ns-sym alias-sym]
-                            (let [ns-sym (if (symbol? ns-sym) ns-sym (clojure.core/ns-name ns-sym))]
-                              (when-let [a (:ns-atom ctx)]
-                                (swap! a update-in [ns-sym :aliases] dissoc alias-sym))
-                              nil))
-                     :meta {:name 'ns-unalias}}
+                    {:val (make-ns-unalias-fn ctx) :meta {:name 'ns-unalias}}
                     (symbol "clojure.core" "ns-unmap")
                     {:val (fn [ns-sym sym]
                             (let [qualified (symbol (str ns-sym) (str sym))]
@@ -607,61 +808,14 @@
                             {}) ;; TODO: track imports properly
                      :meta {:name 'ns-imports}}
                     (symbol "clojure.core" "remove-ns")
-                    {:val (fn [ns-sym]
-                            ;; Remove namespace from ns-atom and its vars from heap
-                            (when-let [a (:ns-atom ctx)]
-                              (swap! a dissoc ns-sym))
-                            (let [ns-str (str ns-sym)]
-                              (swap! heap-atom (fn [h]
-                                                 (reduce-kv (fn [acc k v]
-                                                              (if (= ns-str (namespace k))
-                                                                acc
-                                                                (assoc acc k v)))
-                                                            {} h))))
-                            nil)
-                     :meta {:name 'remove-ns}}
+                    {:val (make-remove-ns-fn ctx heap-atom) :meta {:name 'remove-ns}}
                     (symbol "clojure.core" "find-var")
-                    {:val (fn [sym]
-                            (when-not (qualified-symbol? sym)
-                              (throw (ex-info (str "Not a qualified symbol: " sym)
-                                              {:type :sci/error})))
-                            ;; Check if namespace exists
-                            (let [ns-sym (symbol (namespace sym))
-                                  ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))]
-                              (when-not (get ns-data ns-sym)
-                                (throw (ex-info (str "No such namespace: " ns-sym)
-                                                {:type :sci/error})))
-                              (let [entry (get @heap-atom sym)]
-                                (when entry
-                                  (sci.lang/->Var (symbol (name sym)) (:val entry)
-                                                  (assoc (:meta entry) :sci.impl/var-sym sym)
-                                                  (:dynamic? entry))))))
-                     :meta {:name 'find-var}}
+                    {:val (make-find-var-fn ctx heap-atom) :meta {:name 'find-var}}
                     (symbol "clojure.core" "refer")
-                    {:val (fn sci-refer
-                            ([ns-sym] (sci-refer ns-sym :only nil))
-                            ([ns-sym & filters]
-                             (let [opts (apply hash-map filters)
-                                   only-syms (:only opts)
-                                   exclude-syms (set (:exclude opts))
-                                   heap @heap-atom
-                                   ns-str (str ns-sym)
-                                   entries (filter (fn [[k _]] (= ns-str (namespace k))) heap)
-                                   current-ns 'user] ;; TODO: track current-ns
-                               (doseq [[k entry] entries]
-                                 (let [sym-name (symbol (name k))]
-                                   (when (and (or (nil? only-syms) (contains? (set only-syms) sym-name))
-                                              (not (contains? exclude-syms sym-name)))
-                                     (let [target (symbol (str current-ns) (str sym-name))]
-                                       (swap! heap-atom assoc target entry)))))
-                               nil)))
-                     :meta {:name 'refer}}
+                    {:val (make-refer-fn heap-atom) :meta {:name 'refer}}
                     (symbol "clojure.core" "ns-aliases")
-                    {:val (fn [ns-sym]
-                            (let [ns-data (get (:ns-table ctx) ns-sym)]
-                              (or (:aliases ns-data) {})))
+                    {:val (fn [ns-sym] (or (:aliases (get (:ns-table ctx) ns-sym)) {}))
                      :meta {:name 'ns-aliases}}
-                    ;; defonce — override host macro that uses .hasRoot
                     (symbol "clojure.core" "defonce")
                     {:val (fn sci-defonce [name expr]
                             (list 'do
@@ -670,81 +824,19 @@
                                   (list 'var name)))
                      :meta {:macro true :name 'defonce}
                      :macro? true}
-                    ;; doc — override host macro that uses host resolve
                     (symbol "clojure.repl" "doc")
-                    {:val (fn sci-doc [sym-name]
-                            ;; Look up at expansion time (we have heap-atom closure)
-                            (let [heap @heap-atom
-                                  sym-str (str sym-name)
-                                  ;; Try to find as a var
-                                  candidates (if (qualified-symbol? sym-name)
-                                               [sym-name]
-                                               [(symbol "user" sym-str)
-                                                (symbol "clojure.core" sym-str)])
-                                  entry (some #(get heap %) candidates)
-                                  ;; Only show doc for entries with meaningful metadata
-                                  ;; (not bare bindings which have empty meta)
-                                  has-doc-meta? (and entry
-                                                     (let [m (:meta entry)]
-                                                       (or (:doc m) (:arglists m) (:name m)
-                                                           (:macro m))))
-                                  ns-data (when-let [na (:ns-atom ctx)]
-                                            (get @na sym-name))]
-                              (cond
-                                has-doc-meta?
-                                (list (list 'var 'clojure.repl/print-doc)
-                                      (list 'meta (list 'resolve (list 'quote sym-name))))
-                                ns-data
-                                (list (list 'var 'clojure.repl/print-doc)
-                                      (list 'quote {:name sym-name :doc (:doc ns-data)}))
-                                :else nil)))
-                     :meta {:macro true :name 'doc :doc "Prints documentation for a var or special form given its name,\n   or for a spec if given a keyword"}
+                    {:val (make-doc-fn ctx heap-atom)
+                     :meta {:macro true :name 'doc
+                            :doc "Prints documentation for a var or special form given its name,\n   or for a spec if given a keyword"}
                      :macro? true}
-                    ;; find-doc — override host version that uses host ns-publics
                     (symbol "clojure.repl" "find-doc")
-                    {:val (fn sci-find-doc [re-string-or-pattern]
-                            (let [re (re-pattern re-string-or-pattern)
-                                  heap @heap-atom
-                                  matches (->> heap
-                                               (filter (fn [[_ entry]]
-                                                         (let [m (:meta entry)]
-                                                           (and m (or (when-let [d (:doc m)]
-                                                                        (re-find re d))
-                                                                      (re-find re (str (:name m))))))))
-                                               (sort-by first))]
-                              (doseq [[qualified-sym entry] matches]
-                                ;; Format name as ns/name without using ns-name
-                                (let [m (merge (dissoc (:meta entry) :ns)
-                                               {:name qualified-sym})]
-                                  (#'clojure.repl/print-doc m)))
-                              ;; Also check namespace docs
-                              (when-let [ns-data @(or (:ns-atom ctx) (atom {}))]
-                                (doseq [[ns-sym ns-info] (sort-by first ns-data)]
-                                  (when-let [doc-str (:doc ns-info)]
-                                    (when (re-find re doc-str)
-                                      (#'clojure.repl/print-doc
-                                       {:name ns-sym :doc doc-str})))))))
-                     :meta {:name 'find-doc :doc "Prints documentation for any var whose documentation or name\n contains a match for re-string-or-pattern"}}
-                    ;; source-fn — SCI doesn't have source for user or host fns
+                    {:val (make-find-doc-fn ctx heap-atom)
+                     :meta {:name 'find-doc
+                            :doc "Prints documentation for any var whose documentation or name\n contains a match for re-string-or-pattern"}}
                     (symbol "clojure.repl" "source-fn")
-                    {:val (fn [sym] nil)
-                     :meta {:name 'source-fn}}
+                    {:val (fn [_] nil) :meta {:name 'source-fn}}
                     (symbol "clojure.core" "load-string")
-                    {:val (fn sci-load-string [s]
-                            (let [forms (read-all s)
-                                  m2 (machine/make-machine
-                                      {:heap @heap-atom
-                                       :ns-table (:ns-table ctx)
-                                       :permissions {:allow (:allow ctx)
-                                                     :deny (:deny ctx)}})
-                                  expr (if (= 1 (count forms))
-                                         (first forms)
-                                         (cons 'do forms))
-                                  m2 (-> m2
-                                         (assoc :heap-atom heap-atom)
-                                         (machine/push-frame {:op :eval :expr expr}))]
-                              (step/run m2)))
-                     :meta {:name 'load-string}}
+                    {:val (make-load-string-fn ctx heap-atom) :meta {:name 'load-string}}
                     (symbol "clojure.core" "read-string")
                     {:val (fn sci-read-string
                             ([s]
@@ -785,7 +877,58 @@
         heap (assoc (merge @heap-atom extra-heap)
                     (symbol "clojure.core" "ns-aliases")
                     {:val (fn [ns-sym] (or (:aliases (get @ns-atom ns-sym)) {}))
-                     :meta {:name 'ns-aliases}})
+                     :meta {:name 'ns-aliases}}
+                    (symbol "clojure.core" "defrecord")
+                    {:val (make-defrecord-fn ctx)
+                     :meta {:macro true :name 'defrecord}
+                     :macro? true}
+                    (symbol "clojure.core" "deftype")
+                    {:val (make-deftype-fn ctx)
+                     :meta {:macro true :name 'deftype}
+                     :macro? true}
+                    ;; instance? — check SCI types too
+                    (symbol "clojure.core" "instance?")
+                    {:val (fn [cls obj]
+                            (if (instance? sci.lang.Type cls)
+                              ;; SCI type — check :type metadata
+                              (= cls (:type (clojure.core/meta obj)))
+                              ;; Host class
+                              (clojure.core/instance? cls obj)))
+                     :meta {:name 'instance?}}
+                    ;; type — check SCI type metadata
+                    (symbol "clojure.core" "type")
+                    {:val (fn [x]
+                            (or (:type (clojure.core/meta x))
+                                (clojure.core/type x)))
+                     :meta {:name 'type}}
+                    ;; record? — check SCI record flag
+                    (symbol "clojure.core" "record?")
+                    {:val (fn [x]
+                            (or (:sci.impl/record (clojure.core/meta x))
+                                (clojure.core/record? x)))
+                     :meta {:name 'record?}}
+                    ;; str — dispatch toString for SCI type instances
+                    (symbol "clojure.core" "str")
+                    {:val (fn [& args]
+                            (if (empty? args)
+                              ""
+                              (clojure.string/join
+                                (map (fn [x]
+                                       (if (nil? x) ""
+                                         (if-let [sci-type (:type (clojure.core/meta x))]
+                                           (let [methods (.-methods ^sci.lang.Type sci-type)]
+                                             (if-let [toString-fn (get methods 'toString)]
+                                               (toString-fn x)
+                                               (clojure.core/str "#object[" (.-name ^sci.lang.Type sci-type) "]")))
+                                           (clojure.core/str x))))
+                                     args))))
+                     :meta {:name 'str}}
+                    ;; class? — true for SCI types too
+                    (symbol "clojure.core" "class?")
+                    {:val (fn [x]
+                            (or (clojure.core/class? x)
+                                (instance? sci.lang.Type x)))
+                     :meta {:name 'class?}})
         m (machine/make-machine
            {:heap heap
             :ns-table @ns-atom
@@ -827,7 +970,7 @@
              ns-atom (or (:ns-atom ctx) (atom {}))
              ns-info (get @ns-atom current-ns)
              aliases (:aliases ns-info)
-             read-opts (merge (make-reader-opts current-ns aliases) reader-extra {:eof eof})
+             read-opts (merge (make-reader-opts current-ns aliases (:heap-atom ctx)) reader-extra {:eof eof})
              form (edamame/parse-next reader read-opts)]
          (if (identical? form eof)
            (if (and (map? result) (contains? #{:suspend :effect} (:status result)))
@@ -909,22 +1052,19 @@
                      opts)]
      `(let [v# (var ~clj-var)
             m# (meta v#)
-            val# (deref v#)]
-        (with-meta (if (:macro m#)
-                     val#
-                     (fn [& args#] (apply val# args#)))
-          (merge m# ~opts-expr))))))
+            val# (deref v#)
+            merged-meta# (merge m# ~opts-expr)]
+        ;; Return a sci.lang.Var so non-IObj values (e.g. Long) can carry metadata.
+        (sci.lang/->Var (quote ~clj-var) val# merged-meta# (boolean (:dynamic m#)))))))
 
 (defn copy-var*
   "Copy a Clojure var into an SCI namespace (runtime version, takes a var)."
   ([clj-var sci-ns] (copy-var* clj-var sci-ns nil))
   ([clj-var sci-ns opts]
    (let [m (meta clj-var)
-         val (deref clj-var)]
-     (with-meta (if (:macro m)
-                  val
-                  (fn [& args] (apply val args)))
-       (merge m opts)))))
+         val (deref clj-var)
+         merged-meta (merge m opts)]
+     (sci.lang/->Var (.-sym clj-var) val merged-meta (boolean (:dynamic m))))))
 
 (defmacro copy-ns
   "Copy a Clojure namespace into SCI."

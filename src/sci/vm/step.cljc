@@ -30,7 +30,7 @@
      ns in-ns require letfn* binding
      defmulti defmethod remove-method prefer-method
      defprotocol extend extend-type extend-protocol
-     reify monitor-enter monitor-exit
+     deftype* reify monitor-enter monitor-exit
      suspend!})
 
 ;; ============================================================
@@ -152,22 +152,28 @@
                 ;; Follow ns-aliases transitively
                 resolved-ns (or (get (:ns-aliases machine) resolved-ns)
                                 resolved-ns)
-                qualified (symbol (str resolved-ns) sym-name)]
-            (if (contains? heap qualified)
-              (let [entry (get heap qualified)]
-                (if (and (not (:bound? entry true))
-                         (nil? (:val entry)))
-                  (sci.lang/->Unbound qualified)
-                  (:val entry)))
-              ;; Try as Java static field/method
-              #?(:clj
-                 (if-let [klass (try-resolve-class sym-ns)]
-                   (resolve-static-member klass sym-name)
+                qualified (symbol (str resolved-ns) sym-name)
+                dyn (:dynamic-bindings machine)]
+            (if (and dyn (contains? dyn qualified))
+              (get dyn qualified)
+              (if (contains? heap qualified)
+                (let [entry (get heap qualified)]
+                  (if (and (not (:bound? entry true))
+                           (nil? (:val entry)))
+                    (sci.lang/->Unbound qualified)
+                    (:val entry)))
+              ;; Check SCI types in the resolved namespace
+              (if-let [type-obj (get-in machine [:ns resolved-ns :types (symbol sym-name)])]
+                type-obj
+                ;; Try as Java static field/method
+                #?(:clj
+                   (if-let [klass (try-resolve-class sym-ns)]
+                     (resolve-static-member klass sym-name)
+                     (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                    {:type :sci/error :sym sym})))
+                   :cljs
                    (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                  {:type :sci/error :sym sym})))
-                 :cljs
-                 (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                 {:type :sci/error :sym sym})))))
+                                   {:type :sci/error :sym sym})))))))
           ;; Unqualified
           (let [ns-sym (:current-ns machine)
                 qualified (symbol (str ns-sym) sym-name)
@@ -186,11 +192,14 @@
                       (sci.lang/->Unbound qualified)
                       (:val entry)))
                   (if (and (not core-excluded?) (contains? heap core-q)) (:val (get heap core-q))
-                    #?(:clj (or (try-resolve-class sym-name)
-                                (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                                {:type :sci/error :sym sym})))
-                       :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                             {:type :sci/error :sym sym})))))))))))))))
+                    ;; Check types in namespace
+                    (if-let [type-obj (get-in machine [:ns ns-sym :types (symbol sym-name)])]
+                      type-obj
+                      #?(:clj (or (try-resolve-class sym-name)
+                                  (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                  {:type :sci/error :sym sym})))
+                         :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                               {:type :sci/error :sym sym}))))))))))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
@@ -722,7 +731,13 @@
                          (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))))))
                  ;; Instance access
                  (if (:field? frame)
-                   (m/push-value machine (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))
+                   (if (:type (clojure.core/meta f))
+                     ;; SCI type instance — field access via keyword
+                     (let [field-name (if (.startsWith ^String method-str "-")
+                                       (subs method-str 1)
+                                       method-str)]
+                       (m/push-value machine (get f (keyword field-name))))
+                     (m/push-value machine (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false)))
                    ;; Special methods for sci.lang.Var
                    (if (and (instance? sci.lang.Var f)
                             (contains? #{"hasRoot" "isBound" "isDynamic" "get"} method-str))
@@ -737,12 +752,22 @@
              :cljs
              (throw (ex-info "Interop not supported in CLJS" {})))
           (:new? frame)
-          #?(:clj
-             (m/push-value machine
-               (clojure.lang.Reflector/invokeConstructor
-                ^Class f (to-array [])))
-             :cljs
-             (throw (ex-info "new not supported in CLJS" {})))
+          (if (instance? sci.lang.Type f)
+            ;; SCI type constructor
+            (let [type-obj f
+                  fields (.-fields ^sci.lang.Type type-obj)
+                  field-kws (mapv keyword fields)
+                  is-record? (:record? (.-opts ^sci.lang.Type type-obj))
+                  instance (with-meta (zipmap field-kws [])
+                             (merge {:type type-obj}
+                                    (when is-record? {:sci.impl/record true})))]
+              (m/push-value machine instance))
+            #?(:clj
+               (m/push-value machine
+                 (clojure.lang.Reflector/invokeConstructor
+                  ^Class f (to-array [])))
+               :cljs
+               (throw (ex-info "new not supported in CLJS" {}))))
           :else
           (m/replace-frame machine {:op :apply :f f :args []}))
         (-> machine
@@ -770,24 +795,42 @@
                :cljs
                (throw (ex-info "Interop not supported in CLJS" {}))))
           (:new? frame)
-          #?(:clj
-             (m/push-value machine
-               (clojure.lang.Reflector/invokeConstructor
-                ^Class (:f frame) (to-array done)))
-             :cljs
-             (throw (ex-info "new not supported in CLJS" {})))
+          (let [f (:f frame)]
+            (if (instance? sci.lang.Type f)
+              ;; SCI type constructor with args
+              (let [fields (.-fields ^sci.lang.Type f)
+                    field-kws (mapv keyword fields)
+                    is-record? (:record? (.-opts ^sci.lang.Type f))
+                    instance (with-meta (zipmap field-kws done)
+                               (merge {:type f}
+                                      (when is-record? {:sci.impl/record true})))]
+                (m/push-value machine instance))
+              #?(:clj
+                 (m/push-value machine
+                   (clojure.lang.Reflector/invokeConstructor
+                    ^Class f (to-array done)))
+                 :cljs
+                 (throw (ex-info "new not supported in CLJS" {})))))
           (:defmethod? frame)
           ;; f = multimethod, done = [dispatch-val method-fn]
           (let [mm (:f frame)
-                [dispatch-val method-fn] done
-                methods-atom (:methods (meta mm))]
-            (swap! methods-atom assoc dispatch-val method-fn)
+                [dispatch-val method-fn] done]
+            #?(:clj
+               (if (instance? clojure.lang.MultiFn mm)
+                 (.addMethod ^clojure.lang.MultiFn mm dispatch-val method-fn)
+                 (swap! (:methods (meta mm)) assoc dispatch-val method-fn))
+               :cljs
+               (swap! (:methods (meta mm)) assoc dispatch-val method-fn))
             (m/push-value machine mm))
           (:remove-method? frame)
           (let [mm (:f frame)
-                [dispatch-val] done
-                methods-atom (:methods (meta mm))]
-            (swap! methods-atom dissoc dispatch-val)
+                [dispatch-val] done]
+            #?(:clj
+               (if (instance? clojure.lang.MultiFn mm)
+                 (.removeMethod ^clojure.lang.MultiFn mm dispatch-val)
+                 (swap! (:methods (meta mm)) dissoc dispatch-val))
+               :cljs
+               (swap! (:methods (meta mm)) dissoc dispatch-val))
             (m/push-value machine mm))
           (:prefer-method? frame)
           (let [mm (:f frame)
@@ -882,8 +925,10 @@
             bindings (bind-params (:params arity) args)
             fn-env (merge (:env f)
                           bindings
-                          (when-let [fname (:name f)]
-                            {fname f}))]
+                          ;; Only add self-reference binding for (fn name [x] ...) style,
+                          ;; not for (defn name [x] ...) which uses :sci/def-named.
+                          (when (and (:name f) (not (:sci/def-named f)))
+                            {(:name f) f}))]
         (-> machine
             (m/replace-frame {:op :fn-body
                               :body (:body arity)
@@ -1085,9 +1130,11 @@
         ns-sym (:ns-sym frame)
         qualified (symbol (str ns-sym) (str sym))
         val (:result machine)
-        ;; If the value is a closure (IFn with :sci/closure meta), update its name
+        ;; If the value is a closure (IFn with :sci/closure meta), update its name.
+        ;; Use :sci/def-named true to mark that this name came from def (not fn-name form),
+        ;; so it won't be added to &env for recursion (matching Clojure behavior).
         val (if (and (fn? val) (:sci/closure (meta val)) (nil? (:name (meta val))))
-              (vary-meta val assoc :name sym :ns ns-sym)
+              (vary-meta val assoc :name sym :ns ns-sym :sci/def-named true)
               val)
         meta-map (:meta-map frame)
         entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true}]
@@ -1264,26 +1311,30 @@
   (let [[_ sym] (:expr frame)
         ns-sym (:current-ns machine)
         heap (if-let [a (:heap-atom machine)] @a (:heap machine))
-        qualified (if (qualified-symbol? sym)
-                    sym
-                    ;; Also check clojure.core
-                    (let [local-q (symbol (str ns-sym) (str sym))]
-                      (if (contains? heap local-q)
-                        local-q
-                        (let [core-q (symbol "clojure.core" (str sym))]
-                          (if (contains? heap core-q)
-                            core-q
-                            local-q)))))
-        entry (get heap qualified)
-        ;; Create an SCI var-like object
-        var-obj (sci.lang/->Var (symbol (name qualified))
-                               (:val entry)
-                               (merge (:meta entry)
-                                      {:name (symbol (name qualified))
-                                       :ns (symbol (namespace qualified))
-                                       :sci.impl/var-sym qualified})
-                               (:dynamic? entry))]
-    (m/push-value machine var-obj)))
+        ;; Check if sym is a type name (deftype/defrecord create no var)
+        type-name (symbol (name sym))
+        type-obj (get-in machine [:ns ns-sym :types type-name])]
+    (if type-obj
+      (throw (ex-info (str "Unable to resolve var: " sym " in this context")
+                      {:type :sci/error}))
+      (let [qualified (if (qualified-symbol? sym)
+                        sym
+                        (let [local-q (symbol (str ns-sym) (str sym))]
+                          (if (contains? heap local-q)
+                            local-q
+                            (let [core-q (symbol "clojure.core" (str sym))]
+                              (if (contains? heap core-q)
+                                core-q
+                                local-q)))))
+            entry (get heap qualified)
+            var-obj (sci.lang/->Var (symbol (name qualified))
+                                   (:val entry)
+                                   (merge (:meta entry)
+                                          {:name (symbol (name qualified))
+                                           :ns (symbol (namespace qualified))
+                                           :sci.impl/var-sym qualified})
+                                   (:dynamic? entry))]
+        (m/push-value machine var-obj)))))
 
 ;; ============================================================
 ;; Dynamic binding + set!
@@ -1291,10 +1342,22 @@
 
 (defn- resolve-var-qualified [machine sym]
   (let [sym-name (name sym)
-        local-q (symbol (str (:current-ns machine)) sym-name)]
-    (if (contains? (:heap machine) local-q)
-      local-q
-      (symbol "clojure.core" sym-name))))
+        sym-ns (namespace sym)]
+    (if sym-ns
+      ;; Qualified symbol: resolve the namespace alias and return fully qualified
+      (let [ns-table (:ns machine)
+            current-ns (:current-ns machine)
+            current-ns-data (get ns-table current-ns)
+            resolved-ns (or (get (:aliases current-ns-data) (symbol sym-ns))
+                            (get (:ns-aliases machine) (symbol sym-ns))
+                            (symbol sym-ns))
+            resolved-ns (or (get (:ns-aliases machine) resolved-ns) resolved-ns)]
+        (symbol (str resolved-ns) sym-name))
+      ;; Unqualified symbol: check current-ns heap, fallback to clojure.core
+      (let [local-q (symbol (str (:current-ns machine)) sym-name)]
+        (if (contains? (:heap machine) local-q)
+          local-q
+          (symbol "clojure.core" sym-name))))))
 
 (defn step-eval-binding [machine frame]
   (let [[_ bindings & body] (:expr frame)
@@ -1466,19 +1529,42 @@
 ;; import*
 ;; ============================================================
 
+(defn- try-resolve-sci-type
+  "Try to resolve a dotted class-name string as an SCI type from another namespace.
+   E.g. 'bar.Foo' → looks up [:ns 'bar :types 'Foo]. Returns type-obj or nil."
+  [machine class-name]
+  #?(:clj
+     (let [idx (.lastIndexOf ^String class-name ".")]
+       (when (> idx 0)
+         (let [ns-str (subs class-name 0 idx)
+               type-str (subs class-name (inc idx))]
+           (get-in machine [:ns (symbol ns-str) :types (symbol type-str)]))))
+     :cljs nil))
+
 (defn step-eval-import [machine frame]
   ;; (import* "fully.qualified.ClassName")
   (let [[_ class-str] (:expr frame)]
     #?(:clj
        (let [klass (try (Class/forName class-str)
-                        (catch ClassNotFoundException _
-                          (throw (ex-info (str "Unable to resolve classname: " class-str)
-                                         {:type :sci/error}))))
-             short-name (symbol (.getSimpleName ^Class klass))]
-         ;; Register the short name in the current env so it resolves
-         (-> machine
-             (update :env assoc short-name klass)
-             (m/push-value klass)))
+                        (catch ClassNotFoundException _ nil))
+             sci-type (when-not klass (try-resolve-sci-type machine class-str))]
+         (cond
+           klass
+           (let [short-name (symbol (.getSimpleName ^Class klass))]
+             (-> machine
+                 (update :env assoc short-name klass)
+                 (m/push-value klass)))
+           sci-type
+           (let [idx (.lastIndexOf ^String class-str ".")
+                 short-name (symbol (subs class-str (inc idx)))
+                 cur-ns (:current-ns machine)]
+             (-> machine
+                 (update :env assoc short-name sci-type)
+                 (update-in [:ns cur-ns :types] assoc short-name sci-type)
+                 (m/push-value sci-type)))
+           :else
+           (throw (ex-info (str "Unable to resolve classname: " class-str)
+                           {:type :sci/error}))))
        :cljs
        (throw (ex-info "import not supported in ClojureScript" {})))))
 
@@ -1605,7 +1691,9 @@
                  (fn [m [mname {:keys [arglists]}]]
                    (let [method-fn (fn protocol-dispatch [& args]
                                      (let [target (first args)
-                                           target-type (type target)
+                                           ;; For SCI type instances (maps with :type meta), use SCI type
+                                           sci-type (when (map? target) (:type (clojure.core/meta target)))
+                                           target-type (or sci-type (type target))
                                            impls @(:impls protocol)
                                            ;; Look up implementation: exact type match first, then supers
                                            impl (or (get impls target-type)
@@ -1613,6 +1701,10 @@
                                                             (when (and (class? t) (instance? t target))
                                                               impl))
                                                           impls)
+                                                    ;; For SCI records: check clojure.lang.IRecord / IPersistentMap
+                                                    (when (:sci.impl/record (clojure.core/meta target))
+                                                      (or (get impls clojure.lang.IRecord)
+                                                          (get impls clojure.lang.IPersistentMap)))
                                                     ;; Try nil
                                                     (when (nil? target) (get impls nil))
                                                     ;; Try Object/:default
@@ -1739,19 +1831,24 @@
   ;; (defmacro name [params] body) → defines a macro in the heap
   (let [form (:expr frame)
         [_ macro-name & rest-form] form
-        ;; Parse like fn
+        ;; Parse like fn — then prepend &form and &env to each arity's params
         parsed (parse-fn-form (list* 'fn* rest-form))
+        ;; Prepend &form &env to all arities so macros can use &form and &env
+        arities-with-implicit (mapv (fn [arity]
+                                      (update arity :params #(into ['&form '&env] %)))
+                                    (:arities parsed))
         closure-map {:type :closure
                      :name macro-name
-                     :arities (:arities parsed)
+                     :arities arities-with-implicit
                      :env (:env machine)}
-        ;; Create a callable that takes &form &env then the real args
+        ;; Callable takes &form &env then the real args
         callable (make-callable-closure closure-map machine)
         ns-sym (:current-ns machine)
         qualified (symbol (str ns-sym) (str macro-name))
         macro-meta (merge {:macro true
                            :name macro-name
                            :ns ns-sym
+                           ;; Arglists show the user-visible params (without &form &env)
                            :arglists (apply list (mapv :params (:arities parsed)))}
                           (when-let [ds (:docstring parsed)]
                             {:doc ds})
@@ -1964,14 +2061,19 @@
                                                (let [pkg (first imp-spec)
                                                      classes (rest imp-spec)]
                                                  (reduce (fn [m'' cls]
-                                                           (let [fqn (str pkg "." cls)]
+                                                           (let [fqn (str pkg "." cls)
+                                                                 short (symbol (str cls))]
                                                              #?(:clj
-                                                                (try
-                                                                  (let [klass (Class/forName fqn)]
-                                                                    (update m'' :env assoc (symbol (str cls)) klass))
-                                                                  (catch ClassNotFoundException _
-                                                                    (throw (ex-info (str "Unable to resolve classname: " fqn)
-                                                                                    {:type :sci/error}))))
+                                                                (let [klass (try (Class/forName fqn)
+                                                                                 (catch ClassNotFoundException _ nil))
+                                                                      sci-type (when-not klass (try-resolve-sci-type m'' fqn))]
+                                                                  (cond
+                                                                    klass (update m'' :env assoc short klass)
+                                                                    sci-type (-> m''
+                                                                                 (update :env assoc short sci-type)
+                                                                                 (update-in [:ns ns-sym :types] assoc short sci-type))
+                                                                    :else (throw (ex-info (str "Unable to resolve classname: " fqn)
+                                                                                          {:type :sci/error}))))
                                                                 :cljs m'')))
                                                          m' classes))
                                                m'))
@@ -2068,6 +2170,125 @@
       (assoc :status :suspend :suspend-data (:result machine))))
 
 ;; ============================================================
+;; deftype*
+;; ============================================================
+
+(defn- make-deftype-method-fn
+  "Create a Clojure closure for a deftype method.
+   fields = field-name symbols; params = [this ...]; body = seq of exprs."
+  [machine ns-sym fields params body]
+  (let [heap-atom (:heap-atom machine)
+        ns-atom   (:ns-atom machine)
+        base-env  (:env machine)]
+    (fn [& args]
+      (let [this-obj       (first args)
+            ;; Bind field values from the instance map
+            field-bindings (zipmap fields (map #(get this-obj (keyword %)) fields))
+            fn-env         (merge base-env field-bindings (zipmap params args))
+            heap           (if heap-atom @heap-atom (:heap machine))
+            ;; Use latest ns-table (picks up types defined after this closure was created)
+            ns-table       (if ns-atom @ns-atom (:ns machine))
+            mini-m         (-> (m/make-machine {:heap heap :ns-table ns-table})
+                               (assoc :env fn-env
+                                      :heap-atom heap-atom
+                                      :ns-atom ns-atom
+                                      :current-ns ns-sym)
+                               (m/push-frame {:op :eval
+                                              :expr (if (= 1 (count body))
+                                                      (first body)
+                                                      (cons 'do body))}))]
+        (run mini-m)))))
+
+(defn step-eval-deftype* [machine frame]
+  ;; (deftype* qualified-sym dotted-sym [fields] :implements [Proto1 ...] (method [this] body) ...)
+  (let [form (:expr frame)
+        parts         (vec (rest form))
+        qualified-sym (nth parts 0)
+        dotted-sym    (nth parts 1)
+        fields-vec    (nth parts 2)
+        ;; Find :implements keyword and its vector
+        impl-idx (reduce-kv (fn [_ i v] (if (= :implements v) (reduced i) nil)) nil parts)
+        protocols-vec (when impl-idx (nth parts (inc impl-idx) []))
+        method-forms  (if impl-idx (drop (+ impl-idx 2) parts) (drop 3 parts))
+        is-record?    (:sci.impl/record (meta form))
+        ns-sym        (:current-ns machine)
+        type-name     (symbol (name qualified-sym))
+        clean-fields  (mapv #(with-meta % nil) fields-vec)
+        field-keywords (mapv keyword clean-fields)
+        ;; Build method-map: mname -> {:params [...] :body [...] :fields [...]}
+        method-map (reduce (fn [acc mform]
+                             (if (seq? mform)
+                               (let [mname  (first mform)
+                                     params (second mform)
+                                     body   (vec (drop 2 mform))]
+                                 (assoc acc mname {:params params :body body :fields clean-fields}))
+                               acc))
+                           {} method-forms)
+        ;; Build closures for all defined methods — used for Object dispatch (toString etc.)
+        method-fns (reduce-kv (fn [acc mname {:keys [params body fields]}]
+                                (assoc acc mname
+                                       (make-deftype-method-fn machine ns-sym fields params body)))
+                              {} method-map)
+        ;; Create the Type object — store method fns so str/prn can call them
+        type-obj (sci.lang/->Type dotted-sym clean-fields {} method-fns {:record? is-record?})
+        ;; Create positional constructor ->Name
+        ctor-fn (if is-record?
+                  (fn [& args]
+                    (with-meta (zipmap field-keywords args)
+                               {:type type-obj :sci.impl/record true}))
+                  (fn [& args]
+                    (with-meta (zipmap field-keywords args)
+                               {:type type-obj})))
+        ctor-sym      (symbol (str "->" type-name))
+        ctor-qualified (symbol (str ns-sym) (str ctor-sym))
+        ctor-entry    {:val ctor-fn
+                       :meta {:name ctor-sym :arglists (list clean-fields)
+                              :doc (str "Positional factory function for " dotted-sym ".")}
+                       :bound? true}
+        machine (-> machine
+                    (update-in [:ns ns-sym :types] assoc type-name type-obj)
+                    (update :env assoc type-name type-obj)
+                    (assoc-in [:heap ctor-qualified] ctor-entry))
+        ;; map->Name for records
+        machine (if is-record?
+                  (let [map-ctor-fn (fn [m]
+                                      (with-meta (merge (zipmap field-keywords (repeat nil)) m)
+                                                 {:type type-obj :sci.impl/record true}))
+                        map-ctor-sym (symbol (str "map->" type-name))
+                        map-ctor-q   (symbol (str ns-sym) (str map-ctor-sym))
+                        map-ctor-entry {:val map-ctor-fn :meta {:name map-ctor-sym} :bound? true}]
+                    (when-let [a (:heap-atom machine)] (swap! a assoc map-ctor-q map-ctor-entry))
+                    (assoc-in machine [:heap map-ctor-q] map-ctor-entry))
+                  machine)
+        ;; Register protocol implementations
+        machine (if (seq protocols-vec)
+                  (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                        env  (:env machine)]
+                    (reduce (fn [m proto-sym]
+                              (let [proto (or (get env proto-sym)
+                                             (let [ns-str (str ns-sym)
+                                                   q  (symbol ns-str (str proto-sym))
+                                                   cq (symbol "clojure.core" (str proto-sym))]
+                                               (or (:val (get heap q))
+                                                   (:val (get heap cq)))))]
+                                (if (and (map? proto) (= :sci/protocol (:type proto)))
+                                  (let [proto-methods (:methods proto)
+                                        impl-fns (reduce (fn [acc [mname _]]
+                                                           (if-let [f (get method-fns mname)]
+                                                             (assoc acc mname f)
+                                                             acc))
+                                                         {} proto-methods)]
+                                    (when (seq impl-fns) (do-extend proto type-obj impl-fns))
+                                    m)
+                                  m)))
+                            machine protocols-vec))
+                  machine)]
+    (when-let [a (:heap-atom machine)] (swap! a assoc ctor-qualified ctor-entry))
+    (when-let [a (:ns-atom machine)]
+      (swap! a update-in [ns-sym :types] assoc type-name type-obj))
+    (m/push-value machine type-obj)))
+
+;; ============================================================
 ;; Special form dispatch
 ;; ============================================================
 
@@ -2114,6 +2335,7 @@
       extend-type (step-eval-extend-type machine frame)
       extend-protocol (step-eval-extend-protocol machine frame)
       binding  (step-eval-binding machine frame)
+      deftype* (step-eval-deftype* machine frame)
       monitor-enter (m/push-value machine nil)
       monitor-exit  (m/push-value machine nil)
       suspend! (step-eval-suspend machine frame)
@@ -2125,8 +2347,9 @@
 ;; ============================================================
 
 (defn try-resolve-macro
-  "If the head of a list form is a symbol that resolves to a Clojure macro,
-   return the macro var. Otherwise nil."
+  "If the head of a list form is a symbol that resolves to a macro,
+   return [val host-macro?] where host-macro? means it takes &form &env as first two args.
+   Returns nil if not a macro."
   [machine sym]
   (when (symbol? sym)
     (let [sym-ns (clojure.core/namespace sym)
@@ -2148,7 +2371,10 @@
       (some (fn [qualified]
               (when-let [entry (get heap qualified)]
                 (when (:macro? entry)
-                  (:val entry))))
+                  (let [v (:val entry)]
+                    ;; host-macro? = true when the value is a Clojure var (core macros)
+                    ;; or when explicitly tagged :host-macro? (copy-var of defmacro/^:sci/macro)
+                    [v (boolean (or (var? v) (:host-macro? entry)))]))))
             candidates))))
 
 (defn macroexpand-form
@@ -2171,14 +2397,20 @@
         (if (and (symbol? head) (contains? (:env machine) head))
         ;; Head is a local binding — don't macro-expand
         [false form]
-      (if-let [macro-val (try-resolve-macro machine head)]
-          (let [is-host-macro? (var? macro-val)
-                macro-fn (if is-host-macro? @macro-val macro-val)
+      (if-let [[macro-val is-host-macro?] (try-resolve-macro machine head)]
+          (let [macro-fn (if (var? macro-val) @macro-val macro-val)
+                ;; All macros get &form and &env:
+                ;; - host Clojure vars: the fn itself takes [&form &env ...args]
+                ;; - SCI closures (defmacro in scripts): closure params have &form &env prepended
+                ;; - internal SCI macros (doc, defonce, etc.): take just args (no &form &env)
+                current-env (:env machine)
                 expanded (if is-host-macro?
-                           ;; Host macros get &form and &env as first two args
-                           (apply macro-fn form {} (rest form))
-                           ;; SCI-defined macros just get the args directly
-                           (apply macro-fn (rest form)))
+                           (apply macro-fn form current-env (rest form))
+                           ;; SCI closures from defmacro: also get &form and &env
+                           (if (:sci/closure (meta macro-val))
+                             (apply macro-fn form current-env (rest form))
+                             ;; Internal SCI macros: just args
+                             (apply macro-fn (rest form))))
                 ;; Preserve source location from original form on expanded form
                 expanded (if (and (seq? expanded) (:line (meta form)))
                            (with-meta expanded
