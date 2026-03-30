@@ -211,6 +211,67 @@
                               (clojure.core/reset! ref v)))
                      :meta {:name 'reset!}
                      :dynamic? false})
+        ;; Override reset-vals! and swap-vals! to handle SCI type instances
+        heap (assoc heap (symbol "clojure.core" "reset-vals!")
+                    {:val (fn sci-reset-vals! [ref newval]
+                            (if-let [type-obj (:type (clojure.core/meta ref))]
+                              (if (instance? sci.lang.Type type-obj)
+                                (let [methods (.-methods ^sci.lang.Type type-obj)
+                                      rv-fn (get methods 'resetVals)]
+                                  (if rv-fn
+                                    (rv-fn ref newval)
+                                    (clojure.core/reset-vals! ref newval)))
+                                (clojure.core/reset-vals! ref newval))
+                              (clojure.core/reset-vals! ref newval)))
+                     :meta {:name 'reset-vals! :doc #?(:clj (:doc (meta #'clojure.core/reset-vals!)) :cljs nil)}
+                     :dynamic? false})
+        heap (assoc heap (symbol "clojure.core" "swap-vals!")
+                    {:val (fn sci-swap-vals!
+                            ([ref f]
+                             (if-let [type-obj (:type (clojure.core/meta ref))]
+                               (if (instance? sci.lang.Type type-obj)
+                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                       sv-fn (get methods 'swapVals)]
+                                   (if sv-fn
+                                     (sv-fn ref f)
+                                     (clojure.core/swap-vals! ref f)))
+                                 (clojure.core/swap-vals! ref f))
+                               (clojure.core/swap-vals! ref f)))
+                            ([ref f a] (clojure.core/swap-vals! ref f a))
+                            ([ref f a b] (clojure.core/swap-vals! ref f a b))
+                            ([ref f a b & args] (apply clojure.core/swap-vals! ref f a b args)))
+                     :meta {:name 'swap-vals! :doc #?(:clj (:doc (meta #'clojure.core/swap-vals!)) :cljs nil)}
+                     :dynamic? false})
+        ;; Override derive/underive/isa? to handle SCI types (sci.lang.Type)
+        ;; SCI types are not Class or Named, so we convert them to their qualified symbol
+        heap (let [type->tag (fn [t]
+                               (if (instance? sci.lang.Type t)
+                                 (let [n (.getName ^sci.lang.Type t)
+                                       ;; Convert "foo.Foo" to symbol foo/Foo (namespace-qualified)
+                                       idx (.lastIndexOf ^String n ".")]
+                                   (if (pos? idx)
+                                     (symbol (subs n 0 idx) (subs n (inc idx)))
+                                     (symbol "user" n)))
+                                 t))]
+               (-> heap
+                   (assoc (symbol "clojure.core" "derive")
+                          {:val (fn sci-derive
+                                  ([tag parent] (clojure.core/derive (type->tag tag) (type->tag parent)))
+                                  ([h tag parent] (clojure.core/derive h (type->tag tag) (type->tag parent))))
+                           :meta {:name 'derive :doc #?(:clj (:doc (meta #'clojure.core/derive)) :cljs nil)}
+                           :dynamic? false})
+                   (assoc (symbol "clojure.core" "underive")
+                          {:val (fn sci-underive
+                                  ([tag parent] (clojure.core/underive (type->tag tag) (type->tag parent)))
+                                  ([h tag parent] (clojure.core/underive h (type->tag tag) (type->tag parent))))
+                           :meta {:name 'underive :doc #?(:clj (:doc (meta #'clojure.core/underive)) :cljs nil)}
+                           :dynamic? false})
+                   (assoc (symbol "clojure.core" "isa?")
+                          {:val (fn sci-isa?
+                                  ([child parent] (clojure.core/isa? (type->tag child) (type->tag parent)))
+                                  ([h child parent] (clojure.core/isa? h (type->tag child) (type->tag parent))))
+                           :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs nil)}
+                           :dynamic? false})))
         ;; Install user bindings into heap as user/sym vars
         ;; :dynamic? true so thread-local bindings (sci/binding, sci/with-bindings) work.
         ;; Atom-backed vars (from new-dynamic-var) are stored as atoms; resolve-symbol derefs them.
@@ -1265,7 +1326,18 @@
                     {:val (fn [x]
                             (or (clojure.core/class? x)
                                 (instance? sci.lang.Type x)))
-                     :meta {:name 'class?}})
+                     :meta {:name 'class?}}
+                    ;; extends? — check SCI protocol impls for SCI types
+                    (symbol "clojure.core" "extends?")
+                    {:val (fn [protocol atype]
+                            (if (and (map? protocol) (= :sci/protocol (:type protocol)))
+                              ;; SCI protocol — check impls atom
+                              (contains? @(:impls protocol) atype)
+                              ;; Real protocol — atype must be a Class
+                              (if (clojure.core/class? atype)
+                                (clojure.core/extends? protocol atype)
+                                false)))
+                     :meta {:name 'extends? :doc #?(:clj (:doc (meta #'clojure.core/extends?)) :cljs nil)}})
         ;; Override pmap to capture SCI dynamic bindings at call time.
         ;; pmap is lazy — futures may be created after the binding form exits, so we must
         ;; snapshot current-dynamic-bindings when pmap is called and restore it in each thread.

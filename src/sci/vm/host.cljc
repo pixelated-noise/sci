@@ -5,7 +5,9 @@
             [clojure.set]
             [clojure.walk]
             [clojure.edn]
-            [clojure.repl]))
+            [clojure.repl]
+            [clojure.pprint]
+            [sci.lang]))
 
 (defn- make-ns-registry
   "Generate a registry of all public vars from a namespace."
@@ -17,17 +19,18 @@
         (fn [acc sym v]
           (let [qualified (symbol (str ns-sym) (str sym))
                 m (meta v)
-                is-macro? (:macro m)]
+                is-macro? (:macro m)
+                is-dynamic? (or (:dynamic m) (.isDynamic ^clojure.lang.Var v))]
             (assoc acc qualified {:val (if is-macro? v (deref v))
-                                  :meta (select-keys m [:name :ns :macro :doc :arglists])
+                                  :meta (select-keys m [:name :ns :macro :doc :arglists :file :line])
                                   :macro? is-macro?
-                                  :dynamic? (:dynamic m)})))
+                                  :dynamic? is-dynamic?})))
         {}
         publics))
      :cljs {}))
 
 (def default-namespaces
-  '[clojure.core clojure.string clojure.set clojure.walk clojure.edn clojure.repl])
+  '[clojure.core clojure.string clojure.set clojure.walk clojure.edn clojure.repl clojure.pprint])
 
 (defn- add-private-vars
   "Add specific private vars needed by host macro expansions."
@@ -52,7 +55,103 @@
   (-> (reduce (fn [heap ns-sym] (merge heap (make-ns-registry ns-sym)))
               {}
               default-namespaces)
-      (add-private-vars)))
+      (add-private-vars)
+      #?(:clj
+         ;; Add seq-to-map-for-destructuring behavior for Clojure 1.11 kwargs map support.
+         ;; On Clojure 1.10, destructuring of [& {:keys [a]}] generates
+         ;; (PersistentHashMap/create (seq args)). Clojure 1.11 uses
+         ;; seq-to-map-for-destructuring which treats a single-map seq as the map directly.
+         (assoc 'clojure.lang.PersistentHashMap/create
+                {:val (fn [& args]
+                        (if (and (= 1 (count args))
+                                 (sequential? (first args))
+                                 (= 1 (count (first args)))
+                                 (map? (first (first args))))
+                          (first (first args))
+                          (clojure.lang.Reflector/invokeStaticMethod
+                           clojure.lang.PersistentHashMap "create" (to-array args))))
+                 :meta {:name 'create}})
+         :cljs identity)
+      ;; Override with-bindings* to handle sci.lang.Var objects.
+      ;; The host clojure.core/with-bindings* expects clojure.lang.Var keys, but SCI
+      ;; code produces sci.lang.Var objects from #'sym. Map SCI vars to real CLJ vars
+      ;; where possible (e.g. #'*out* -> #'clojure.core/*out*), then push JVM thread bindings.
+      ;; Override push-thread-bindings to handle sci.lang.Var keys.
+      ;; The host clojure.core/binding macro expands to (push-thread-bindings {#'var val}).
+      ;; In SCI, #'var evaluates to a sci.lang.Var, not a clojure.lang.Var.
+      ;; We map SCI vars to their real CLJ vars before pushing JVM bindings.
+      #?(:clj
+         (assoc 'clojure.core/push-thread-bindings
+                {:val (fn sci-push-thread-bindings [binding-map]
+                        (let [clj-bindings
+                              (reduce (fn [acc [k v]]
+                                        (cond
+                                          (instance? clojure.lang.Var k)
+                                          (assoc acc k v)
+                                          (instance? sci.lang.Var k)
+                                          (let [m (.-meta-map ^sci.lang.Var k)
+                                                qsym (or (:sci.impl/var-sym m)
+                                                         (when (and (:ns m) (:name m))
+                                                           (symbol (str (:ns m)) (str (:name m)))))
+                                                real-var (when qsym
+                                                           (try (let [rv (clojure.core/resolve qsym)]
+                                                                  (when (and rv (var? rv) (.isDynamic ^clojure.lang.Var rv)) rv))
+                                                                (catch Exception _ nil)))]
+                                            (if real-var (assoc acc real-var v) acc))
+                                          :else acc))
+                                      {} binding-map)]
+                          (when (seq clj-bindings)
+                            (clojure.core/push-thread-bindings clj-bindings))))
+                 :meta {:name 'push-thread-bindings :doc (:doc (meta #'clojure.core/push-thread-bindings))}})
+         :cljs identity)
+      #?(:clj
+         (assoc 'clojure.core/with-bindings*
+                {:val (fn [binding-map f & args]
+                        (let [clj-bindings
+                              (reduce (fn [acc [k v]]
+                                        (cond
+                                          ;; Real CLJ var — use as-is
+                                          (instance? clojure.lang.Var k)
+                                          (assoc acc k v)
+                                          ;; SCI var — look up the real CLJ var via meta
+                                          (instance? sci.lang.Var k)
+                                          (let [m (.-meta-map ^sci.lang.Var k)
+                                                qsym (or (:sci.impl/var-sym m)
+                                                         (when (and (:ns m) (:name m))
+                                                           (symbol (str (:ns m)) (str (:name m)))))
+                                                real-var (when qsym
+                                                           (try (let [rv (clojure.core/resolve qsym)]
+                                                                  (when (and rv (var? rv) (.isDynamic ^clojure.lang.Var rv)) rv))
+                                                                (catch Exception _ nil)))]
+                                            (if real-var (assoc acc real-var v) acc))
+                                          :else acc))
+                                      {} binding-map)]
+                          (if (seq clj-bindings)
+                            (clojure.core/with-bindings* clj-bindings f)
+                            (apply f args))))
+                 :meta {:name 'with-bindings*}})
+         :cljs identity)
+      ;; Override assert with a runtime check so (set! *assert* false) takes effect.
+      ;; The host clojure.core/assert macro checks *assert* at expansion time, not runtime.
+      ;; Our override always emits (when *assert* ...), letting the VM evaluate *assert*
+      ;; from the heap at runtime.
+      #?(:clj
+         (assoc 'clojure.core/assert
+                {:val (fn [form _env & _]
+                        (let [args (rest form)
+                              expr (first args)
+                              msg (second args)]
+                          (if msg
+                            `(when *assert*
+                               (when-not ~expr
+                                 (throw (new AssertionError (str "Assert failed: " ~msg "\n" (pr-str '~expr))))))
+                            `(when *assert*
+                               (when-not ~expr
+                                 (throw (new AssertionError (str "Assert failed: " (pr-str '~expr)))))))))
+                 :meta {:name 'assert :macro true}
+                 :macro? true
+                 :host-macro? true})
+         :cljs identity)))
 
 #?(:clj
    (defn inverse-registry

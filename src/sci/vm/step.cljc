@@ -873,15 +873,19 @@
           #?(:clj
              (let [method-str (str (:method-name frame))]
                (if (instance? Class f)
-                 ;; Static access
+                 ;; Static access — try static field/method first, fall back to instance method on Class object
                  (if (:field? frame)
-                   (m/push-value machine (clojure.lang.Reflector/getStaticField ^Class f method-str))
-                   ;; Try static field first, then no-arg static method
+                   (m/push-value machine
+                                 (try (clojure.lang.Reflector/getStaticField ^Class f method-str)
+                                      (catch Exception _
+                                        (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))
                    (m/push-value machine
                                  (try
                                    (clojure.lang.Reflector/getStaticField ^Class f method-str)
                                    (catch Exception _
-                                     (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))))))
+                                     (try (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))
+                                          (catch Exception _
+                                            (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false)))))))
                  ;; Instance access
                  (if (:field? frame)
                    (if (:type (clojure.core/meta f))
@@ -1273,32 +1277,32 @@
           (m/push-frame {:op :eval :expr (into {} meta-map)}))
       (if (and (nil? init-expr) (empty? init))
         (let [ns-sym (:current-ns machine)
-            qualified (symbol (str ns-sym) (str sym))
-            ;; Only create entry if var doesn't already exist (declare semantics)
-            heap (if-let [a (:heap-atom machine)] @a (:heap machine))
-            existing (get heap qualified)
-            ;; Check if existing entry was referred from another namespace
-            ;; (i.e. has :sci.impl/var-sym pointing to a different ns)
-            referred-from (when existing
-                            (let [vs (get-in existing [:meta :sci.impl/var-sym])]
-                              (when (and vs (not= (str ns-sym) (namespace vs)))
-                                vs)))
-            _ (when referred-from
-                (throw (ex-info (str ns-sym " already refers to: " referred-from
-                                     ", being replaced by: " qualified)
-                                {:type :sci/error})))
-            entry (if (and existing (:bound? existing))
-                    ;; Var already bound — keep existing value, update meta
-                    (assoc existing :meta meta-map)
-                    ;; Var not yet bound or doesn't exist — declare it
-                    {:val nil :meta meta-map :bound? false})]
-        (when-let [a (:heap-atom machine)]
-          (swap! a assoc qualified entry))
-        (-> machine
-            (assoc-in [:heap qualified] entry)
-            (m/push-value (sci.lang/->Var (symbol (name qualified)) nil
-                                          (assoc meta-map :sci.impl/var-sym qualified)
-                                          (:dynamic meta-map)))))
+              qualified (symbol (str ns-sym) (str sym))
+              ;; Only create entry if var doesn't already exist (declare semantics)
+              heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+              existing (get heap qualified)
+              ;; Check if existing entry was referred from another namespace
+              ;; (i.e. has :sci.impl/var-sym pointing to a different ns)
+              referred-from (when existing
+                              (let [vs (get-in existing [:meta :sci.impl/var-sym])]
+                                (when (and vs (not= (str ns-sym) (namespace vs)))
+                                  vs)))
+              _ (when referred-from
+                  (throw (ex-info (str ns-sym " already refers to: " referred-from
+                                       ", being replaced by: " qualified)
+                                  {:type :sci/error})))
+              entry (if (and existing (:bound? existing))
+                      ;; Var already bound — keep existing value, update meta
+                      (assoc existing :meta meta-map)
+                      ;; Var not yet bound or doesn't exist — declare it
+                      {:val nil :meta meta-map :bound? false})]
+          (when-let [a (:heap-atom machine)]
+            (swap! a assoc qualified entry))
+          (-> machine
+              (assoc-in [:heap qualified] entry)
+              (m/push-value (sci.lang/->Var (symbol (name qualified)) nil
+                                            (assoc meta-map :sci.impl/var-sym qualified)
+                                            (:dynamic meta-map)))))
       (let [;; Propagate :line from the def form to init-expr (for recur checking)
             init-expr (if (and (seq? init-expr)
                                (not (:line (meta init-expr)))
@@ -1995,10 +1999,10 @@
                          method-arglists arglists
                          ;; Find docstring for this method (immediately after the method-name in the definition)
                          method-doc (some (fn [md]
-                                           (when (and (seq? md) (= mname (first md)))
-                                             (let [second-el (second md)]
-                                               (when (string? second-el) second-el))))
-                                         method-defs)
+                                            (when (and (seq? md) (= mname (first md)))
+                                              (let [second-el (second md)]
+                                                (when (string? second-el) second-el))))
+                                          method-defs)
                          entry {:val method-fn
                                 :meta {:protocol protocol
                                        :name mname
@@ -2056,6 +2060,8 @@
                              (let [impl-map (into {}
                                                   (map (fn [method-form]
                                                          (let [mname (first method-form)
+                                                               ;; Normalize to unqualified name
+                                                               mname (symbol (name mname))
                                                                args-body (rest method-form)]
                                                            [(list 'quote mname)
                                                             (list* 'fn* args-body)]))
@@ -2680,13 +2686,26 @@
                                (let [mname (first mform)
                                      params (second mform)
                                      body (vec (drop 2 mform))]
-                                 (assoc acc mname {:params params :body body}))
+                                 (update acc mname (fnil conj []) {:params params :body body}))
                                acc))
                            {} method-forms)
         ;; Build closures — normalize to unqualified names
-        method-fns (reduce-kv (fn [acc mname {:keys [params body]}]
-                                (assoc acc (symbol (name mname))
-                                       (make-deftype-method-fn machine ns-sym [] params body)))
+        method-fns (reduce-kv (fn [acc mname arities]
+                                (let [fns (mapv (fn [{:keys [params body]}]
+                                                  {:fn (make-deftype-method-fn machine ns-sym [] params body)
+                                                   :arity (count params)})
+                                                arities)
+                                      method-fn (if (= 1 (count fns))
+                                                  (:fn (first fns))
+                                                  (fn [& args]
+                                                    (let [n (count args)
+                                                          match (first (filter #(= n (:arity %)) fns))]
+                                                      (if match
+                                                        (apply (:fn match) args)
+                                                        (throw (ex-info (str "No matching arity for method " mname
+                                                                             ", got " n " args")
+                                                                        {:type :sci/error}))))))]
+                                  (assoc acc (symbol (name mname)) method-fn)))
                               {} method-map)
         ;; Create anonymous Type object
         type-obj (sci.lang/->Type "reified" [] {} method-fns {})
@@ -2715,8 +2734,10 @@
                                     m)
                                   m)))
                             machine interfaces-vec))
-                  machine)]
-    (m/push-value machine type-obj)))
+                  machine)
+        ;; Create instance: an empty map with {:type type-obj} metadata
+        instance (with-meta {} {:type type-obj})]
+    (m/push-value machine instance)))
 
 ;; ============================================================
 ;; Special form dispatch
