@@ -180,6 +180,37 @@
                              (clojure.core/deref ref timeout-ms timeout-val)))
                      :meta {:name 'deref}
                      :dynamic? false})
+        ;; Override swap! and reset! to handle SCI type instances with swap/reset methods
+        heap (assoc heap (symbol "clojure.core" "swap!")
+                    {:val (fn sci-swap!
+                            ([ref f]
+                             (if-let [type-obj (:type (clojure.core/meta ref))]
+                               (if (instance? sci.lang.Type type-obj)
+                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                       swap-fn (get methods 'swap)]
+                                   (if swap-fn
+                                     (swap-fn ref f)
+                                     (clojure.core/swap! ref f)))
+                                 (clojure.core/swap! ref f))
+                               (clojure.core/swap! ref f)))
+                            ([ref f a] (clojure.core/swap! ref f a))
+                            ([ref f a b] (clojure.core/swap! ref f a b))
+                            ([ref f a b & args] (apply clojure.core/swap! ref f a b args)))
+                     :meta {:name 'swap!}
+                     :dynamic? false})
+        heap (assoc heap (symbol "clojure.core" "reset!")
+                    {:val (fn sci-reset! [ref v]
+                            (if-let [type-obj (:type (clojure.core/meta ref))]
+                              (if (instance? sci.lang.Type type-obj)
+                                (let [methods (.-methods ^sci.lang.Type type-obj)
+                                      reset-fn (get methods 'reset)]
+                                  (if reset-fn
+                                    (reset-fn ref v)
+                                    (clojure.core/reset! ref v)))
+                                (clojure.core/reset! ref v))
+                              (clojure.core/reset! ref v)))
+                     :meta {:name 'reset!}
+                     :dynamic? false})
         ;; Install user bindings into heap as user/sym vars
         ;; :dynamic? true so thread-local bindings (sci/binding, sci/with-bindings) work.
         ;; Atom-backed vars (from new-dynamic-var) are stored as atoms; resolve-symbol derefs them.

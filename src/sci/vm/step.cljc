@@ -901,7 +901,7 @@
                                      "isDynamic" (boolean (.-dynamic? ^sci.lang.Var f))
                                      "get" (.-val ^sci.lang.Var f)))
                      (m/push-value machine
-                                   (clojure.lang.Reflector/invokeInstanceMethod f method-str (to-array [])))))))
+                                   (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))))
              :cljs
              (throw (ex-info "Interop not supported in CLJS" {})))
           (:new? frame)
@@ -954,9 +954,16 @@
                    (m/push-value machine (first (first args)))
                    (m/push-value machine
                                  (clojure.lang.Reflector/invokeStaticMethod ^Class obj method-str (to-array args))))
-                 ;; Instance method call
+                 ;; Instance method call — fall back to field access if method not found
                  (m/push-value machine
-                               (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))))
+                               (try (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))
+                                    (catch IllegalArgumentException _
+                                      (if (empty? args)
+                                        (clojure.lang.Reflector/invokeNoArgInstanceMember obj method-str false)
+                                        (throw (ex-info (str "No matching method " method-str
+                                                             " found taking " (count args)
+                                                             " args for class " (class obj))
+                                                        {:type :sci/error})))))))
                :cljs
                (throw (ex-info "Interop not supported in CLJS" {}))))
           (:new? frame)
@@ -1265,7 +1272,7 @@
                             :form-meta (meta (:expr frame))})
           (m/push-frame {:op :eval :expr (into {} meta-map)}))
       (if (and (nil? init-expr) (empty? init))
-      (let [ns-sym (:current-ns machine)
+        (let [ns-sym (:current-ns machine)
             qualified (symbol (str ns-sym) (str sym))
             ;; Only create entry if var doesn't already exist (declare semantics)
             heap (if-let [a (:heap-atom machine)] @a (:heap machine))
@@ -3404,8 +3411,8 @@
                                      (when-let [sym (.get ^java.util.IdentityHashMap ir (:f tf))]
                                        (let [entry (get @(:heap-atom machine) sym)
                                              m (or (:meta entry) {})]
-                                         {:ns (symbol (str (or (:ns m) (namespace (str sym)))))
-                                          :name (or (:name m) (symbol (name (str sym))))
+                                         {:ns (symbol (str (or (:ns m) (namespace sym))))
+                                          :name (or (:name m) (symbol (name sym)))
                                           :file (:file m)
                                           :line (:line m)
                                           :column (or (:column m) 1)})))))
