@@ -1995,10 +1995,13 @@
                           (let [qualified (symbol (str ns-sym) (str sym))
                                 heap (if-let [a (:heap-atom m)] @a (:heap m))]
                             (if-let [entry (get heap qualified)]
-                              (let [target-sym (symbol (str current-ns) (str sym))]
+                              (let [target-sym (symbol (str current-ns) (str sym))
+                                    ;; Tag referred entries with original var-sym for syntax-quote
+                                    entry' (update entry :meta
+                                                   #(assoc (or % {}) :sci.impl/var-sym qualified))]
                                 (when-let [a (:heap-atom m)]
-                                  (swap! a assoc target-sym entry))
-                                (assoc-in m [:heap target-sym] entry))
+                                  (swap! a assoc target-sym entry'))
+                                (assoc-in m [:heap target-sym] entry'))
                               m)))
                         m
                         refers))))))

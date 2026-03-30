@@ -20,7 +20,9 @@
 (def ^:private special-forms-sq
   #{'if 'do 'let 'fn 'def 'quote 'var 'loop 'recur
     'try 'catch 'finally 'throw 'new 'set! 'monitor-enter
-    'monitor-exit '& 'binding})
+    'monitor-exit '& 'binding
+    ;; Special reader symbols that should not be namespace-qualified
+    '... '__})
 
 (defn- sq-resolve-class
   "Try to resolve sym as a Java class; returns fully-qualified symbol or nil."
@@ -32,8 +34,10 @@
 
 (defn- make-syntax-quote-resolver
   "Returns a :resolve-symbol fn for edamame syntax-quote.
-   heap-atom may be nil (for contexts without a live heap)."
-  [current-ns heap-atom]
+   heap-atom may be nil (for contexts without a live heap).
+   ns-atom, if provided, supplies :refer-clojure-excludes."
+  ([current-ns heap-atom] (make-syntax-quote-resolver current-ns heap-atom nil))
+  ([current-ns heap-atom ns-atom]
   (fn [sym]
     (let [sym-name (name sym)]
       (cond
@@ -72,20 +76,25 @@
                    (symbol (str current-ns) sym-name)))))
          ;; Java class?
          (sq-resolve-class sym)
-         ;; Host Clojure var (clojure.core etc.)
-         (let [resolved #?(:clj (clojure.core/resolve sym) :cljs nil)]
+         ;; Host Clojure var (clojure.core etc.) — unless excluded via :refer-clojure :exclude
+         (let [excluded? (when ns-atom
+                           (let [excludes (get-in @ns-atom [current-ns :refer-clojure-excludes])]
+                             (and excludes (contains? excludes (symbol sym-name)))))
+               resolved (when-not excluded?
+                          #?(:clj (clojure.core/resolve sym) :cljs nil))]
            (when resolved
              (let [m (meta resolved)]
                (symbol (str (:ns m)) (str (:name m))))))
          ;; Default: qualify with current ns
-         (symbol (str current-ns) sym-name))))))
+         (symbol (str current-ns) sym-name)))))))
 
 (defn- make-reader-opts
   "Create edamame reader options, optionally with a current namespace for ::keyword resolution."
-  ([] (make-reader-opts 'user nil nil))
-  ([current-ns] (make-reader-opts current-ns nil nil))
-  ([current-ns ns-aliases] (make-reader-opts current-ns ns-aliases nil))
-  ([current-ns ns-aliases heap-atom]
+  ([] (make-reader-opts 'user nil nil nil))
+  ([current-ns] (make-reader-opts current-ns nil nil nil))
+  ([current-ns ns-aliases] (make-reader-opts current-ns ns-aliases nil nil))
+  ([current-ns ns-aliases heap-atom] (make-reader-opts current-ns ns-aliases heap-atom nil))
+  ([current-ns ns-aliases heap-atom ns-atom]
    {:all true
     :row-key :line
     :col-key :column
@@ -96,7 +105,7 @@
     :features #{:clj}
     :fn true
     :quote true
-    :syntax-quote {:resolve-symbol (make-syntax-quote-resolver current-ns heap-atom)}
+    :syntax-quote {:resolve-symbol (make-syntax-quote-resolver current-ns heap-atom ns-atom)}
     :var true
     :deref true
     :regex true
@@ -363,8 +372,10 @@
              (if macro-entry
                (let [mv (:val macro-entry)
                      mf (if (var? mv) @mv mv)]
-                 (if (var? mv)
+                 (if (or (var? mv) (:sci/closure (meta mf)))
+                   ;; Host macros (Clojure vars) and SCI closures (defmacro) get &form &env
                    (apply mf form {} (rest form))
+                   ;; Internal SCI functions (not closures): just args
                    (apply mf (rest form))))
                form))))))
     ([env form]
@@ -976,7 +987,7 @@
              ns-atom (or (:ns-atom ctx) (atom {}))
              ns-info (get @ns-atom current-ns)
              aliases (:aliases ns-info)
-             read-opts (merge (make-reader-opts current-ns aliases (:heap-atom ctx)) reader-extra {:eof eof})
+             read-opts (merge (make-reader-opts current-ns aliases (:heap-atom ctx) ns-atom) reader-extra {:eof eof})
              form (edamame/parse-next reader read-opts)]
          (if (identical? form eof)
            (if (and (map? result) (contains? #{:suspend :effect} (:status result)))
