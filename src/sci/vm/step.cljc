@@ -150,11 +150,19 @@
            (try
              (clojure.lang.Reflector/invokeStaticMethod
               klass member-name (to-array []))
-             (catch Exception _
-               ;; Fall back to wrapper fn for multi-arg static methods
-               (fn [& args]
-                 (clojure.lang.Reflector/invokeStaticMethod
-                  klass member-name (to-array args))))))))))
+             (catch Exception e
+               ;; Check if ANY static method with this name exists — if so, wrap as fn
+               ;; Otherwise, throw (the member truly doesn't exist)
+               (let [methods (.getMethods ^Class klass)]
+                 (if (some #(and (java.lang.reflect.Modifier/isStatic (.getModifiers ^java.lang.reflect.Method %))
+                                 (= member-name (.getName ^java.lang.reflect.Method %)))
+                           methods)
+                   ;; Method exists but needs args — return wrapper fn
+                   (fn [& args]
+                     (clojure.lang.Reflector/invokeStaticMethod
+                      klass member-name (to-array args)))
+                   ;; No such static member at all
+                   (throw e))))))))))
 
 (defn resolve-symbol [machine sym]
   (let [env (:env machine)]
@@ -1375,12 +1383,12 @@
               (vary-meta val assoc :name sym :ns ns-sym :sci/def-named true)
               val)
         meta-map (:meta-map frame)
-        ;; Merge with existing metadata — preserves :arglists/:doc set by deftype* constructors
-        ;; when the host deftype macro expansion re-defs ->TypeName
-        heap (if-let [a (:heap-atom machine)] @a (:heap machine))
-        existing-meta (:meta (get heap qualified))
+        ;; Preserve :arglists/:doc from existing entry — deftype* constructors set these
+        ;; before the host deftype macro expansion re-defs ->TypeName
+        heap-for-meta (if-let [a (:heap-atom machine)] @a (:heap machine))
+        existing-meta (:meta (get heap-for-meta qualified))
         meta-map (if existing-meta
-                   (merge existing-meta meta-map)
+                   (merge (select-keys existing-meta [:arglists :doc]) meta-map)
                    meta-map)
         entry {:val val :meta meta-map :dynamic? (:dynamic meta-map) :bound? true
                :const? (boolean (:const meta-map))
