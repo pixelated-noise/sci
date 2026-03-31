@@ -132,14 +132,17 @@
            {:type :class-ref :name (.getName ^Class x)}
 
            ;; Atom (from multimethods, protocols, etc.)
-           ;; Check for cycle (protocol impls atom → closures → env → protocol → impls atom)
+           ;; Atom — assign unique ID for identity preservation across references.
+           ;; If already seen, emit a back-reference to the same ID.
            (and (instance? clojure.lang.Atom x) (.containsKey seen x))
            (.get seen x)
 
            (instance? clojure.lang.Atom x)
-           (let [ref {:type :atom-ref :val nil}]
-             (.put seen x ref)
-             {:type :atom-ref :val (replace-unserializable @x inverse-reg seen)})
+           (let [id (str (java.util.UUID/randomUUID))
+                 back-ref {:type :atom-back-ref :id id}]
+             ;; Register back-ref BEFORE recursing to break cycles
+             (.put seen x back-ref)
+             {:type :atom-ref :id id :val (replace-unserializable @x inverse-reg seen)})
 
            ;; Namespace object — serialize as symbol
            (instance? clojure.lang.Namespace x)
@@ -183,11 +186,13 @@
      (let [heap (:heap machine)
            inverse-reg (host/inverse-registry heap)
            u-heap (user-heap heap)
+           ;; Shared seen map so atoms/fns in user-heap and state get the same IDs
+           seen (java.util.IdentityHashMap.)
            ;; Build the serializable state
            state (-> machine
                      (dissoc :heap-atom :heap :inverse-registry :ctx :ns-atom :current-ns-atom :hierarchy-atom)
-                     (assoc :user-heap (replace-unserializable u-heap inverse-reg)))
-           state (replace-unserializable state inverse-reg)]
+                     (assoc :user-heap (replace-unserializable u-heap inverse-reg seen)))
+           state (replace-unserializable state inverse-reg seen)]
        (pr-str (assoc state :version 1)))
      :cljs
      (throw (ex-info "freeze is not yet supported in ClojureScript" {}))))
@@ -199,8 +204,9 @@
 #?(:clj
    (defn- restore-serialized
      "Walk a data structure, replacing tagged maps back to live objects.
-      type-registry is an atom mapping type-name strings to shared sci.lang.Type objects."
-     [data full-heap type-registry]
+      type-registry is an atom mapping type-name strings to shared sci.lang.Type objects.
+      atom-registry is an atom mapping atom IDs to shared atom objects (identity preservation)."
+     [data full-heap type-registry atom-registry]
      (walk/postwalk
       (fn [x]
         (if-not (map? x)
@@ -241,22 +247,25 @@
             (Class/forName (:name x))
 
             :atom-ref
-            (atom (:val x))
+            (let [a (atom (:val x))]
+              (when-let [id (:id x)]
+                (swap! atom-registry assoc id a))
+              a)
+
+            :atom-back-ref
+            (let [id (:id x)]
+              (or (get @atom-registry id)
+                  (let [a (atom nil)]
+                    (swap! atom-registry assoc id a)
+                    a)))
 
             :ns-ref
             (let [ns-sym (symbol (:name x))]
               (or (clojure.core/find-ns ns-sym) ns-sym))
 
-            :comp-fn
-            (let [fns (:fns x)
-                  sci-comp (:val (get full-heap 'clojure.core/comp))]
-              (apply sci-comp fns))
-
-            :partial-fn
-            (let [f (:f x)
-                  args (:args x)
-                  sci-partial (:val (get full-heap 'clojure.core/partial))]
-              (apply sci-partial f args))
+            ;; comp/partial — deferred to second pass (fns may be closure maps)
+            :comp-fn x
+            :partial-fn x
 
             ;; Multimethod — deferred to second pass (methods may contain closures)
             :multimethod
@@ -312,6 +321,17 @@
           (case (:type x)
             :closure
             (step/make-callable-closure x machine)
+
+            :comp-fn
+            (let [fns (:fns x)
+                  sci-comp (:val (get (:heap machine) 'clojure.core/comp))]
+              (apply sci-comp fns))
+
+            :partial-fn
+            (let [f (:f x)
+                  args (:args x)
+                  sci-partial (:val (get (:heap machine) 'clojure.core/partial))]
+              (apply sci-partial f args))
 
             :multimethod
             (let [mm-name (symbol (:name x))
@@ -456,13 +476,14 @@
   [edn-str]
   #?(:clj
      (let [state (edn/read-string edn-str)
-           ;; Shared type registry — ensures all refs to the same type get the same object
+           ;; Shared registries — ensure identity preservation across references
            type-registry (atom {})
+           atom-registry (atom {})
            ;; Rebuild the full heap: host defaults + user heap
            host-heap (host/default-heap)
            raw-user-heap (:user-heap state)
            ;; First pass: restore host-fn-refs, var-refs, class-refs, atoms in user heap
-           restored-user-heap (restore-serialized raw-user-heap host-heap type-registry)
+           restored-user-heap (restore-serialized raw-user-heap host-heap type-registry atom-registry)
            full-heap (merge host-heap restored-user-heap)
            heap-atom (atom full-heap)
            ;; Build a minimal machine for closure wrapping
@@ -480,7 +501,7 @@
            ;; Restore the rest of the machine state (stack, env, bindings, etc.)
            restored-state (-> state
                               (dissoc :user-heap :version)
-                              (restore-serialized full-heap type-registry))
+                              (restore-serialized full-heap type-registry atom-registry))
            ;; Second pass on state: wrap closures and protocol dispatch refs
            restored-state (wrap-closures restored-state minimal-machine)]
        (-> restored-state

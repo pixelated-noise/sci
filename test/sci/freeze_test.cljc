@@ -628,7 +628,7 @@
           result (sci/resume thawed)]
       (is (= "Rex the Lab" result)))))
 
-(deftest ^:known-limitation freeze-thaw-comp-user-fns
+(deftest freeze-thaw-comp-user-fns
   (testing "comp of user-defined fns should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defn my-double [x] (* 2 x))
@@ -641,7 +641,7 @@
           result (sci/resume thawed)]
       (is (= 12 result)))))
 
-(deftest ^:known-limitation freeze-thaw-partial-user-fn
+(deftest freeze-thaw-partial-user-fn
   (testing "partial of user-defined fn should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defn add [a b] (+ a b))
@@ -653,7 +653,7 @@
           result (sci/resume thawed)]
       (is (= 15 result)))))
 
-(deftest ^:known-limitation freeze-thaw-atom-identity-in-closure
+(deftest freeze-thaw-atom-identity-in-closure
   (testing "atom identity should be preserved across closure env boundaries"
     (let [m (eval-suspend
              "(do (let [counter (atom 0)]
