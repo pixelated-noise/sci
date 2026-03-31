@@ -462,9 +462,9 @@
             (= :let bind)
             `(let ~expr (for ~(vec more) ~body-expr))
             (= :when bind)
-            `(if ~expr (for ~(vec more) ~body-expr) ())
+            `(if ~expr (for ~(vec more) ~body-expr) (list))
             (= :while bind)
-            `(if ~expr (for ~(vec more) ~body-expr) ()))
+            `(if ~expr (for ~(vec more) ~body-expr) (list)))
           `(mapcat (fn [~bind] (for ~(vec more) ~body-expr)) ~expr))))))
 
 (defn- comment-impl [_ _ & _body] nil)
