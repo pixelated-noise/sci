@@ -48,6 +48,12 @@
           result (sci/resume m)]
       (is (= 2 result)))))
 
+(deftest suspend-in-vector
+  (testing "suspend! as an element of a vector literal"
+    (let [m (eval-suspend "[(suspend!) 2 3]")
+          result (sci/resume m :a)]
+      (is (= [:a 2 3] result)))))
+
 ;; ============================================================
 ;; Freeze/thaw round-trip
 ;; ============================================================
@@ -59,6 +65,14 @@
           thawed (freeze/thaw frozen)
           result (sci/resume thawed)]
       (is (= 2 result)))))
+
+(deftest freeze-thaw-suspend-in-vector
+  (testing "suspend! inside a vector literal survives freeze/thaw"
+    (let [m (eval-suspend "[(suspend!) 2 3]")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed :a)]
+      (is (= [:a 2 3] result)))))
 
 (deftest freeze-produces-valid-edn
   (testing "frozen output is valid EDN"
