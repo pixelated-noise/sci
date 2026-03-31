@@ -1,5 +1,6 @@
 (ns sci.lang
   "Core SCI types: Var, Namespace, Type."
+  #?(:cljs (:refer-clojure :exclude [Namespace Var ->Namespace ->Var]))
   (:require [sci.impl.types :as types]))
 
 ;; Type — represents deftype/defrecord types in SCI

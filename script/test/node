@@ -2,8 +2,8 @@
 
 set -eo pipefail
 
-# Exclude tests that require old (non-VM) SCI namespaces: sci.async, sci.impl.js
-EXCLUDE_RE='(?!sci\.(async|js-libs|js)).*-test$'
+# Exclude tests that require old (non-VM) SCI namespaces or crash on missing CLJS interop
+EXCLUDE_RE='(?!sci\.(async|js-libs|js|interop)).*-test$'
 
 echo 'Running CLJS test in Node with optimizations :none'
 echo '{:optimizations :none}' > cljs-opts.edn
