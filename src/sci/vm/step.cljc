@@ -348,11 +348,10 @@
                          ;; Check :classes config for CLJS
                          (let [classes (:classes machine)
                                ;; js/* prefix → look up in the js object from :classes config
+                               ;; Default to js/globalThis when no :classes config or :allow :all
                                js-val (when (= (str resolved-ns) "js")
                                          (let [js-obj (or (get classes 'js)
-                                                          (when (= :all classes) js/globalThis)
-                                                          (when (and (map? classes) (= :all (:allow classes)))
-                                                            js/globalThis))]
+                                                          js/globalThis)]
                                            (when js-obj
                                              (gobject/get js-obj sym-name))))
                                class-val (when (and (nil? js-val) (map? classes))
@@ -3833,8 +3832,10 @@
                          (throw (ex-info (str "Unable to resolve symbol: " frm " in this context")
                                          {:type :sci/error :sym frm :phase "analysis"})))
                        :cljs
-                       (throw (ex-info (str "Unable to resolve symbol: " frm " in this context")
-                                       {:type :sci/error :sym frm :phase "analysis"})))
+                       (let [sym-ns (namespace frm)]
+                         (when-not (and sym-ns (= "js" sym-ns))
+                           (throw (ex-info (str "Unable to resolve symbol: " frm " in this context")
+                                           {:type :sci/error :sym frm :phase "analysis"})))))
                     ;; In heap but is a macro — can't take value
                     (:macro? entry)
                     (throw (ex-info (str "Can't take value of a macro: " frm)

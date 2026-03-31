@@ -113,14 +113,15 @@
                              (destructure-binding
                               sym (if default `(get ~gs '~sym ~default) `(get ~gs '~sym))))))
                    binds (:syms pattern))
-            ;; Handle regular key-value pairs: {local-sym :key}
+            ;; Handle regular key-value pairs: {local-sym lookup-key}
+            ;; In Clojure: {foo-val k} means bind foo-val to (get map k)
             binds (reduce
-                   (fn [binds [k v]]
-                     (if (#{:keys :strs :syms :or :as} k)
+                   (fn [binds [local-sym lookup-key]]
+                     (if (#{:keys :strs :syms :or :as} local-sym)
                        binds
-                       (let [default (get or-map v)]
+                       (let [default (get or-map local-sym)]
                          (into binds
-                               (destructure-binding v (if default `(get ~gs ~k ~default) `(get ~gs ~k)))))))
+                               (destructure-binding local-sym (if default `(get ~gs ~lookup-key ~default) `(get ~gs ~lookup-key)))))))
                    binds pattern)
             ;; Handle :as
             binds (if as-sym (into binds [as-sym gs]) binds)]
@@ -553,6 +554,33 @@
   ;; In SCI context, try to resolve it and check
   (list 'clojure.core/some? (list 'try sym (list 'catch 'js/Error '_ nil))))
 
+(defn- time-impl [_ _ expr]
+  ;; (time expr) → prints elapsed time, returns value
+  (let [start (gensym "start__")
+        ret (gensym "ret__")]
+    (list 'let* [start (list 'cljs.core/system-time)
+                 ret expr]
+          (list 'prn (list 'str "\"Elapsed time: \""
+                           (list '- (list 'cljs.core/system-time) start)
+                           "\" msecs\""))
+          ret)))
+
+(defn- memfn-impl [_ _ method-name & args]
+  ;; (memfn method arg1 arg2) → (fn [target arg1 arg2] (. target method arg1 arg2))
+  (let [target (gensym "target__")]
+    (list 'fn* (vec (cons target args))
+          (list '. target (cons method-name args)))))
+
+(defn- amap-impl [_ _ a idx ret expr]
+  ;; (amap a idx ret expr) → clone array, loop filling with expr
+  (list 'let* [ret (list 'clojure.core/aclone a)]
+        (list 'loop* [idx (list 'int 0)]
+              (list 'if (list '< idx (list 'clojure.core/alength ret))
+                    (list 'do
+                          (list 'clojure.core/aset ret idx expr)
+                          (list 'recur (list 'inc idx)))
+                    ret))))
+
 ;; ============================================================
 ;; clojure.core function registry for CLJS
 ;; ============================================================
@@ -562,7 +590,7 @@
      "Returns a map of qualified-symbol -> heap-entry for clojure.core functions."
      []
      (let [fns {'= = '< < '<= <= '> > '>= >= '+ + '- - '* * '/ /
-                '== == 'aget aget 'alength alength 'apply apply
+                '== == 'aclone aclone 'aget aget 'alength alength 'aset aset 'apply apply
                 'assoc assoc 'assoc-in assoc-in 'associative? associative?
                 'array-map array-map 'atom atom
                 'bit-and-not bit-and-not 'bit-set bit-set
@@ -584,21 +612,23 @@
                 'compare-and-set! compare-and-set!
                 'dec dec 'dedupe dedupe 'deref deref
                 'dissoc dissoc 'distinct distinct 'distinct? distinct?
-                'disj disj 'double double 'double? double?
+                'disj disj 'doall doall 'dorun dorun
+                'double double 'double? double?
                 'drop drop 'drop-last drop-last 'drop-while drop-while
                 'eduction eduction 'empty empty 'empty? empty?
                 'even? even? 'every? every? 'every-pred every-pred
                 'ensure-reduced ensure-reduced 'ex-info ex-info
                 'ex-message ex-message 'ex-data ex-data 'ex-cause ex-cause
-                'first first 'float? float? 'fnil fnil
+                'first first 'float float 'float? float? 'fnil fnil
                 'fnext fnext 'ffirst ffirst 'flatten flatten
                 'false? false? 'filter filter 'filterv filterv
-                'find find 'frequencies frequencies 'fn? fn?
+                'find find 'frequencies frequencies 'fn? fn? 'ifn? ifn?
                 'get get 'get-in get-in 'group-by group-by
                 'gensym gensym 'hash hash 'hash-map hash-map
                 'hash-set hash-set 'hash-unordered-coll hash-unordered-coll
                 'ident? ident? 'identical? identical? 'identity identity
                 'inc inc 'int-array int-array 'interleave interleave
+                'js-in js-in
                 'into into 'iterate iterate 'int int 'int? int?
                 'interpose interpose 'indexed? indexed?
                 'integer? integer? 'into-array into-array
@@ -608,7 +638,7 @@
                 'long-array long-array
                 'map clojure.core/map 'map? map? 'map-indexed map-indexed
                 'map-entry? map-entry? 'mapv mapv 'mapcat mapcat
-                'max max 'max-key max-key 'meta meta
+                'max max 'max-key max-key 'memoize memoize 'meta meta
                 'merge merge 'merge-with merge-with
                 'min min 'min-key min-key 'munge munge 'mod mod
                 'make-array make-array 'name name
@@ -653,7 +683,7 @@
                 'special-symbol? special-symbol? 'subvec subvec
                 'some-fn some-fn 'some some
                 'split-at split-at 'split-with split-with
-                'sorted-set sorted-set 'subseq subseq
+                'sorted-set sorted-set 'subseq subseq 'system-time system-time
                 'sorted-set-by sorted-set-by
                 'sorted-map-by sorted-map-by
                 'sorted-map sorted-map 'sorted? sorted?
@@ -664,7 +694,7 @@
                 'trampoline trampoline 'transduce transduce
                 'tree-seq tree-seq
                 'type clojure.core/type
-                'true? true? 'to-array to-array
+                'true? true? 'to-array to-array 'to-array-2d to-array-2d
                 'update update 'update-in update-in
                 'uri? uri? 'uuid? uuid?
                 'unchecked-inc-int unchecked-inc-int
@@ -762,6 +792,9 @@
                    'delay      delay-impl
                    'reify      reify-impl
                    'exists?    exists?-impl
+                   'time       time-impl
+                   'memfn      memfn-impl
+                   'amap       amap-impl
                    'import     import-impl
                    'with-redefs with-redefs-impl
                    'with-local-vars with-local-vars-impl}]
