@@ -741,10 +741,10 @@
       (is (= [3 5 3] result)))))
 
 ;; ============================================================
-;; Known limitations — data types
+;; Data types
 ;; ============================================================
 
-(deftest ^:known-limitation freeze-thaw-sorted-set
+(deftest freeze-thaw-sorted-set
   (testing "sorted-set ordering should be preserved after freeze/thaw"
     (let [m (eval-suspend
              "(let [s (sorted-set 5 3 1 4 2)]
@@ -755,7 +755,7 @@
           result (sci/resume thawed)]
       (is (= [1 2 3 4 5] result)))))
 
-(deftest ^:known-limitation freeze-thaw-delay
+(deftest freeze-thaw-delay
   (testing "delay should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [d (delay (+ 1 2))]
@@ -766,7 +766,7 @@
           result (sci/resume thawed)]
       (is (= 3 result)))))
 
-(deftest ^:known-limitation freeze-thaw-volatile
+(deftest freeze-thaw-volatile
   (testing "volatile should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [v (volatile! 42)]

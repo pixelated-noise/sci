@@ -378,6 +378,18 @@
                            {:sci/fnil-f f :sci/fnil-defaults [x y z]})))
                  :meta {:name 'fnil :doc (:doc (meta #'clojure.core/fnil))}})
          :cljs identity)
+      ;; Override delay so the inner fn is an SCI closure (serializable for freeze/thaw).
+      ;; The host delay macro expands to (new Delay (fn* [] body)) — fn* produces a JVM
+      ;; closure that freeze can't serialize. Using fn instead creates an SCI closure.
+      #?(:clj
+         (assoc 'clojure.core/delay
+                {:val (fn [form _env & _]
+                        (let [body (rest form)]
+                          `(new clojure.lang.Delay (fn [] ~@body))))
+                 :meta {:name 'delay :macro true :doc (:doc (meta #'clojure.core/delay))}
+                 :macro? true
+                 :host-macro? true})
+         :cljs identity)
       ;; Override assert with a runtime check so (set! *assert* false) takes effect.
       ;; The host clojure.core/assert macro checks *assert* at expansion time, not runtime.
       ;; Our override always emits (when *assert* ...), letting the VM evaluate *assert*

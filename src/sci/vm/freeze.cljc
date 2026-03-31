@@ -207,6 +207,29 @@
            (instance? sci.lang.Type x)
            {:type :sci-type-ref :name (str x)}
 
+           ;; Sorted set — preserve ordering by serializing as sorted vector
+           (instance? clojure.lang.PersistentTreeSet x)
+           {:type :sorted-set :items (vec x)}
+
+           ;; Sorted map — preserve ordering by serializing as sorted key-value pairs
+           (instance? clojure.lang.PersistentTreeMap x)
+           {:type :sorted-map :items (vec (mapcat identity x))}
+
+           ;; Delay — serialize the realized value or the inner fn (for unrealized delays)
+           (instance? clojure.lang.Delay x)
+           (if (realized? x)
+             {:type :delay-ref :realized? true
+              :val (replace-unserializable @x inverse-reg seen)}
+             (let [fld (doto (.getDeclaredField clojure.lang.Delay "fn")
+                         (.setAccessible true))
+                   inner-fn (.get fld x)]
+               {:type :delay-ref :realized? false
+                :fn (replace-unserializable inner-fn inverse-reg seen)}))
+
+           ;; Volatile — serialize current value
+           (instance? clojure.lang.Volatile x)
+           {:type :volatile-ref :val (replace-unserializable @x inverse-reg seen)}
+
            ;; Any other non-serializable object — store class name for reconstruction
            (and (not (or (string? x) (number? x) (keyword? x) (symbol? x)
                          (nil? x) (boolean? x) (map? x) (vector? x)
@@ -318,6 +341,20 @@
             (let [ns-sym (symbol (:name x))]
               (or (clojure.core/find-ns ns-sym) ns-sym))
 
+            :sorted-set
+            (apply sorted-set (:items x))
+
+            :sorted-map
+            (apply sorted-map (:items x))
+
+            :delay-ref
+            (if (:realized? x)
+              (let [v (:val x)] (delay v))
+              x) ;; unrealized delay — deferred to wrap-closures (inner fn may be closure map)
+
+            :volatile-ref
+            (volatile! (:val x))
+
             ;; HOF results — deferred to second pass (inner fns may be closure maps)
             :comp-fn x
             :partial-fn x
@@ -424,6 +461,11 @@
             :fnil-fn
             (let [sci-fnil (:val (get (:heap machine) 'clojure.core/fnil))]
               (apply sci-fnil (:f x) (:defaults x)))
+
+            :delay-ref
+            ;; Unrealized delay — inner fn is now a wrapped closure
+            (let [inner-fn (:fn x)]
+              (clojure.lang.Delay. ^clojure.lang.IFn inner-fn))
 
             :multimethod
             (let [mm-name (symbol (:name x))
