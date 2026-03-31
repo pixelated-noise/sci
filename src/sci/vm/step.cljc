@@ -6,7 +6,7 @@
             [clojure.string]
             [edamame.core :as edamame]))
 
-(declare match-arity bind-params run check-permission form-location do-extend)
+(declare match-arity bind-params run check-permission form-location do-extend try-resolve-sci-type)
 
 ;; Thread-local dynamic bindings for closures called from host code (e.g. via map).
 ;; Using a dynamic var ensures each thread (future/test) has isolated bindings.
@@ -244,6 +244,8 @@
                               (if-let [type-obj (get-in machine [:ns ns-sym :types (symbol sym-name)])]
                                 type-obj
                                 #?(:clj (or (try-resolve-class sym-name)
+                                            ;; Try dotted SCI type (e.g. foo.Foo → ns foo, type Foo)
+                                            (try-resolve-sci-type machine sym-name)
                                             (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                             {:type :sci/error :sym sym :phase "analysis"})))
                                    :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
@@ -2899,7 +2901,18 @@
           var      (step-eval-var machine frame)
           case*    (step-eval-case machine frame)
           set!     (step-eval-set! machine frame)
-          new      (step-eval-new machine frame)
+          new      (if (qualified-symbol? raw-head)
+                     ;; Clojure 1.12: (String/new args...) → treat as (new String args...)
+                     (let [class-sym (symbol (namespace raw-head))
+                           args (rest (:expr frame))]
+                       (-> machine
+                           (m/replace-frame {:op :eval-args
+                                             :pending (vec args)
+                                             :done []
+                                             :phase :eval-f
+                                             :new? true})
+                           (m/push-frame {:op :eval :expr class-sym})))
+                     (step-eval-new machine frame))
           .        (step-eval-dot machine frame)
           import*  (step-eval-import machine frame)
           letfn*   (step-eval-letfn machine frame)
