@@ -1415,6 +1415,26 @@
                      :meta {:macro true :name 'deftype}
                      :macro? true
                      :host-macro? true}
+                    ;; = — records of different types must not be equal
+                    (symbol "clojure.core" "=")
+                    {:val (fn sci-equals
+                            ([] true)
+                            ([x] true)
+                            ([x y]
+                             (let [xm (clojure.core/meta x)
+                                   ym (clojure.core/meta y)]
+                               (if (or (:sci.impl/record xm) (:sci.impl/record ym))
+                                 ;; At least one is a record — types must match
+                                 (and (= (:type xm) (:type ym))
+                                      (clojure.core/= x y))
+                                 (clojure.core/= x y))))
+                            ([x y & more]
+                             (if (sci-equals x y)
+                               (if (next more)
+                                 (recur y (first more) (next more))
+                                 (sci-equals y (first more)))
+                               false)))
+                     :meta {:name '=}}
                     ;; instance? — check SCI types too
                     (symbol "clojure.core" "instance?")
                     {:val (fn [cls obj]
@@ -1521,6 +1541,62 @@
                                   (when (seq cleaned) cleaned))
                                 :else m)))
                      :meta {:name 'meta :doc #?(:clj (:doc (meta #'clojure.core/meta)) :cljs nil)}}
+                    ;; dissoc — handle SCI records: removing basis fields downgrades to plain map
+                    (symbol "clojure.core" "dissoc")
+                    (let [dissoc1 (fn [m k]
+                                    (let [md (clojure.core/meta m)
+                                          result (clojure.core/dissoc m k)]
+                                      (if (and md (:sci.impl/record md))
+                                        (let [type-obj (:type md)
+                                              basis-fields (when (instance? sci.lang.Type type-obj)
+                                                             (set (map keyword (.-fields ^sci.lang.Type type-obj))))]
+                                          (if (and basis-fields (contains? basis-fields k))
+                                            (with-meta result (dissoc md :type :sci.impl/record))
+                                            result))
+                                        result)))]
+                      {:val (fn
+                              ([m] m)
+                              ([m k] (dissoc1 m k))
+                              ([m k & ks] (reduce dissoc1 (dissoc1 m k) ks)))
+                       :meta {:name 'dissoc}})
+                    ;; pr-str — handle SCI records and vars
+                    (symbol "clojure.core" "pr-str")
+                    {:val (fn [& args]
+                            (clojure.string/join " "
+                              (map (fn [x]
+                                     (let [m (clojure.core/meta x)]
+                                       (cond
+                                         ;; SCI record — print as #ns.Name{...}
+                                         (:sci.impl/record m)
+                                         (let [type-obj (:type m)
+                                               type-name (when (instance? sci.lang.Type type-obj)
+                                                           (.-name ^sci.lang.Type type-obj))]
+                                           (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
+                                         ;; SCI Var — print as #'ns/name
+                                         (instance? sci.lang.Var x)
+                                         (let [sym (.-sym ^sci.lang.Var x)]
+                                           (str "#'" sym))
+                                         :else (clojure.core/pr-str x))))
+                                   args)))
+                     :meta {:name 'pr-str}}
+                    ;; print-str — like pr-str for print-str
+                    (symbol "clojure.core" "print-str")
+                    {:val (fn [& args]
+                            (clojure.string/join " "
+                              (map (fn [x]
+                                     (let [m (clojure.core/meta x)]
+                                       (cond
+                                         (:sci.impl/record m)
+                                         (let [type-obj (:type m)
+                                               type-name (when (instance? sci.lang.Type type-obj)
+                                                           (.-name ^sci.lang.Type type-obj))]
+                                           (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
+                                         (instance? sci.lang.Var x)
+                                         (let [sym (.-sym ^sci.lang.Var x)]
+                                           (str "#'" sym))
+                                         :else (clojure.core/print-str x))))
+                                   args)))
+                     :meta {:name 'print-str}}
                     ;; class? — true for SCI types too
                     (symbol "clojure.core" "class?")
                     {:val (fn [x]
