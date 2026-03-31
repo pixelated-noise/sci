@@ -183,8 +183,8 @@
              {:type :var-ref :id (str (symbol x))})
 
            ;; Class reference
-           (class? x)
-           {:type :class-ref :name (.getName ^Class x)}
+           #?(:clj (class? x) :cljs (fn? x))
+           {:type :class-ref :name #?(:clj (.getName ^Class x) :cljs (.-name x))}
 
            ;; Atom (from multimethods, protocols, etc.)
            ;; Atom — assign unique ID for identity preservation across references.
@@ -254,9 +254,9 @@
                 (not (fn? x))
                 (not (var? x))
                 (not (instance? sci.lang.Var x))
-                (not (class? x))
-                (not (instance? clojure.lang.Atom x))
-                (not (instance? clojure.lang.Namespace x)))
+                (not #?(:clj (class? x) :cljs (fn? x)))
+                (not (instance? #?(:clj clojure.lang.Atom :cljs cljs.core/Atom) x))
+                #?(:clj (not (instance? clojure.lang.Namespace x)) :cljs true))
            {:type :with-meta
             :value (with-meta x nil)
             :meta (replace-unserializable (meta x) inverse-reg seen)}

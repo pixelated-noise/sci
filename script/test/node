@@ -2,10 +2,13 @@
 
 set -eo pipefail
 
+# Exclude tests that require old (non-VM) SCI namespaces: sci.async, sci.impl.js
+EXCLUDE_RE='(?!sci\.(async|js-libs|js)).*-test$'
+
 echo 'Running CLJS test in Node with optimizations :none'
 echo '{:optimizations :none}' > cljs-opts.edn
-clojure -M:test:cljs-test-runner -c cljs-opts.edn $@
+clojure -M:test:cljs-test-runner -c cljs-opts.edn -r "$EXCLUDE_RE" $@
 
 echo 'Running CLJS test in Node with optimizations :advanced'
 echo '{:optimizations :advanced}' > cljs-opts.edn
-clojure -M:test:cljs-test-runner -c cljs-opts.edn $@
+clojure -M:test:cljs-test-runner -c cljs-opts.edn -r "$EXCLUDE_RE" $@

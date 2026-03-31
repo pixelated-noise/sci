@@ -2405,16 +2405,17 @@
                         (apply meta-fn args)
                         (let [impl (or direct-impl
                                        (when (:sci.impl/record (clojure.core/meta target))
-                                         (or (get impls clojure.lang.IRecord)
-                                             (get impls clojure.lang.IPersistentMap)))
+                                         #?(:clj (or (get impls clojure.lang.IRecord)
+                                                     (get impls clojure.lang.IPersistentMap))
+                                            :cljs nil))
                                        (some (fn [[t impl]]
-                                               (when (and (class? t)
-                                                          (not= t Object)
+                                               (when (and #?(:clj (class? t) :cljs (fn? t))
+                                                          (not= t #?(:clj Object :cljs js/Object))
                                                           (instance? t target))
                                                  impl))
                                              impls)
                                        (when (nil? target) (get impls nil))
-                                       (get impls Object)
+                                       (get impls #?(:clj Object :cljs js/Object))
                                        (get impls :default))]
                           (if-let [f (or (get impl mname)
                                          (get impl (keyword mname))
