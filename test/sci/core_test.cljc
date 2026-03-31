@@ -4,7 +4,7 @@
    [clojure.edn :as edn]
    [clojure.string :as str]
    [clojure.test :as test :refer [deftest is testing]]
-   [sci.copy-ns-test-ns]
+   #?(:clj [sci.copy-ns-test-ns])
    [sci.core :as sci]
    [sci.impl.unrestrict :as unrestrict]
    [sci.test-utils :as tu]))
@@ -1339,34 +1339,35 @@
 (def ^:dynamic *foo* 1)
 (defn always-foo [& _args] :foo)
 
-(deftest copy-var-test
-  (let [foo-ns (sci/create-ns 'foo)
-        do-twice-var (sci/copy-var do-twice foo-ns)
-        do-twice*-var (sci/copy-var do-twice* foo-ns)
-        foo-var (sci/copy-var *foo* foo-ns)
-        always-foo-var (sci/copy-var always-foo foo-ns)
-        opts {:namespaces {'foo {'do-twice do-twice-var
-                                 'do-twice* do-twice*-var
-                                 '*foo* foo-var
-                                 'always-foo always-foo-var}}}
-        effects (sci/with-out-str (sci/eval-string "
+#?(:clj
+   (deftest copy-var-test
+     (let [foo-ns (sci/create-ns 'foo)
+           do-twice-var (sci/copy-var do-twice foo-ns)
+           do-twice*-var (sci/copy-var do-twice* foo-ns)
+           foo-var (sci/copy-var *foo* foo-ns)
+           always-foo-var (sci/copy-var always-foo foo-ns)
+           opts {:namespaces {'foo {'do-twice do-twice-var
+                                    'do-twice* do-twice*-var
+                                    '*foo* foo-var
+                                    'always-foo always-foo-var}}}
+           effects (sci/with-out-str (sci/eval-string "
 (foo/do-twice (prn 1))
 (foo/do-twice* (prn 1))
 (prn (foo/always-foo))
 (prn foo/*foo*)
 (binding [foo/*foo* 10] (prn foo/*foo*))" opts))
-        do-twice-doc (sci/with-out-str (sci/eval-string "(clojure.repl/doc foo/do-twice)" opts))
-        always-foo-doc (sci/with-out-str (sci/eval-string "(clojure.repl/doc foo/always-foo)" opts))]
-    (is (= "1\n1\n1\n1\n:foo\n1\n10\n" effects))
-    (is (= "-------------------------\nfoo/do-twice\n([x])\nMacro\n" do-twice-doc))
-    (is (= "-------------------------\nfoo/always-foo\n([& _args])\n" always-foo-doc))))
+           do-twice-doc (sci/with-out-str (sci/eval-string "(clojure.repl/doc foo/do-twice)" opts))
+           always-foo-doc (sci/with-out-str (sci/eval-string "(clojure.repl/doc foo/always-foo)" opts))]
+       (is (= "1\n1\n1\n1\n:foo\n1\n10\n" effects))
+       (is (= "-------------------------\nfoo/do-twice\n([x])\nMacro\n" do-twice-doc))
+       (is (= "-------------------------\nfoo/always-foo\n([& _args])\n" always-foo-doc)))))
 
 (defn- private-fn [] :private)
 
-(deftest copy-var-private-test
-  (is (true? (:private (meta (sci/copy-var private-fn (sci/create-ns 'foo)))))
-      "copy-var preserves :private metadata for same-namespace var")
-  #?(:clj
+#?(:clj
+   (deftest copy-var-private-test
+     (is (true? (:private (meta (sci/copy-var private-fn (sci/create-ns 'foo)))))
+         "copy-var preserves :private metadata for same-namespace var")
      (let [v (sci/copy-var sci.copy-ns-test-ns/private-fn (sci/create-ns 'foo))]
        (is (true? (:private (meta v)))
            "copy-var preserves :private metadata for cross-namespace var")
@@ -1637,39 +1638,41 @@
      (testing "js objects are not instantiated at read time, but at runtime, rendering new objects each time"
        (sci/eval-string "(apply identical? (for [x [1 2]] #js {:a 1}))" {:classes {'js goog/global :allow :all}}))))
 
-(deftest copy-ns-test
-  (let [sci-ns (sci/copy-ns sci.copy-ns-test-ns
-                            (sci/create-ns 'sci.copy-ns-test-ns)
-                            {:exclude [baz quux]
-                             :copy-meta [:doc :copy-this]})]
-    (is (map? sci-ns))
-    (is (= 5 (count sci-ns)))
-    (is (= #{'foo 'bar 'ITest 'x 'vec-macro} (set (keys sci-ns))))
-    (is (= [:foo :bar] (sci/eval-string
-                        "(require '[sci.copy-ns-test-ns :refer [foo bar]])
-                         [(foo) (bar)]"
-                        {:namespaces {'sci.copy-ns-test-ns sci-ns}})))
-    (is (= "YOLO" (:doc (meta (get sci-ns 'foo)))))
-    (is (:copy-this (meta (get sci-ns 'foo)))))
-  (let [sci-ns (sci/copy-ns sci.copy-ns-test-ns
-                            (sci/create-ns 'sci.copy-ns-test-ns)
-                            {:exclude-when-meta [:exclude-this]
-                             :copy-meta :all})]
-    (is (= 7 (count sci-ns)))
-    (is (= #{'foo 'bar 'baz 'skip-wiki 'ITest 'x 'vec-macro} (set (keys sci-ns))))
+#?(:clj
+   (deftest copy-ns-test
+     (let [sci-ns (sci/copy-ns sci.copy-ns-test-ns
+                               (sci/create-ns 'sci.copy-ns-test-ns)
+                               {:exclude [baz quux]
+                                :copy-meta [:doc :copy-this]})]
+       (is (map? sci-ns))
+       (is (= 5 (count sci-ns)))
+       (is (= #{'foo 'bar 'ITest 'x 'vec-macro} (set (keys sci-ns))))
+       (is (= [:foo :bar] (sci/eval-string
+                           "(require '[sci.copy-ns-test-ns :refer [foo bar]])
+                            [(foo) (bar)]"
+                           {:namespaces {'sci.copy-ns-test-ns sci-ns}})))
+       (is (= "YOLO" (:doc (meta (get sci-ns 'foo)))))
+       (is (:copy-this (meta (get sci-ns 'foo)))))
+     (let [sci-ns (sci/copy-ns sci.copy-ns-test-ns
+                               (sci/create-ns 'sci.copy-ns-test-ns)
+                               {:exclude-when-meta [:exclude-this]
+                                :copy-meta :all})]
+       (is (= 7 (count sci-ns)))
+       (is (= #{'foo 'bar 'baz 'skip-wiki 'ITest 'x 'vec-macro} (set (keys sci-ns))))
     (is (= "YOLO" (:doc (meta (get sci-ns 'foo)))))
     (is (:copy-this (meta (get sci-ns 'foo))))
     (is (:awesome-meta (meta (get sci-ns 'baz))))
     (is (= [1 1] (sci/eval-string "(vec-macro 1)" {:namespaces {'user sci-ns}}))))
-  ;; throws at compile time, so it's difficult to test this:
-  #_(is (thrown? Exception (sci/copy-ns #_:clj-kondo/ignore non-existent.namespace nil))))
+     ;; throws at compile time, so it's difficult to test this:
+     #_(is (thrown? Exception (sci/copy-ns #_:clj-kondo/ignore non-existent.namespace nil)))))
 
-(deftest copy-ns-default-meta-test
-  (testing "copy-ns default meta includes name"
-    (let [sci-ns (sci/copy-ns sci.copy-ns-test-ns
-                              (sci/create-ns 'sci.copy-ns-test-ns))]
-      (is (every? (fn [[var-name meta]] (and (symbol? var-name) (= var-name (:name meta))))
-                  (map (fn [[name var]] (vector name (meta var))) sci-ns))))))
+#?(:clj
+   (deftest copy-ns-default-meta-test
+     (testing "copy-ns default meta includes name"
+       (let [sci-ns (sci/copy-ns sci.copy-ns-test-ns
+                                 (sci/create-ns 'sci.copy-ns-test-ns))]
+         (is (every? (fn [[var-name meta]] (and (symbol? var-name) (= var-name (:name meta))))
+                     (map (fn [[name var]] (vector name (meta var))) sci-ns)))))))
 
 (deftest vswap-test
   (is (= 2 (sci/eval-string

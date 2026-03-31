@@ -12,7 +12,7 @@
             [sci.lang]
             [sci.impl.types]
             [clojure.string :as str])
-)
+  #?(:cljs (:require-macros [sci.core])))
 
 (declare read-eval)
 
@@ -22,6 +22,13 @@
   [^sci.lang.Type type-obj]
   #?(:clj (.-methods type-obj)
      :cljs (unchecked-get type-obj "methods$")))
+
+(defn- type-name
+  "Get the name from a sci.lang.Type instance.
+   Uses HasName protocol to work across CLJ/CLJS."
+  [^sci.lang.Type type-obj]
+  #?(:clj (.getName type-obj)
+     :cljs (sci.impl.types/getName type-obj)))
 
 ;; ============================================================
 ;; Reader
@@ -120,7 +127,7 @@
                   type-obj (get types (symbol sym-name))]
               (when (instance? sci.lang.Type type-obj)
                ;; Use the type's own name (which is the dotted form: ns.Name)
-                (symbol (.getName ^sci.lang.Type type-obj)))))
+                (symbol (type-name type-obj)))))
          ;; Check SCI heap: sym defined/referred in current ns?
           (when heap-atom
             (let [h     @heap-atom
@@ -206,14 +213,14 @@
                                               entry (get @heap-atom map-ctor-sym)]
                                           (when entry (:val entry)))))))
                          :cljs (fn [tag]
-                                (when (= 'js tag)
-                                  (fn [v]
-                                    (if (map? v)
-                                      (apply list 'js-obj
-                                             (mapcat (fn [[k val]]
-                                                       [(if (keyword? k) (name k) (str k)) val])
-                                                     v))
-                                      (apply list 'array (seq v)))))))))))
+                                 (when (= 'js tag)
+                                   (fn [v]
+                                     (if (map? v)
+                                       (apply list 'js-obj
+                                              (mapcat (fn [[k val]]
+                                                        [(if (keyword? k) (name k) (str k)) val])
+                                                      v))
+                                       (apply list 'array (seq v)))))))))))
 
 (defn read-all
   "Read all forms from a string."
@@ -408,7 +415,7 @@
         hierarchy-atom (atom (clojure.core/make-hierarchy))
         heap (let [type->tag (fn [t]
                                (if (instance? sci.lang.Type t)
-                                 (let [n (.getName ^sci.lang.Type t)
+                                 (let [n (type-name t)
                                        idx (.lastIndexOf ^String n ".")]
                                    (if (pos? idx)
                                      (symbol (subs n 0 idx) (subs n (inc idx)))
@@ -1090,6 +1097,21 @@
       (list 'do
             (list 'declare (symbol (str "->" name-sym)))
             (apply list 'deftype* qualified dotted fields :implements proto-syms methods)))))
+
+;; ============================================================
+;; IO vars (defined early so heap entries can reference `out`)
+;; ============================================================
+
+(def in (atom #?(:clj *in* :cljs nil)))
+(def out (atom #?(:clj *out* :cljs nil)))
+(def err (atom #?(:clj *err* :cljs nil)))
+(def print-fn (atom nil))
+(def print-length (atom nil))
+(def print-namespace-maps (atom true))
+(def ns (atom #?(:clj (clojure.core/find-ns 'user) :cljs 'user)))
+(def read-eval (atom false))
+(def assert (atom true))
+(def ^:dynamic file nil)
 
 ;; ============================================================
 
@@ -1819,11 +1841,11 @@
                                             ;; SCI record — print as #ns.Name{...}
                                             (and m (:sci.impl/record m))
                                             (let [type-name (when (instance? sci.lang.Type type-obj)
-                                                              (.getName ^sci.lang.Type type-obj))]
+                                                              (type-name type-obj))]
                                               (str "#" type-name "{" (clojure.string/join ", " (map (fn [[k v]] (str (pr1 k) " " (pr1 v))) (sort-by key x))) "}"))
                                             ;; SCI deftype (non-record) — print as #object[ns.Name]
                                             (instance? sci.lang.Type type-obj)
-                                            (str "#object[" (.getName ^sci.lang.Type type-obj) "]")
+                                            (str "#object[" (type-name type-obj) "]")
                                             ;; SCI Var — print as #'ns/name
                                             (instance? sci.lang.Var x) (str "#'" (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var x)) (.-sym ^sci.lang.Var x)))
                                             ;; Collections — recursive traversal to catch SCI types inside
@@ -1840,7 +1862,7 @@
                             (let [pr-str-fn (:val (get @heap-atom (symbol "clojure.core" "pr-str")))
                                   s (apply pr-str-fn args)]
                               #?(:clj (.write ^java.io.Writer *out* ^String s)
-                                 :cljs (*print-fn* s))))
+                                 :cljs (if-let [w @out] (-write w s) (when *print-fn* (*print-fn* s))))))
                      :meta {:name 'pr :doc #?(:clj (:doc (meta #'clojure.core/pr)) :cljs (existing-doc (symbol "clojure.core" "pr")))}}
                     ;; prn — pr followed by newline
                     (symbol "clojure.core" "prn")
@@ -1849,8 +1871,25 @@
                               (apply pr-fn args)
                               #?(:clj (do (.write ^java.io.Writer *out* "\n")
                                           (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
-                                 :cljs (*print-fn* "\n"))))
+                                 :cljs (if-let [w @out] (-write w "\n") (when *print-fn* (*print-fn* "\n"))))))
                      :meta {:name 'prn :doc #?(:clj (:doc (meta #'clojure.core/prn)) :cljs (existing-doc (symbol "clojure.core" "prn")))}}
+                    ;; print — like pr but uses print-str (human-readable)
+                    (symbol "clojure.core" "print")
+                    {:val (fn [& args]
+                            (let [print-str-fn (:val (get @heap-atom (symbol "clojure.core" "print-str")))
+                                  s (apply print-str-fn args)]
+                              #?(:clj (.write ^java.io.Writer *out* ^String s)
+                                 :cljs (if-let [w @out] (-write w s) (when *print-fn* (*print-fn* s))))))
+                     :meta {:name 'print :doc #?(:clj (:doc (meta #'clojure.core/print)) :cljs (existing-doc (symbol "clojure.core" "print")))}}
+                    ;; println — print followed by newline
+                    (symbol "clojure.core" "println")
+                    {:val (fn [& args]
+                            (let [print-fn (:val (get @heap-atom (symbol "clojure.core" "print")))]
+                              (apply print-fn args)
+                              #?(:clj (do (.write ^java.io.Writer *out* "\n")
+                                          (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
+                                 :cljs (if-let [w @out] (-write w "\n") (when *print-fn* (*print-fn* "\n"))))))
+                     :meta {:name 'println :doc #?(:clj (:doc (meta #'clojure.core/println)) :cljs (existing-doc (symbol "clojure.core" "println")))}}
                     ;; print-str — like pr-str for print-str
                     (symbol "clojure.core" "print-str")
                     {:val (fn [& args]
@@ -1861,7 +1900,7 @@
                                                             (:sci.impl/record m)
                                                             (let [type-obj (:type m)
                                                                   type-name (when (instance? sci.lang.Type type-obj)
-                                                                              (.getName ^sci.lang.Type type-obj))]
+                                                                              (type-name type-obj))]
                                                               (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
                                                             (instance? sci.lang.Var x)
                                                             (let [v ^sci.lang.Var x]
@@ -2043,22 +2082,23 @@
   ([name init-val opts]
    (sci.lang/->DynamicVar (atom init-val) (or opts {}))))
 
-(defmacro copy-var
-  "Copy a Clojure var into an SCI namespace."
-  ([clj-var sci-ns]
-   `(copy-var ~clj-var ~sci-ns nil))
-  ([clj-var sci-ns opts]
-   (let [copy-meta-from (when (map? opts) (:copy-meta-from opts))
-         opts-expr (if copy-meta-from
-                     (let [clean-opts (dissoc opts :copy-meta-from)]
-                       `(merge (meta (var ~copy-meta-from)) ~clean-opts))
-                     opts)]
-     `(let [v# (var ~clj-var)
-            m# (meta v#)
-            val# (deref v#)
-            merged-meta# (merge m# ~opts-expr)]
-        ;; Return a sci.lang.Var so non-IObj values (e.g. Long) can carry metadata.
-        (sci.lang/->Var (quote ~clj-var) val# merged-meta# (boolean (:dynamic m#)))))))
+#?(:clj
+   (defmacro copy-var
+     "Copy a Clojure var into an SCI namespace."
+     ([clj-var sci-ns]
+      `(copy-var ~clj-var ~sci-ns nil))
+     ([clj-var sci-ns opts]
+      (let [copy-meta-from (when (map? opts) (:copy-meta-from opts))
+            opts-expr (if copy-meta-from
+                        (let [clean-opts (dissoc opts :copy-meta-from)]
+                          `(merge (meta (var ~copy-meta-from)) ~clean-opts))
+                        opts)]
+        `(let [v# (var ~clj-var)
+               m# (meta v#)
+               val# (deref v#)
+               merged-meta# (merge m# ~opts-expr)]
+           ;; Return a sci.lang.Var so non-IObj values (e.g. Long) can carry metadata.
+           (sci.lang/->Var (quote ~clj-var) val# merged-meta# (boolean (:dynamic m#))))))))
 
 (defn copy-var*
   "Copy a Clojure var into an SCI namespace (runtime version, takes a var)."
@@ -2069,44 +2109,45 @@
          merged-meta (merge m opts)]
      (sci.lang/->Var (.-sym clj-var) val merged-meta (boolean (:dynamic m))))))
 
-(defmacro copy-ns
-  "Copy a Clojure namespace into SCI."
-  ([ns-sym sci-ns]
-   `(copy-ns ~ns-sym ~sci-ns nil))
-  ([ns-sym sci-ns opts]
-   (let [;; Extract opts at compile time to quote symbols properly
-         opts-map (when (map? opts) opts)
-         exclude-syms (when opts-map (:exclude opts-map))
-         exclude-when-meta-keys (when opts-map (:exclude-when-meta opts-map))
-         copy-meta-val (when opts-map (:copy-meta opts-map))]
-     `(let [ns# (the-ns '~ns-sym)
-            publics# (clojure.core/ns-publics ns#)
-            exclude# '~(set exclude-syms)
-            exclude-when-meta# '~(set exclude-when-meta-keys)
-            copy-meta-val# ~(if (= :all copy-meta-val) :all
-                                (when copy-meta-val `'~(vec copy-meta-val)))]
-        (reduce-kv
-         (fn [m# sym# v#]
-           (let [vm# (meta v#)]
-             (if (or (contains? exclude# sym#)
-                     (and (not= :all copy-meta-val#)
-                          (:skip-wiki vm#))
-                     (some #(get vm# %) exclude-when-meta#))
-               m#
-               (let [val# (deref v#)
-                     selected-meta# (cond
-                                      (= :all copy-meta-val#) vm#
-                                      copy-meta-val#
-                                      (select-keys vm# (concat [:name :arglists :macro :sci/macro] copy-meta-val#))
-                                      :else
-                                      (select-keys vm# [:name :arglists :macro :sci/macro :doc]))]
-                 (assoc m# sym# (with-meta
-                                  (if (or (:macro vm#) (:sci/macro vm#))
-                                    val#
-                                    (fn [& args#] (apply val# args#)))
-                                  selected-meta#))))))
-         {}
-         publics#)))))
+#?(:clj
+   (defmacro copy-ns
+     "Copy a Clojure namespace into SCI."
+     ([ns-sym sci-ns]
+      `(copy-ns ~ns-sym ~sci-ns nil))
+     ([ns-sym sci-ns opts]
+      (let [;; Extract opts at compile time to quote symbols properly
+            opts-map (when (map? opts) opts)
+            exclude-syms (when opts-map (:exclude opts-map))
+            exclude-when-meta-keys (when opts-map (:exclude-when-meta opts-map))
+            copy-meta-val (when opts-map (:copy-meta opts-map))]
+        `(let [ns# (the-ns '~ns-sym)
+               publics# (clojure.core/ns-publics ns#)
+               exclude# '~(set exclude-syms)
+               exclude-when-meta# '~(set exclude-when-meta-keys)
+               copy-meta-val# ~(if (= :all copy-meta-val) :all
+                                   (when copy-meta-val `'~(vec copy-meta-val)))]
+           (reduce-kv
+            (fn [m# sym# v#]
+              (let [vm# (meta v#)]
+                (if (or (contains? exclude# sym#)
+                        (and (not= :all copy-meta-val#)
+                             (:skip-wiki vm#))
+                        (some #(get vm# %) exclude-when-meta#))
+                  m#
+                  (let [val# (deref v#)
+                        selected-meta# (cond
+                                         (= :all copy-meta-val#) vm#
+                                         copy-meta-val#
+                                         (select-keys vm# (concat [:name :arglists :macro :sci/macro] copy-meta-val#))
+                                         :else
+                                         (select-keys vm# [:name :arglists :macro :sci/macro :doc]))]
+                    (assoc m# sym# (with-meta
+                                     (if (or (:macro vm#) (:sci/macro vm#))
+                                       val#
+                                       (fn [& args#] (apply val# args#)))
+                                     selected-meta#))))))
+            {}
+            publics#))))))
 
 (defn alter-var-root
   "Alter the root value of a var."
@@ -2126,67 +2167,106 @@
 ;; Dynamic binding macros
 ;; ============================================================
 
-(def ^:private sci-var->clj-var
-  "Mapping from SCI atom vars to their corresponding Clojure dynamic vars."
-  #?(:clj {'sci.core/out       #'*out*
-           'sci.core/in        #'*in*
-           'sci.core/err       #'*err*
-           'sci.core/print-length #'*print-length*
-           'sci.core/print-namespace-maps #'*print-namespace-maps*}
-     :cljs {}))
+#?(:clj
+   (def ^:private sci-var->clj-var
+     "Mapping from SCI atom vars to their corresponding Clojure dynamic vars."
+     {'sci.core/out       #'*out*
+      'sci.core/in        #'*in*
+      'sci.core/err       #'*err*
+      'sci.core/print-length #'*print-length*
+      'sci.core/print-namespace-maps #'*print-namespace-maps*}))
 
-(defmacro binding
-  "Dynamic binding form for SCI vars.
-   Supports both real Clojure vars and SCI dynamic vars (atoms)."
-  [bindings & body]
-  (let [pairs (partition 2 bindings)]
-    #?(:clj
-       (let [;; Check at compile time if the binding targets are vars
-             all-vars? (every? (fn [[target _]]
-                                 (let [v (clojure.core/resolve target)]
-                                   (and (symbol? target) v (var? v)
-                                        (.isDynamic ^clojure.lang.Var v))))
+#?(:clj
+   (defmacro binding
+     "Dynamic binding form for SCI vars.
+      Supports both real Clojure vars and SCI dynamic vars (atoms)."
+     [bindings & body]
+     (let [pairs (partition 2 bindings)]
+       (if (:ns &env)
+         ;; CLJS: simple atom save/restore (no thread bindings)
+         (let [sym-pairs (mapv (fn [[target val-expr]]
+                                 [(gensym "old") target val-expr])
                                pairs)]
-         (if all-vars?
-           `(clojure.core/binding ~bindings ~@body)
-           ;; For SCI dynamic vars (atoms), save/restore manually
-           ;; Also push real JVM thread bindings for vars like *out*, *print-length*
-           (let [sym-pairs (mapv (fn [[target val-expr]]
-                                   [(gensym "old") target val-expr])
-                                 pairs)
-                 ;; Find corresponding real Clojure vars to thread-bind
-                 thread-binds (keep (fn [[_ target val-expr]]
-                                      (let [resolved (clojure.core/resolve target)
-                                            fq (when resolved
-                                                 (symbol (str (.ns ^clojure.lang.Var resolved))
-                                                         (str (.sym ^clojure.lang.Var resolved))))]
-                                        (when-let [clj-var (get sci-var->clj-var fq)]
-                                          [clj-var val-expr])))
-                                    sym-pairs)
-                 has-thread-binds? (seq thread-binds)]
-             (if has-thread-binds?
-               ;; Wrap in clojure.core/binding for the real vars, plus atom save/restore
-               (let [clj-bindings (vec (mapcat (fn [[v expr]]
-                                                 [(symbol (str (.ns ^clojure.lang.Var v))
-                                                          (str (.sym ^clojure.lang.Var v)))
-                                                  expr])
-                                               thread-binds))]
+           `(let [~@(mapcat (fn [[old-sym target _]] [old-sym `(deref ~target)]) sym-pairs)]
+              ~@(mapv (fn [[_ target val-expr]] `(reset! ~target ~val-expr)) sym-pairs)
+              (try
+                (do ~@body)
+                (finally
+                  ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs)))))
+         ;; CLJ
+         (let [;; Check at compile time if the binding targets are vars
+               all-vars? (every? (fn [[target _]]
+                                   (let [v (clojure.core/resolve target)]
+                                     (and (symbol? target) v (var? v)
+                                          (.isDynamic ^clojure.lang.Var v))))
+                                 pairs)]
+           (if all-vars?
+             `(clojure.core/binding ~bindings ~@body)
+             ;; For SCI dynamic vars (atoms), save/restore manually
+             ;; Also push real JVM thread bindings for vars like *out*, *print-length*
+             (let [sym-pairs (mapv (fn [[target val-expr]]
+                                     [(gensym "old") target val-expr])
+                                   pairs)
+                   ;; Find corresponding real Clojure vars to thread-bind
+                   thread-binds (keep (fn [[_ target val-expr]]
+                                        (let [resolved (clojure.core/resolve target)
+                                              fq (when resolved
+                                                   (symbol (str (.ns ^clojure.lang.Var resolved))
+                                                           (str (.sym ^clojure.lang.Var resolved))))]
+                                          (when-let [clj-var (get sci-var->clj-var fq)]
+                                            [clj-var val-expr])))
+                                      sym-pairs)
+                   has-thread-binds? (seq thread-binds)]
+               (if has-thread-binds?
+                 ;; Wrap in clojure.core/binding for the real vars, plus atom save/restore
+                 (let [clj-bindings (vec (mapcat (fn [[v expr]]
+                                                   [(symbol (str (.ns ^clojure.lang.Var v))
+                                                            (str (.sym ^clojure.lang.Var v)))
+                                                    expr])
+                                                 thread-binds))]
+                   `(let [~@(mapcat (fn [[old-sym target _]] [old-sym `(deref ~target)]) sym-pairs)]
+                      ~@(mapv (fn [[_ target val-expr]] `(reset! ~target ~val-expr)) sym-pairs)
+                      (try
+                        (clojure.core/binding ~clj-bindings
+                          ~@body)
+                        (finally
+                          ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs)))))
                  `(let [~@(mapcat (fn [[old-sym target _]] [old-sym `(deref ~target)]) sym-pairs)]
                     ~@(mapv (fn [[_ target val-expr]] `(reset! ~target ~val-expr)) sym-pairs)
                     (try
-                      (clojure.core/binding ~clj-bindings
-                        ~@body)
+                      (do ~@body)
                       (finally
-                        ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs)))))
-               `(let [~@(mapcat (fn [[old-sym target _]] [old-sym `(deref ~target)]) sym-pairs)]
-                  ~@(mapv (fn [[_ target val-expr]] `(reset! ~target ~val-expr)) sym-pairs)
-                  (try
-                    (do ~@body)
-                    (finally
-                      ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs))))))))
-       :cljs
-       ;; CLJS: simple atom save/restore (no thread bindings)
-       (let [sym-pairs (mapv (fn [[target val-expr]]
+                        ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs))))))))))))
+
+#?(:clj
+   (defmacro with-bindings
+     "Execute body with SCI var bindings. Keys must be dynamic vars (atoms from new-dynamic-var)."
+     [binding-map & body]
+     (let [check-expr (if (:ns &env)
+                        `(or (instance? cljs.core/Atom ~'k#) (instance? sci.lang.DynamicVar ~'k#))
+                        `(or (instance? clojure.lang.Atom ~'k#) (instance? sci.lang.DynamicVar ~'k#)))]
+       `(let [~'bmap# ~binding-map]
+          (doseq [[~'k# _#] ~'bmap#]
+            (when-not ~check-expr
+              (throw (ex-info (str "Cannot bind non-dynamic var: " ~'k#)
+                              {:type :bind-non-dynamic}))))
+          (let [~'saved# (into {} (map (fn [[v# _#]] [v# @v#]) ~'bmap#))]
+            (try
+              (doseq [[v# val#] ~'bmap#]
+                (reset! v# val#))
+              ~@body
+              (finally
+                (doseq [[v# old#] ~'saved#]
+                  (reset! v# old#)))))))))
+
+#?(:clj
+   (defmacro with-redefs
+     "Temporarily redefine vars."
+     [bindings & body]
+     (if (:ns &env)
+       ;; CLJS: atom save/restore for SCI vars
+       (let [pairs (partition 2 bindings)
+             sym-pairs (mapv (fn [[target val-expr]]
                                [(gensym "old") target val-expr])
                              pairs)]
          `(let [~@(mapcat (fn [[old-sym target _]] [old-sym `(deref ~target)]) sym-pairs)]
@@ -2194,30 +2274,8 @@
             (try
               (do ~@body)
               (finally
-                ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs))))))))
-
-(defmacro with-bindings
-  "Execute body with SCI var bindings. Keys must be dynamic vars (atoms from new-dynamic-var)."
-  [binding-map & body]
-  `(let [bmap# ~binding-map]
-     (doseq [[k# _#] bmap#]
-       (when-not #?(:clj (or (instance? clojure.lang.Atom k#) (instance? sci.lang.DynamicVar k#))
-                    :cljs (or (instance? cljs.core/Atom k#) (instance? sci.lang.DynamicVar k#)))
-         (throw (ex-info (str "Cannot bind non-dynamic var: " k#)
-                         {:type :bind-non-dynamic}))))
-     (let [saved# (into {} (map (fn [[v# _#]] [v# @v#]) bmap#))]
-       (try
-         (doseq [[v# val#] bmap#]
-           (reset! v# val#))
-         ~@body
-         (finally
-           (doseq [[v# old#] saved#]
-             (reset! v# old#)))))))
-
-(defmacro with-redefs
-  "Temporarily redefine vars."
-  [bindings & body]
-  `(clojure.core/with-redefs ~bindings ~@body))
+                ~@(mapv (fn [[old-sym target _]] `(reset! ~target ~old-sym)) sym-pairs)))))
+       `(clojure.core/with-redefs ~bindings ~@body))))
 
 ;; ============================================================
 ;; Namespace operations
@@ -2276,21 +2334,6 @@
       ctx)))
 
 ;; ============================================================
-;; IO vars
-;; ============================================================
-
-(def in (atom #?(:clj *in* :cljs nil)))
-(def out (atom #?(:clj *out* :cljs nil)))
-(def err (atom #?(:clj *err* :cljs nil)))
-(def print-fn (atom nil))
-(def print-length (atom nil))
-(def print-namespace-maps (atom true))
-(def ns (atom #?(:clj (clojure.core/find-ns 'user) :cljs 'user)))
-(def read-eval (atom false))
-(def assert (atom true))
-(def ^:dynamic file nil)
-
-;; ============================================================
 ;; IO wrappers
 ;; ============================================================
 
@@ -2300,42 +2343,55 @@
      [f]
      (let [sb (volatile! "")
            old-print-fn *print-fn*
-           old-print-err-fn *print-err-fn*]
+           old-print-err-fn *print-err-fn*
+           old-out @out
+           writer (reify
+                    IWriter
+                    (-write [_ s] (vswap! sb str s))
+                    (-flush [_]))]
+       (reset! out writer)
        (set! *print-fn* (fn [x] (vswap! sb str x)))
        (set! *print-err-fn* (fn [x] (vswap! sb str x)))
        (try
          (f)
          (finally
            (set! *print-fn* old-print-fn)
-           (set! *print-err-fn* old-print-err-fn)))
+           (set! *print-err-fn* old-print-err-fn)
+           (reset! out old-out)))
        @sb)))
 
-(defmacro with-out-str [& body]
-  `(let [sw# (java.io.StringWriter.)
-         old-out# @out]
-     (reset! out sw#)
-     (try
-       (binding [*out* sw#]
-         ~@body)
-       (finally
-         (reset! out old-out#)))
-     (str sw#)))
+#?(:clj
+   (defmacro with-out-str [& body]
+     (if (:ns &env)
+       `(sci.core/with-out-str-fn (fn [] ~@body))
+       `(let [sw# (java.io.StringWriter.)
+              old-out# @out]
+          (reset! out sw#)
+          (try
+            (clojure.core/binding [~'*out* sw#]
+              ~@body)
+            (finally
+              (reset! out old-out#)))
+          (str sw#)))))
 
-(defmacro with-in-str [s & body]
-  `(let [sr# (java.io.StringReader. ~s)
-         old-in# @in]
-     (reset! in sr#)
-     (try
-       (binding [*in* (clojure.java.io/reader sr#)]
-         ~@body)
-       (finally
-         (reset! in old-in#)))))
+#?(:clj
+   (defmacro with-in-str [s & body]
+     `(let [sr# (java.io.StringReader. ~s)
+            old-in# @in]
+        (reset! in sr#)
+        (try
+          (binding [*in* (clojure.java.io/reader sr#)]
+            ~@body)
+          (finally
+            (reset! in old-in#))))))
 
-(defmacro future [& body]
-  `(clojure.core/future ~@body))
+#?(:clj
+   (defmacro future [& body]
+     `(clojure.core/future ~@body)))
 
-(defmacro pmap [f & colls]
-  `(clojure.core/pmap ~f ~@colls))
+#?(:clj
+   (defmacro pmap [f & colls]
+     `(clojure.core/pmap ~f ~@colls)))
 
 ;; ============================================================
 ;; Stacktrace / error support

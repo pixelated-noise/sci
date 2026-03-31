@@ -9,6 +9,7 @@
             #?(:clj [clojure.repl])
             #?(:clj [clojure.pprint])
             [sci.lang]
+            [sci.impl.types]
             #?(:cljs [sci.vm.cljs-bindings :as cljs-bindings])))
 
 (defn- type-methods
@@ -17,6 +18,12 @@
   [^sci.lang.Type type-obj]
   #?(:clj (.-methods type-obj)
      :cljs (unchecked-get type-obj "methods$")))
+
+(defn- type-name
+  "Get the name from a sci.lang.Type instance."
+  [^sci.lang.Type type-obj]
+  #?(:clj (.getName type-obj)
+     :cljs (sci.impl.types/getName type-obj)))
 
 (defn- make-ns-registry
   "Generate a registry of all public vars from a namespace."
@@ -397,7 +404,7 @@
                                            (nil? x) "nil"
                                            (:sci.impl/record (clojure.core/meta x))
                                            (let [type-obj (:type (clojure.core/meta x))]
-                                             (clojure.core/str "#" (.getName ^sci.lang.Type type-obj)
+                                             (clojure.core/str "#" (type-name type-obj)
                                                                (clojure.core/pr-str (into (sorted-map) x))))
                                            (instance? sci.lang.Var x)
                                            (clojure.core/str "#'" (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var x)) (.-sym ^sci.lang.Var x)))
@@ -419,9 +426,9 @@
                                             (if-let [toString-fn (get methods 'toString)]
                                               (toString-fn x)
                                               (if (:sci.impl/record (clojure.core/meta x))
-                                                (clojure.core/str "#" (.getName ^sci.lang.Type sci-type)
+                                                (clojure.core/str "#" (type-name sci-type)
                                                                   (clojure.core/pr-str (into (sorted-map) x)))
-                                                (clojure.core/str "#object[" (.getName ^sci.lang.Type sci-type) "]"))))
+                                                (clojure.core/str "#object[" (type-name sci-type) "]"))))
                                          ;; For collections, check if they might contain SCI records
                                           (if (coll? x)
                                             (sci-pr-str x)
