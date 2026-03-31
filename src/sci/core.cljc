@@ -1456,12 +1456,13 @@
                     {:val (fn [obj]
                             (let [m (clojure.core/meta obj)]
                               (cond
-                                ;; SCI closure — strip implementation keys, keep user metadata
+                                ;; SCI closure — return :user-meta if present, else strip impl keys
                                 (:sci/closure m)
-                                (let [cleaned (dissoc m :sci/closure :type :sci.impl/record
-                                                      :ns :env :arities :file :name :line :column
-                                                      :sci.impl/var-sym)]
-                                  (when (seq cleaned) cleaned))
+                                (or (:user-meta m)
+                                    (let [cleaned (dissoc m :sci/closure :type :sci.impl/record
+                                                          :ns :env :arities :file :name :line :column
+                                                          :sci.impl/var-sym :user-meta)]
+                                      (when (seq cleaned) cleaned)))
                                 ;; SCI type/record — strip type identity keys
                                 (and m (or (contains? m :type) (contains? m :sci.impl/record)))
                                 (let [cleaned (dissoc m :type :sci.impl/record :sci.impl/var-sym)]
