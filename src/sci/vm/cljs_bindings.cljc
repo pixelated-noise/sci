@@ -6,7 +6,8 @@
   (:require [clojure.string :as str]
             [clojure.set :as set]
             [clojure.walk :as walk]
-            #?(:cljs [cljs.reader :as edn])))
+            #?(:cljs [cljs.reader :as edn]))
+  #?(:cljs (:require-macros [sci.vm.cljs-bindings :refer [clj-docstrings]])))
 
 ;; ============================================================
 ;; Helper to build heap entries
@@ -22,6 +23,17 @@
    Macro fns receive [&form &env & args]."
   [val m]
   {:val val :meta (assoc m :macro true) :macro? true :host-macro? true})
+
+#?(:clj
+   (defmacro ^:private clj-docstrings
+     "Compile-time macro: generates a map of {symbol -> docstring} for all public
+      vars in clojure.core. Runs on JVM at compile time, available in CLJS at runtime."
+     []
+     (into {}
+           (keep (fn [[sym v]]
+                   (when-let [doc (:doc (meta v))]
+                     [(list 'quote sym) doc])))
+           (ns-publics 'clojure.core))))
 
 (defn- dynamic-entry
   "Create a heap entry for a dynamic var."
@@ -146,9 +158,9 @@
                        binds
                        (into binds
                              (destructure-binding local-sym
-                               (if (contains? or-map local-sym)
-                                 `(get ~gs ~lookup-key ~(get or-map local-sym))
-                                 `(get ~gs ~lookup-key))))))
+                                                  (if (contains? or-map local-sym)
+                                                    `(get ~gs ~lookup-key ~(get or-map local-sym))
+                                                    `(get ~gs ~lookup-key))))))
                    binds pattern)
             ;; Handle :as
             binds (if as-sym (into binds [as-sym gs]) binds)]
@@ -349,7 +361,7 @@
                              body (rest sig)
                              ;; Extract pre/post conditions
                              [pre-post body] (if (and (map? (first body))
-                                                       (or (:pre (first body)) (:post (first body))))
+                                                      (or (:pre (first body)) (:post (first body))))
                                                [(first body) (rest body)]
                                                [nil body])
                              pre-checks (when-let [pres (:pre pre-post)]
@@ -616,14 +628,14 @@
   ;; (import foo.Bar) => (import* "foo.Bar")
   ;; (import (foo Bar Baz)) => (do (import* "foo.Bar") (import* "foo.Baz"))
   (let [forms (mapcat (fn [spec]
-                         (if (symbol? spec)
-                           [(list 'import* (str spec))]
+                        (if (symbol? spec)
+                          [(list 'import* (str spec))]
                            ;; List form: (package Class1 Class2)
-                           (let [package (first spec)]
-                             (map (fn [cls]
-                                    (list 'import* (str package "." cls)))
-                                  (rest spec)))))
-                       import-specs)]
+                          (let [package (first spec)]
+                            (map (fn [cls]
+                                   (list 'import* (str package "." cls)))
+                                 (rest spec)))))
+                      import-specs)]
     (if (= 1 (count forms))
       (first forms)
       (cons 'do forms))))
@@ -877,6 +889,18 @@
                 'parse-boolean parse-boolean 'parse-uuid parse-uuid
                 'NaN? NaN? 'Inf? Inf?
                 '*assert* true
+                ;; Dynamic vars (REPL and printer settings)
+                '*1 nil '*2 nil '*3 nil '*e nil
+                '*print-dup* false
+                '*print-readably* true
+                '*print-namespace-maps* true
+                '*print-meta* false
+                '*print-level* nil
+                '*file* nil '*ns* nil
+                ;; Protocol functions (for ifn? checks and extend-protocol)
+                '-pr-writer -pr-writer
+                '-write -write
+                ;; Misc
                 'random-uuid random-uuid
                 ;; with-out-str helpers
                 '--sci-with-out-str-start
@@ -891,11 +915,14 @@
                 (fn [[_ old-print-fn old-print-err-fn]]
                   (set! *print-fn* old-print-fn)
                   (set! *print-err-fn* old-print-err-fn))}]
-       (reduce-kv
-        (fn [acc sym v]
-          (assoc acc (symbol "clojure.core" (str sym))
-                 {:val v :meta {:name sym}}))
-        {} fns))))
+       (let [docs (clj-docstrings)]
+         (reduce-kv
+          (fn [acc sym v]
+            (assoc acc (symbol "clojure.core" (str sym))
+                   {:val v :meta (merge {:name sym}
+                                        (when-let [d (get docs sym)]
+                                          {:doc d}))}))
+          {} fns)))))
 
 ;; ============================================================
 ;; clojure.core macros for CLJS
@@ -953,14 +980,17 @@
                    'with-out-str with-out-str-impl
                    'areduce areduce-impl
                    '.. ..-impl}]
-       (reduce-kv
-        (fn [acc sym v]
-          (assoc acc (symbol "clojure.core" (str sym))
-                 {:val v
-                  :meta {:name sym :macro true}
-                  :macro? true
-                  :host-macro? true}))
-        {} macros))))
+       (let [docs (clj-docstrings)]
+         (reduce-kv
+          (fn [acc sym v]
+            (assoc acc (symbol "clojure.core" (str sym))
+                   {:val v
+                    :meta (merge {:name sym :macro true}
+                                 (when-let [d (get docs sym)]
+                                   {:doc d}))
+                    :macro? true
+                    :host-macro? true}))
+          {} macros)))))
 
 ;; ============================================================
 ;; clojure.string for CLJS
@@ -1077,13 +1107,40 @@
       heap heap)))
 
 #?(:cljs
+   (defn- make-sci-protocol
+     "Create a minimal SCI protocol map for a host CLJS protocol."
+     [proto-name method-names]
+     {:type :sci/protocol
+      :name proto-name
+      :methods (into {} (map (fn [m] [m {:name m}]) method-names))
+      :impls (atom {})}))
+
+#?(:cljs
    (defn cljs-heap
      "Build the full CLJS heap with all namespace bindings."
      []
-     (-> (merge (cljs-core-functions)
-                (cljs-core-macros)
-                (cljs-string-ns)
-                (cljs-set-ns)
-                (cljs-walk-ns)
-                (cljs-edn-ns))
-         (mirror-cljs-core))))
+     (let [;; SCI protocol entries for key CLJS host protocols
+           ;; These allow extend-protocol, satisfies?, and custom dispatch to work
+           protos {(symbol "clojure.core" "IPrintWithWriter")
+                   {:val (make-sci-protocol 'clojure.core/IPrintWithWriter ['-pr-writer])
+                    :meta {:name 'IPrintWithWriter}}
+                   (symbol "clojure.core" "IDeref")
+                   {:val (make-sci-protocol 'clojure.core/IDeref ['-deref])
+                    :meta {:name 'IDeref}}
+                   (symbol "clojure.core" "ISwap")
+                   {:val (make-sci-protocol 'clojure.core/ISwap ['-swap!])
+                    :meta {:name 'ISwap}}
+                   (symbol "clojure.core" "IReset")
+                   {:val (make-sci-protocol 'clojure.core/IReset ['-reset!])
+                    :meta {:name 'IReset}}
+                   (symbol "clojure.core" "IWriter")
+                   {:val (make-sci-protocol 'clojure.core/IWriter ['-write '-flush])
+                    :meta {:name 'IWriter}}}]
+       (-> (merge (cljs-core-functions)
+                  (cljs-core-macros)
+                  (cljs-string-ns)
+                  (cljs-set-ns)
+                  (cljs-walk-ns)
+                  (cljs-edn-ns)
+                  protos)
+           (mirror-cljs-core)))))

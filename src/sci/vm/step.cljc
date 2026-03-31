@@ -2558,7 +2558,15 @@
                                        (some (fn [[t impl]]
                                                (when (and #?(:clj (class? t) :cljs (fn? t))
                                                           (not= t #?(:clj Object :cljs js/Object))
-                                                          (instance? t target))
+                                                          #?(:clj (instance? t target)
+                                                             :cljs (or (instance? t target)
+                                                                       ;; JS primitives: instance? doesn't work
+                                                                       ;; for string/number/boolean/function
+                                                                       (and (= t js/String) (string? target))
+                                                                       (and (= t js/Number) (number? target))
+                                                                       (and (= t js/Boolean) (boolean? target))
+                                                                       (and (= t js/Function) (fn? target))
+                                                                       (and (= t js/Array) (array? target)))))
                                                  impl))
                                              impls)
                                        (when (nil? target) (get impls nil))
@@ -2680,9 +2688,24 @@
   [protocol target-type impl-map]
   (swap! (:impls protocol) assoc target-type impl-map))
 
+#?(:cljs
+   (def ^:private cljs-primitive-type-symbols
+     "Map of CLJS primitive type symbols to their JS constructor equivalents.
+      Used in extend-type/extend-protocol to translate type names."
+     {'default :default
+      'object  'js/Object
+      'string  'js/String
+      'number  'js/Number
+      'array   'js/Array
+      'function 'js/Function
+      'boolean 'js/Boolean}))
+
 (defn step-eval-extend-type [machine frame]
   ;; (extend-type Type Protocol1 (method1 [this] ...) Protocol2 ...)
   (let [[_ type-sym & specs] (:expr frame)
+        ;; On CLJS, translate primitive type symbols to JS constructors
+        type-sym #?(:clj type-sym
+                    :cljs (get cljs-primitive-type-symbols type-sym type-sym))
         ;; Parse specs into protocol -> {method -> fn} pairs
         ;; Group specs by protocol
         groups (loop [specs specs groups []]
@@ -2721,7 +2744,7 @@
                          remaining (drop-while seq? (rest specs))]
                      (recur remaining
                             (conj groups {:type type-sym :methods methods})))))
-        ;; Build extend-type forms
+        ;; Build extend-type forms (type translation happens in extend-type)
         extend-forms (mapv (fn [{:keys [type methods]}]
                              (list* 'extend-type type proto-sym methods))
                            groups)

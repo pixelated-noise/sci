@@ -16,6 +16,7 @@
 
 (declare read-eval)
 
+
 ;; ============================================================
 ;; Reader
 ;; ============================================================
@@ -230,18 +231,27 @@
                 disable-arity-checks deftype-fn reify-fn]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
+        ;; Helper: get existing :doc from heap for an entry we're about to override
+        existing-doc (fn [sym] (get-in heap [sym :meta :doc]))
         ;; Override satisfies? to handle SCI protocols
         heap (assoc heap (symbol "clojure.core" "satisfies?")
                     {:val (fn sci-satisfies? [protocol x]
                             (cond
                               (and (map? protocol) (= :sci/protocol (:type protocol)))
                               (let [impls @(:impls protocol)
-                                    target-type (type x)]
+                                    sci-type (when (map? x) (:type (clojure.core/meta x)))
+                                    target-type (or sci-type (type x))]
                                 (boolean
                                  (or (get impls target-type)
                                      (some (fn [[t _]]
                                              (and #?(:clj (class? t) :cljs (fn? t))
-                                                  (instance? t x)))
+                                                  #?(:clj (instance? t x)
+                                                     :cljs (or (instance? t x)
+                                                               (and (= t js/String) (string? x))
+                                                               (and (= t js/Number) (number? x))
+                                                               (and (= t js/Boolean) (boolean? x))
+                                                               (and (= t js/Function) (fn? x))
+                                                               (and (= t js/Array) (array? x))))))
                                            impls)
                                      (when (nil? x) (get impls nil))
                                      (get impls #?(:clj Object :cljs js/Object))
@@ -254,7 +264,7 @@
                                         :else
                                         (clojure.core/satisfies? protocol x)]
                                   :cljs [:else false])))
-                     :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs nil)}
+                     :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs (existing-doc (symbol "clojure.core" "satisfies?")))}
                      :dynamic? false})
         ;; Override deref to handle SCI type instances with deref methods
         heap (assoc heap (symbol "clojure.core" "deref")
@@ -263,7 +273,8 @@
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
                                  (let [methods (.-methods ^sci.lang.Type type-obj)
-                                       deref-fn (get methods 'deref)]
+                                       deref-fn (or (get methods 'deref)
+                                                    (get methods '-deref))]
                                    (if deref-fn
                                      (deref-fn ref)
                                      (clojure.core/deref ref)))
@@ -271,7 +282,7 @@
                                (clojure.core/deref ref)))
                             #?@(:clj [([ref timeout-ms timeout-val]
                                        (clojure.core/deref ref timeout-ms timeout-val))]))
-                     :meta {:name 'deref :doc #?(:clj (:doc (meta #'clojure.core/deref)) :cljs nil)}
+                     :meta {:name 'deref :doc #?(:clj (:doc (meta #'clojure.core/deref)) :cljs (existing-doc (symbol "clojure.core" "deref")))}
                      :dynamic? false})
         ;; Override swap! and reset! to handle SCI type instances with swap/reset methods
         heap (assoc heap (symbol "clojure.core" "swap!")
@@ -280,7 +291,7 @@
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
                                  (let [methods (.-methods ^sci.lang.Type type-obj)
-                                       swap-fn (get methods 'swap)]
+                                       swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (swap-fn ref f)
                                      (clojure.core/swap! ref f)))
@@ -290,7 +301,7 @@
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
                                  (let [methods (.-methods ^sci.lang.Type type-obj)
-                                       swap-fn (get methods 'swap)]
+                                       swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (swap-fn ref f a)
                                      (clojure.core/swap! ref f a)))
@@ -300,7 +311,7 @@
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
                                  (let [methods (.-methods ^sci.lang.Type type-obj)
-                                       swap-fn (get methods 'swap)]
+                                       swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (swap-fn ref f a b)
                                      (clojure.core/swap! ref f a b)))
@@ -310,26 +321,26 @@
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
                                  (let [methods (.-methods ^sci.lang.Type type-obj)
-                                       swap-fn (get methods 'swap)]
+                                       swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (apply swap-fn ref f a b args)
                                      (apply clojure.core/swap! ref f a b args)))
                                  (apply clojure.core/swap! ref f a b args))
                                (apply clojure.core/swap! ref f a b args))))
-                     :meta {:name 'swap! :doc #?(:clj (:doc (meta #'clojure.core/swap!)) :cljs nil)}
+                     :meta {:name 'swap! :doc #?(:clj (:doc (meta #'clojure.core/swap!)) :cljs (existing-doc (symbol "clojure.core" "swap!")))}
                      :dynamic? false})
         heap (assoc heap (symbol "clojure.core" "reset!")
                     {:val (fn sci-reset! [ref v]
                             (if-let [type-obj (:type (clojure.core/meta ref))]
                               (if (instance? sci.lang.Type type-obj)
                                 (let [methods (.-methods ^sci.lang.Type type-obj)
-                                      reset-fn (get methods 'reset)]
+                                      reset-fn (or (get methods 'reset) (get methods '-reset!))]
                                   (if reset-fn
                                     (reset-fn ref v)
                                     (clojure.core/reset! ref v)))
                                 (clojure.core/reset! ref v))
                               (clojure.core/reset! ref v)))
-                     :meta {:name 'reset! :doc #?(:clj (:doc (meta #'clojure.core/reset!)) :cljs nil)}
+                     :meta {:name 'reset! :doc #?(:clj (:doc (meta #'clojure.core/reset!)) :cljs (existing-doc (symbol "clojure.core" "reset!")))}
                      :dynamic? false})
         ;; Override reset-vals! and swap-vals! to handle SCI type instances
         heap (assoc heap (symbol "clojure.core" "reset-vals!")
@@ -343,7 +354,7 @@
                                     (clojure.core/reset-vals! ref newval)))
                                 (clojure.core/reset-vals! ref newval))
                               (clojure.core/reset-vals! ref newval)))
-                     :meta {:name 'reset-vals! :doc #?(:clj (:doc (meta #'clojure.core/reset-vals!)) :cljs nil)}
+                     :meta {:name 'reset-vals! :doc #?(:clj (:doc (meta #'clojure.core/reset-vals!)) :cljs (existing-doc (symbol "clojure.core" "reset-vals!")))}
                      :dynamic? false})
         heap (assoc heap (symbol "clojure.core" "swap-vals!")
                     {:val (fn sci-swap-vals!
@@ -360,7 +371,7 @@
                             ([ref f a] (clojure.core/swap-vals! ref f a))
                             ([ref f a b] (clojure.core/swap-vals! ref f a b))
                             ([ref f a b & args] (apply clojure.core/swap-vals! ref f a b args)))
-                     :meta {:name 'swap-vals! :doc #?(:clj (:doc (meta #'clojure.core/swap-vals!)) :cljs nil)}
+                     :meta {:name 'swap-vals! :doc #?(:clj (:doc (meta #'clojure.core/swap-vals!)) :cljs (existing-doc (symbol "clojure.core" "swap-vals!")))}
                      :dynamic? false})
         heap (assoc heap (symbol "clojure.core" "compare-and-set!")
                     {:val (fn sci-compare-and-set! [ref oldval newval]
@@ -373,7 +384,7 @@
                                     (clojure.core/compare-and-set! ref oldval newval)))
                                 (clojure.core/compare-and-set! ref oldval newval))
                               (clojure.core/compare-and-set! ref oldval newval)))
-                     :meta {:name 'compare-and-set! :doc #?(:clj (:doc (meta #'clojure.core/compare-and-set!)) :cljs nil)}
+                     :meta {:name 'compare-and-set! :doc #?(:clj (:doc (meta #'clojure.core/compare-and-set!)) :cljs (existing-doc (symbol "clojure.core" "compare-and-set!")))}
                      :dynamic? false})
         ;; Override derive/underive/isa?/parents/ancestors/descendants to:
         ;; 1. Handle SCI types (sci.lang.Type) by converting to qualified symbols
@@ -390,14 +401,14 @@
                (-> heap
                    (assoc (symbol "clojure.core" "make-hierarchy")
                           {:val clojure.core/make-hierarchy
-                           :meta {:name 'make-hierarchy :doc #?(:clj (:doc (meta #'clojure.core/make-hierarchy)) :cljs nil)}})
+                           :meta {:name 'make-hierarchy :doc #?(:clj (:doc (meta #'clojure.core/make-hierarchy)) :cljs (existing-doc (symbol "clojure.core" "make-hierarchy")))}})
                    (assoc (symbol "clojure.core" "derive")
                           {:val (fn sci-derive
                                   ([tag parent]
                                    (swap! hierarchy-atom clojure.core/derive (type->tag tag) (type->tag parent))
                                    nil)
                                   ([h tag parent] (clojure.core/derive h (type->tag tag) (type->tag parent))))
-                           :meta {:name 'derive :doc #?(:clj (:doc (meta #'clojure.core/derive)) :cljs nil)}
+                           :meta {:name 'derive :doc #?(:clj (:doc (meta #'clojure.core/derive)) :cljs (existing-doc (symbol "clojure.core" "derive")))}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "underive")
                           {:val (fn sci-underive
@@ -405,31 +416,31 @@
                                    (swap! hierarchy-atom clojure.core/underive (type->tag tag) (type->tag parent))
                                    nil)
                                   ([h tag parent] (clojure.core/underive h (type->tag tag) (type->tag parent))))
-                           :meta {:name 'underive :doc #?(:clj (:doc (meta #'clojure.core/underive)) :cljs nil)}
+                           :meta {:name 'underive :doc #?(:clj (:doc (meta #'clojure.core/underive)) :cljs (existing-doc (symbol "clojure.core" "underive")))}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "isa?")
                           {:val (fn sci-isa?
                                   ([child parent] (clojure.core/isa? @hierarchy-atom (type->tag child) (type->tag parent)))
                                   ([h child parent] (clojure.core/isa? h (type->tag child) (type->tag parent))))
-                           :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs nil)}
+                           :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs (existing-doc (symbol "clojure.core" "isa?")))}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "parents")
                           {:val (fn sci-parents
                                   ([tag] (clojure.core/parents @hierarchy-atom (type->tag tag)))
                                   ([h tag] (clojure.core/parents h (type->tag tag))))
-                           :meta {:name 'parents :doc #?(:clj (:doc (meta #'clojure.core/parents)) :cljs nil)}
+                           :meta {:name 'parents :doc #?(:clj (:doc (meta #'clojure.core/parents)) :cljs (existing-doc (symbol "clojure.core" "parents")))}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "ancestors")
                           {:val (fn sci-ancestors
                                   ([tag] (clojure.core/ancestors @hierarchy-atom (type->tag tag)))
                                   ([h tag] (clojure.core/ancestors h (type->tag tag))))
-                           :meta {:name 'ancestors :doc #?(:clj (:doc (meta #'clojure.core/ancestors)) :cljs nil)}
+                           :meta {:name 'ancestors :doc #?(:clj (:doc (meta #'clojure.core/ancestors)) :cljs (existing-doc (symbol "clojure.core" "ancestors")))}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "descendants")
                           {:val (fn sci-descendants
                                   ([tag] (clojure.core/descendants @hierarchy-atom (type->tag tag)))
                                   ([h tag] (clojure.core/descendants h (type->tag tag))))
-                           :meta {:name 'descendants :doc #?(:clj (:doc (meta #'clojure.core/descendants)) :cljs nil)}
+                           :meta {:name 'descendants :doc #?(:clj (:doc (meta #'clojure.core/descendants)) :cljs (existing-doc (symbol "clojure.core" "descendants")))}
                            :dynamic? false})))
         ;; Install user bindings into heap as user/sym vars
         ;; :dynamic? true so thread-local bindings (sci/binding, sci/with-bindings) work.
@@ -1070,6 +1081,7 @@
   "Create a fresh machine from a context and a list of forms."
   [ctx forms]
   (let [heap-atom   (or (:heap-atom ctx) (atom (:heap ctx)))
+        existing-doc (fn [sym] (get-in @heap-atom [sym :meta :doc]))
         resolve-fn  (make-resolve-fn ctx heap-atom)
         eval-fn     (make-eval-fn ctx heap-atom)
         ns-vars-fn  (make-ns-vars-fn heap-atom)
@@ -1101,7 +1113,7 @@
                                      (if entry (:val entry) (.-val ^sci.lang.Var v)))))
                                #?(:clj (var-get v)
                                   :cljs (throw (ex-info "var-get not supported for host vars in CLJS" {:type :sci/error})))))
-                      :meta {:name 'var-get :doc #?(:clj (:doc (meta #'clojure.core/var-get)) :cljs nil)}}
+                      :meta {:name 'var-get :doc #?(:clj (:doc (meta #'clojure.core/var-get)) :cljs (existing-doc (symbol "clojure.core" "var-get")))}}
                      (symbol "clojure.core" "thread-bound?")
                      {:val (fn sci-thread-bound? [& vars]
                              (every? (fn [v]
@@ -1128,7 +1140,7 @@
                                      val)))
                                #?(:clj (var-set v val)
                                   :cljs (throw (ex-info "var-set not supported for host vars in CLJS" {:type :sci/error})))))
-                      :meta {:name 'var-set :doc #?(:clj (:doc (meta #'clojure.core/var-set)) :cljs nil)}}
+                      :meta {:name 'var-set :doc #?(:clj (:doc (meta #'clojure.core/var-set)) :cljs (existing-doc (symbol "clojure.core" "var-set")))}}
                      (symbol "clojure.core" "add-watch")
                      {:val (fn sci-add-watch [ref key callback]
                              (if (instance? sci.lang.Var ref)
@@ -1177,7 +1189,7 @@
                      (symbol "clojure.core" "ns-resolve")
                      {:val (fn [ns-sym sym] (resolve-fn ns-sym sym)) :meta {:name 'ns-resolve}}
                      (symbol "clojure.core" "eval")
-                     {:val eval-fn :meta {:name 'eval :doc #?(:clj (:doc (meta #'clojure.core/eval)) :cljs nil)}}
+                     {:val eval-fn :meta {:name 'eval :doc #?(:clj (:doc (meta #'clojure.core/eval)) :cljs (existing-doc (symbol "clojure.core" "eval")))}}
                      (symbol "clojure.core" "macroexpand-1")
                      {:val (make-macroexpand-1-fn heap-atom) :meta {:name 'macroexpand-1}}
                      (symbol "clojure.core" "macroexpand")
@@ -1186,7 +1198,7 @@
                                (loop [f form]
                                  (let [expanded (me1-fn f)]
                                    (if (= expanded f) f (recur expanded))))))
-                      :meta {:name 'macroexpand :doc #?(:clj (:doc (meta #'clojure.core/macroexpand)) :cljs nil)}}
+                      :meta {:name 'macroexpand :doc #?(:clj (:doc (meta #'clojure.core/macroexpand)) :cljs (existing-doc (symbol "clojure.core" "macroexpand")))}}
                      (symbol "clojure.core" "bound?")
                      {:val (fn [& vars]
                              (every? (fn [v]
@@ -1204,7 +1216,7 @@
                      (symbol "clojure.core" "intern")
                      {:val (make-intern-fn heap-atom) :meta {:name 'intern}}
                      (symbol "clojure.core" "find-ns")
-                     {:val (make-find-ns-fn ctx) :meta {:name 'find-ns :doc #?(:clj (:doc (meta #'clojure.core/find-ns)) :cljs nil)}}
+                     {:val (make-find-ns-fn ctx) :meta {:name 'find-ns :doc #?(:clj (:doc (meta #'clojure.core/find-ns)) :cljs (existing-doc (symbol "clojure.core" "find-ns")))}}
                      (symbol "clojure.core" "create-ns")
                      {:val (make-create-ns-fn ctx) :meta {:name 'create-ns}}
                      (symbol "clojure.core" "the-ns")
@@ -1220,7 +1232,7 @@
                      (symbol "clojure.core" "all-ns")
                      {:val (make-all-ns-fn ctx) :meta {:name 'all-ns}}
                      (symbol "clojure.core" "ns-publics")
-                     {:val ns-vars-fn :meta {:name 'ns-publics :doc #?(:clj (:doc (meta #'clojure.core/ns-publics)) :cljs nil)}}
+                     {:val ns-vars-fn :meta {:name 'ns-publics :doc #?(:clj (:doc (meta #'clojure.core/ns-publics)) :cljs (existing-doc (symbol "clojure.core" "ns-publics")))}}
                      (symbol "clojure.core" "ns-interns")
                      {:val ns-vars-fn :meta {:name 'ns-interns}}
                      (symbol "clojure.core" "*clojure-version*")
@@ -1251,7 +1263,7 @@
                      (symbol "clojure.core" "alias")
                      {:val (make-alias-fn ctx) :meta {:name 'alias}}
                      (symbol "clojure.core" "ns-unalias")
-                     {:val (make-ns-unalias-fn ctx) :meta {:name 'ns-unalias :doc #?(:clj (:doc (meta #'clojure.core/ns-unalias)) :cljs nil)}}
+                     {:val (make-ns-unalias-fn ctx) :meta {:name 'ns-unalias :doc #?(:clj (:doc (meta #'clojure.core/ns-unalias)) :cljs (existing-doc (symbol "clojure.core" "ns-unalias")))}}
                      (symbol "clojure.core" "ns-unmap")
                      {:val (fn [ns-sym sym]
                              (let [ns-sym (if (instance? sci.lang.Namespace ns-sym) (:name ns-sym) ns-sym)
@@ -1267,7 +1279,7 @@
                                                       (update-in [ns-sym :refers] dissoc sym)
                                                       (update-in [ns-sym :unmapped] (fnil conj #{}) sym)))))
                                nil))
-                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs nil)}}
+                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs (existing-doc (symbol "clojure.core" "ns-unmap")))}}
                      (symbol "clojure.core" "ns-imports")
                      {:val (fn [ns-sym-or-obj]
                              (let [ns-sym (if (symbol? ns-sym-or-obj)
@@ -1278,13 +1290,13 @@
                                    ns-a (:ns-atom ctx)
                                    ns-table (if ns-a @ns-a {})]
                                (get-in ns-table [ns-sym :imports] {})))
-                      :meta {:name 'ns-imports :doc #?(:clj (:doc (meta #'clojure.core/ns-imports)) :cljs nil)}}
+                      :meta {:name 'ns-imports :doc #?(:clj (:doc (meta #'clojure.core/ns-imports)) :cljs (existing-doc (symbol "clojure.core" "ns-imports")))}}
                      (symbol "clojure.core" "remove-ns")
-                     {:val (make-remove-ns-fn ctx heap-atom) :meta {:name 'remove-ns :doc #?(:clj (:doc (meta #'clojure.core/remove-ns)) :cljs nil)}}
+                     {:val (make-remove-ns-fn ctx heap-atom) :meta {:name 'remove-ns :doc #?(:clj (:doc (meta #'clojure.core/remove-ns)) :cljs (existing-doc (symbol "clojure.core" "remove-ns")))}}
                      (symbol "clojure.core" "find-var")
-                     {:val (make-find-var-fn ctx heap-atom) :meta {:name 'find-var :doc #?(:clj (:doc (meta #'clojure.core/find-var)) :cljs nil)}}
+                     {:val (make-find-var-fn ctx heap-atom) :meta {:name 'find-var :doc #?(:clj (:doc (meta #'clojure.core/find-var)) :cljs (existing-doc (symbol "clojure.core" "find-var")))}}
                      (symbol "clojure.core" "refer")
-                     {:val (make-refer-fn ctx heap-atom) :meta {:name 'refer :doc #?(:clj (:doc (meta #'clojure.core/refer)) :cljs nil)}}
+                     {:val (make-refer-fn ctx heap-atom) :meta {:name 'refer :doc #?(:clj (:doc (meta #'clojure.core/refer)) :cljs (existing-doc (symbol "clojure.core" "refer")))}}
                      (symbol "clojure.core" "ns-aliases")
                      {:val (fn [ns-sym-or-obj]
                              (let [ns-sym (if (sci-namespace? ns-sym-or-obj)
@@ -1321,7 +1333,7 @@
                               ;; Build require form from function args and evaluate via the VM
                                (eval-f (cons 'require (map (fn [s] (list 'quote s)) specs)))
                                nil))
-                      :meta {:name 'require :doc #?(:clj (:doc (meta #'clojure.core/require)) :cljs nil)}}
+                      :meta {:name 'require :doc #?(:clj (:doc (meta #'clojure.core/require)) :cljs (existing-doc (symbol "clojure.core" "require")))}}
                      (symbol "clojure.core" "use")
                      {:val (fn sci-use [& specs]
                              (let [eval-f (fn [form]
@@ -1677,7 +1689,7 @@
                                                        (not (contains? m :sci.impl/record)))
                                                   (assoc :sci.impl/record (:sci.impl/record old-meta)))]
                                   (clojure.core/with-meta obj (merge m preserved))))))
-                     :meta {:name 'with-meta :doc #?(:clj (:doc (meta #'clojure.core/with-meta)) :cljs nil)}}
+                     :meta {:name 'with-meta :doc #?(:clj (:doc (meta #'clojure.core/with-meta)) :cljs (existing-doc (symbol "clojure.core" "with-meta")))}}
                     (symbol "clojure.core" "vary-meta")
                     {:val (fn [obj f & args]
                             (let [old-meta (clojure.core/meta obj)]
@@ -1695,7 +1707,7 @@
                                                        (not (contains? new-meta :sci.impl/record)))
                                                   (assoc :sci.impl/record (:sci.impl/record old-meta)))]
                                   (clojure.core/with-meta obj (merge new-meta preserved))))))
-                     :meta {:name 'vary-meta :doc #?(:clj (:doc (meta #'clojure.core/vary-meta)) :cljs nil)}}
+                     :meta {:name 'vary-meta :doc #?(:clj (:doc (meta #'clojure.core/vary-meta)) :cljs (existing-doc (symbol "clojure.core" "vary-meta")))}}
                     ;; meta — hide :type and :sci.impl/record implementation keys from user code
                     (symbol "clojure.core" "meta")
                     {:val (fn [obj]
@@ -1717,7 +1729,7 @@
                                 (let [cleaned (dissoc m :sci.impl/var-sym)]
                                   (when (seq cleaned) cleaned))
                                 :else m)))
-                     :meta {:name 'meta :doc #?(:clj (:doc (meta #'clojure.core/meta)) :cljs nil)}}
+                     :meta {:name 'meta :doc #?(:clj (:doc (meta #'clojure.core/meta)) :cljs (existing-doc (symbol "clojure.core" "meta")))}}
                     ;; dissoc — handle SCI records: removing basis fields downgrades to plain map
                     (symbol "clojure.core" "dissoc")
                     (let [dissoc1 (fn [m k]
@@ -1746,7 +1758,20 @@
                                                        (when (instance? clojure.lang.MultiFn pm)
                                                          (let [method-table (.getMethodTable ^clojure.lang.MultiFn pm)]
                                                            (get method-table type-obj)))))
-                                                   :cljs nil))]
+                                                   :cljs
+                                                   (when (instance? sci.lang.Type type-obj)
+                                                     (or
+                                                      ;; Inline protocol implementation (deftype/defrecord/reify)
+                                                      (let [methods (.-methods ^sci.lang.Type type-obj)]
+                                                        (or (get methods '-pr-writer)
+                                                            (get methods (symbol "-pr-writer"))))
+                                                      ;; Extended via extend-protocol/extend-type
+                                                      (let [ipw-entry (get @heap-atom (symbol "clojure.core" "IPrintWithWriter"))]
+                                                        (when (and ipw-entry (= :sci/protocol (:type (:val ipw-entry))))
+                                                          (let [impls @(:impls (:val ipw-entry))
+                                                                impl (get impls type-obj)]
+                                                            (or (get impl '-pr-writer)
+                                                                (get impl (symbol "-pr-writer"))))))))))]
                             (fn sci-pr [& args]
                               (letfn [(meta-prefix [x s]
                                         (if (and *print-meta*
@@ -1761,13 +1786,20 @@
                                               type-obj (when m (:type m))
                                               custom-pm-fn (get-custom-pm type-obj)]
                                           (cond
-                                            ;; Custom print-method registered for this SCI type
+                                            ;; Custom print-method/IPrintWithWriter for this SCI type
                                             custom-pm-fn
                                             #?(:clj
                                                (let [sw (java.io.StringWriter.)]
                                                  (custom-pm-fn x sw)
                                                  (str sw))
-                                               :cljs (clojure.core/pr-str x))
+                                               :cljs
+                                               (let [sb (volatile! "")
+                                                     writer (reify
+                                                              IWriter
+                                                              (-write [_ s] (vswap! sb str s))
+                                                              (-flush [_]))]
+                                                 (custom-pm-fn x writer nil)
+                                                 @sb))
                                             ;; SCI record — print as #ns.Name{...}
                                             (and m (:sci.impl/record m))
                                             (let [type-name (when (instance? sci.lang.Type type-obj)
@@ -1793,7 +1825,7 @@
                                   s (apply pr-str-fn args)]
                               #?(:clj (.write ^java.io.Writer *out* ^String s)
                                  :cljs (*print-fn* s))))
-                     :meta {:name 'pr :doc #?(:clj (:doc (meta #'clojure.core/pr)) :cljs nil)}}
+                     :meta {:name 'pr :doc #?(:clj (:doc (meta #'clojure.core/pr)) :cljs (existing-doc (symbol "clojure.core" "pr")))}}
                     ;; prn — pr followed by newline
                     (symbol "clojure.core" "prn")
                     {:val (fn [& args]
@@ -1802,7 +1834,7 @@
                               #?(:clj (do (.write ^java.io.Writer *out* "\n")
                                           (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
                                  :cljs (*print-fn* "\n"))))
-                     :meta {:name 'prn :doc #?(:clj (:doc (meta #'clojure.core/prn)) :cljs nil)}}
+                     :meta {:name 'prn :doc #?(:clj (:doc (meta #'clojure.core/prn)) :cljs (existing-doc (symbol "clojure.core" "prn")))}}
                     ;; print-str — like pr-str for print-str
                     (symbol "clojure.core" "print-str")
                     {:val (fn [& args]
@@ -1838,7 +1870,7 @@
                                         (clojure.core/extends? protocol atype)
                                         false)
                                  :cljs false)))
-                     :meta {:name 'extends? :doc #?(:clj (:doc (meta #'clojure.core/extends?)) :cljs nil)}})
+                     :meta {:name 'extends? :doc #?(:clj (:doc (meta #'clojure.core/extends?)) :cljs (existing-doc (symbol "clojure.core" "extends?")))}})
         ;; Override pmap to capture SCI dynamic bindings at call time.
         ;; pmap is lazy — futures may be created after the binding form exits, so we must
         ;; snapshot current-dynamic-bindings when pmap is called and restore it in each thread.
