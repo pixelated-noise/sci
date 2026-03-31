@@ -1353,6 +1353,30 @@
                                            (clojure.core/str x))))
                                      args))))
                      :meta {:name 'str}}
+                    ;; with-meta — preserve :type and :sci.impl/record in metadata
+                    (symbol "clojure.core" "with-meta")
+                    {:val (fn [obj m]
+                            (let [old-meta (clojure.core/meta obj)
+                                  preserved (select-keys old-meta [:type :sci.impl/record])]
+                              (clojure.core/with-meta obj (merge m preserved))))
+                     :meta {:name 'with-meta :doc #?(:clj (:doc (meta #'clojure.core/with-meta)) :cljs nil)}}
+                    ;; vary-meta — preserve :type and :sci.impl/record in metadata
+                    (symbol "clojure.core" "vary-meta")
+                    {:val (fn [obj f & args]
+                            (let [old-meta (clojure.core/meta obj)
+                                  new-meta (apply f old-meta args)
+                                  preserved (select-keys old-meta [:type :sci.impl/record])]
+                              (clojure.core/with-meta obj (merge new-meta preserved))))
+                     :meta {:name 'vary-meta :doc #?(:clj (:doc (meta #'clojure.core/vary-meta)) :cljs nil)}}
+                    ;; meta — hide :type and :sci.impl/record implementation keys from user code
+                    (symbol "clojure.core" "meta")
+                    {:val (fn [obj]
+                            (let [m (clojure.core/meta obj)]
+                              (if (and m (or (contains? m :type) (contains? m :sci.impl/record)))
+                                (let [cleaned (dissoc m :type :sci.impl/record)]
+                                  (when (seq cleaned) cleaned))
+                                m)))
+                     :meta {:name 'meta :doc #?(:clj (:doc (meta #'clojure.core/meta)) :cljs nil)}}
                     ;; class? — true for SCI types too
                     (symbol "clojure.core" "class?")
                     {:val (fn [x]
@@ -1751,10 +1775,25 @@
 ;; ============================================================
 
 (defmacro with-out-str [& body]
-  `(clojure.core/with-out-str ~@body))
+  `(let [sw# (java.io.StringWriter.)
+         old-out# @out]
+     (reset! out sw#)
+     (try
+       (binding [*out* sw#]
+         ~@body)
+       (finally
+         (reset! out old-out#)))
+     (str sw#)))
 
 (defmacro with-in-str [s & body]
-  `(clojure.core/with-in-str ~s ~@body))
+  `(let [sr# (java.io.StringReader. ~s)
+         old-in# @in]
+     (reset! in sr#)
+     (try
+       (binding [*in* (clojure.java.io/reader sr#)]
+         ~@body)
+       (finally
+         (reset! in old-in#)))))
 
 (defmacro future [& body]
   `(clojure.core/future ~@body))

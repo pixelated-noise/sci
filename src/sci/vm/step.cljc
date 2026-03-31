@@ -1970,11 +1970,13 @@
         sigs-map (reduce-kv (fn [acc mname {:keys [arglists]}]
                               (let [doc-str (some (fn [md]
                                                     (when (and (seq? md) (= mname (first md)))
-                                                      (let [s (second md)]
-                                                        (when (string? s) s))))
+                                                      ;; docstring can be second element or last element
+                                                      (let [parts (rest md)]
+                                                        (or (when (string? (last parts)) (last parts))
+                                                            (when (string? (first parts)) (first parts))))))
                                                   method-defs)]
                                 (assoc acc (keyword mname)
-                                       {:name mname :arglists arglists :doc doc-str})))
+                                       {:name mname :arglists (apply list arglists) :doc doc-str})))
                             {} method-sigs)
         protocol (assoc (make-protocol proto-name method-sigs ns-sym opts)
                         :sigs sigs-map)
