@@ -287,7 +287,7 @@
                                         :else
                                         (clojure.core/satisfies? protocol x)]
                                   :cljs [:else false])))
-                     :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs (existing-doc (symbol "clojure.core" "satisfies?")))}
+                     :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs "Returns true if x satisfies the protocol")}
                      :dynamic? false})
         ;; Override deref to handle SCI type instances with deref methods
         heap (assoc heap (symbol "clojure.core" "deref")
@@ -445,7 +445,7 @@
                           {:val (fn sci-isa?
                                   ([child parent] (clojure.core/isa? @hierarchy-atom (type->tag child) (type->tag parent)))
                                   ([h child parent] (clojure.core/isa? h (type->tag child) (type->tag parent))))
-                           :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs (existing-doc (symbol "clojure.core" "isa?")))}
+                           :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs "Returns true if (= child parent), or child is directly or indirectly derived from parent")}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "parents")
                           {:val (fn sci-parents
@@ -999,16 +999,29 @@
                (swap! heap-atom assoc (symbol (str current-ns) (str sym-name)) entry')))))
        nil))))
 
+(defn- sci-write-line
+  "Write a line to the current SCI output destination."
+  [s]
+  #?(:clj (do (.write ^java.io.Writer *out* ^String (str s))
+              (.write ^java.io.Writer *out* "\n"))
+     :cljs (if-let [w @out]
+             (do (-write w (str s)) (-write w "\n"))
+             (if-let [pf @print-fn]
+               (do (pf (str s)) (pf "\n"))
+               (when *print-fn*
+                 (*print-fn* (str s))
+                 (*print-fn* "\n"))))))
+
 (defn- sci-print-doc
   "Print documentation for a SCI var entry's metadata, compatible with
    clojure.repl/print-doc but using SCI-side symbol/string instead of Clojure namespace."
   [{:keys [ns name arglists macro doc special-form]}]
-  (println "-------------------------")
-  (println (str (when ns (str (clojure.core/name (clojure.core/symbol (str ns))) "/")) name))
-  (when arglists (println (pr-str arglists)))
-  (when macro (println "Macro"))
-  (when special-form (println "Special Form"))
-  (when doc (println " " doc))
+  (sci-write-line "-------------------------")
+  (sci-write-line (str (when ns (str (clojure.core/name (clojure.core/symbol (str ns))) "/")) name))
+  (when arglists (sci-write-line (pr-str arglists)))
+  (when macro (sci-write-line "Macro"))
+  (when special-form (sci-write-line "Special Form"))
+  (when doc (sci-write-line (str "  " doc)))
   nil)
 
 (defn- make-doc-fn [ctx heap-atom]
@@ -1040,12 +1053,14 @@
 
 (defn- sci-print-doc* [m]
   #?(:clj (#'clojure.repl/print-doc m)
-     :cljs (do (println "-------------------------")
-               (println (:name m))
+     :cljs (do (sci-write-line "-------------------------")
+               (sci-write-line (str (:name m)))
                (when-let [arglists (:arglists m)]
-                 (println arglists))
+                 (sci-write-line (pr-str arglists)))
+               (when (:macro m)
+                 (sci-write-line "Macro"))
                (when-let [doc (:doc m)]
-                 (println " " doc)))))
+                 (sci-write-line (str "  " doc))))))
 
 (defn- make-find-doc-fn [ctx heap-atom]
   (fn sci-find-doc [re-string-or-pattern]
@@ -1227,7 +1242,7 @@
                      (symbol "clojure.core" "ns-resolve")
                      {:val (fn [ns-sym sym] (resolve-fn ns-sym sym)) :meta {:name 'ns-resolve}}
                      (symbol "clojure.core" "eval")
-                     {:val eval-fn :meta {:name 'eval :doc #?(:clj (:doc (meta #'clojure.core/eval)) :cljs (existing-doc (symbol "clojure.core" "eval")))}}
+                     {:val eval-fn :meta {:name 'eval :doc #?(:clj (:doc (meta #'clojure.core/eval)) :cljs "Evaluates the form data structure and returns the result.")}}
                      (symbol "clojure.core" "macroexpand-1")
                      {:val (make-macroexpand-1-fn heap-atom) :meta {:name 'macroexpand-1}}
                      (symbol "clojure.core" "macroexpand")
@@ -1236,7 +1251,7 @@
                                (loop [f form]
                                  (let [expanded (me1-fn f)]
                                    (if (= expanded f) f (recur expanded))))))
-                      :meta {:name 'macroexpand :doc #?(:clj (:doc (meta #'clojure.core/macroexpand)) :cljs (existing-doc (symbol "clojure.core" "macroexpand")))}}
+                      :meta {:name 'macroexpand :doc #?(:clj (:doc (meta #'clojure.core/macroexpand)) :cljs "Repeatedly calls macroexpand-1 on form until it no longer represents a macro form, then returns it.")}}
                      (symbol "clojure.core" "bound?")
                      {:val (fn [& vars]
                              (every? (fn [v]
@@ -1254,7 +1269,7 @@
                      (symbol "clojure.core" "intern")
                      {:val (make-intern-fn heap-atom) :meta {:name 'intern}}
                      (symbol "clojure.core" "find-ns")
-                     {:val (make-find-ns-fn ctx) :meta {:name 'find-ns :doc #?(:clj (:doc (meta #'clojure.core/find-ns)) :cljs (existing-doc (symbol "clojure.core" "find-ns")))}}
+                     {:val (make-find-ns-fn ctx) :meta {:name 'find-ns :doc #?(:clj (:doc (meta #'clojure.core/find-ns)) :cljs "Returns the namespace named by the symbol or nil if it doesn't exist.")}}
                      (symbol "clojure.core" "create-ns")
                      {:val (make-create-ns-fn ctx) :meta {:name 'create-ns}}
                      (symbol "clojure.core" "the-ns")
@@ -1270,7 +1285,7 @@
                      (symbol "clojure.core" "all-ns")
                      {:val (make-all-ns-fn ctx) :meta {:name 'all-ns}}
                      (symbol "clojure.core" "ns-publics")
-                     {:val ns-vars-fn :meta {:name 'ns-publics :doc #?(:clj (:doc (meta #'clojure.core/ns-publics)) :cljs (existing-doc (symbol "clojure.core" "ns-publics")))}}
+                     {:val ns-vars-fn :meta {:name 'ns-publics :doc #?(:clj (:doc (meta #'clojure.core/ns-publics)) :cljs "Returns a map of the public intern mappings for the namespace.")}}
                      (symbol "clojure.core" "ns-interns")
                      {:val ns-vars-fn :meta {:name 'ns-interns}}
                      (symbol "clojure.core" "*clojure-version*")
@@ -1317,7 +1332,7 @@
                                                       (update-in [ns-sym :refers] dissoc sym)
                                                       (update-in [ns-sym :unmapped] (fnil conj #{}) sym)))))
                                nil))
-                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs (existing-doc (symbol "clojure.core" "ns-unmap")))}}
+                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs "Removes the mappings for the symbol from the namespace.")}}
                      (symbol "clojure.core" "ns-imports")
                      {:val (fn [ns-sym-or-obj]
                              (let [ns-sym (if (symbol? ns-sym-or-obj)
@@ -1884,8 +1899,8 @@
                     ;; println — print followed by newline
                     (symbol "clojure.core" "println")
                     {:val (fn [& args]
-                            (let [print-fn (:val (get @heap-atom (symbol "clojure.core" "print")))]
-                              (apply print-fn args)
+                            (let [print-fn* (:val (get @heap-atom (symbol "clojure.core" "print")))]
+                              (apply print-fn* args)
                               #?(:clj (do (.write ^java.io.Writer *out* "\n")
                                           (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
                                  :cljs (if-let [w @out] (-write w "\n") (if-let [pf @print-fn] (pf "\n") (when *print-fn* (*print-fn* "\n")))))))
