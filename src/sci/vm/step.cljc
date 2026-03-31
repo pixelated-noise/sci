@@ -3024,7 +3024,18 @@
                                                                                                    (when ref-loc
                                                                                                      {:line (:line ref-loc)
                                                                                                       :column (:column ref-loc)})))))))
-                                                                :cljs m'')))
+                                                                :cljs
+                                                                (let [ns-str (str pkg)
+                                                                      ns-str-unm (clojure.string/replace ns-str "_" "-")
+                                                                      ns-table (or (when-let [a (:ns-atom m'')] @a) (:ns m''))
+                                                                      sci-type (or (get-in ns-table [(symbol ns-str) :types (symbol (str cls))])
+                                                                                   (get-in ns-table [(symbol ns-str-unm) :types (symbol (str cls))]))]
+                                                                  (if sci-type
+                                                                    (-> m''
+                                                                        (update :env assoc short sci-type)
+                                                                        (update-in [:ns ns-sym :types] assoc short sci-type)
+                                                                        (update-in [:ns ns-sym :imports] assoc short sci-type))
+                                                                    m'')))))
                                                          m' classes))
                                                m'))
                                            m ref-specs)
