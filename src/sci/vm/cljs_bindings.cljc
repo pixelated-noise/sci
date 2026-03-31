@@ -510,34 +510,50 @@
                (doseq ~(vec more) ~@body))
              (recur (next s#))))))))
 
-(defn- for-impl [_ _ seq-exprs body-expr]
-  (if (empty? seq-exprs)
-    ;; Base case: no more bindings, just produce the body in a list
-    (list 'list body-expr)
-    (let [[bind expr & more] seq-exprs]
-      (if (and (nil? more) (not (keyword? bind)))
-        ;; Last binding — simple map
-        `(map (fn [~bind] ~body-expr) ~expr)
-        ;; Complex for with multiple bindings/modifiers
-        (if (keyword? bind)
-          (cond
-            (= :let bind)
-            `(let ~expr (for ~(vec more) ~body-expr))
-            (= :when bind)
-            `(if ~expr (for ~(vec more) ~body-expr) (list))
-            (= :while bind)
-            `(if ~expr (for ~(vec more) ~body-expr) (list)))
-          `(mapcat (fn [~bind] (for ~(vec more) ~body-expr)) ~expr))))))
+(defn- for-impl [_ _ & args]
+  (let [arg-count (count args)]
+    (when-not (= 2 arg-count)
+      (throw (ex-info (str "Wrong number of args (" arg-count ") passed to: clojure.core/for") {}))))
+  (let [seq-exprs (first args)
+        body-expr (second args)]
+    (when-not (vector? seq-exprs)
+      (throw (ex-info "for requires a vector for its binding" {})))
+    (when-not (even? (count seq-exprs))
+      (throw (ex-info "for requires an even number of forms in binding vector" {})))
+    ;; Validate modifier keywords
+    (doseq [[k _v] (partition 2 seq-exprs)]
+      (when (keyword? k)
+        (when-not (#{:let :when :while} k)
+          (throw (ex-info (str "Unsupported keyword in for: " k ". Only :let, :when, :while are valid keyword modifiers.") {})))))
+    (if (empty? seq-exprs)
+      ;; Base case: no more bindings, just produce the body in a list
+      (list 'list body-expr)
+      (let [[bind expr & more] seq-exprs]
+        (if (and (nil? more) (not (keyword? bind)))
+          ;; Last binding — simple map
+          `(map (fn [~bind] ~body-expr) ~expr)
+          ;; Complex for with multiple bindings/modifiers
+          (if (keyword? bind)
+            (cond
+              (= :let bind)
+              `(let ~expr (for ~(vec more) ~body-expr))
+              (= :when bind)
+              `(if ~expr (for ~(vec more) ~body-expr) (list))
+              (= :while bind)
+              `(if ~expr (for ~(vec more) ~body-expr) (list)))
+            `(mapcat (fn [~bind] (for ~(vec more) ~body-expr)) ~expr)))))))
 
 (defn- comment-impl [_ _ & _body] nil)
 
 (defn- assert-impl
   ([_ _ x]
-   `(when-not ~x
-      (throw (ex-info (str "Assert failed: " '~x) {}))))
+   `(when clojure.core/*assert*
+      (when-not ~x
+        (throw (ex-info (str "Assert failed: " '~x) {})))))
   ([_ _ x message]
-   `(when-not ~x
-      (throw (ex-info (str "Assert failed: " ~message "\n" '~x) {})))))
+   `(when clojure.core/*assert*
+      (when-not ~x
+        (throw (ex-info (str "Assert failed: " ~message "\n" '~x) {}))))))
 
 (defn- if-not-impl
   ([_ _ test then] `(if (not ~test) ~then nil))
@@ -549,6 +565,16 @@
   (let [default (when (odd? (count clauses)) (last clauses))
         clauses (if (odd? (count clauses)) (butlast clauses) clauses)
         pairs (partition 2 clauses)
+        ;; Check for duplicate test constants
+        _ (let [all-tests (mapcat (fn [[test _]]
+                                    (if (and (sequential? test) (not (vector? test)))
+                                      (seq test)
+                                      [test]))
+                                  pairs)
+                freqs (frequencies all-tests)]
+            (doseq [[t cnt] freqs]
+              (when (> cnt 1)
+                (throw (ex-info (str "Duplicate case test constant: " t) {})))))
         ge (gensym "case__")
         ;; Build case-map: for each test constant, map its hash to [test result]
         ;; For grouped tests like (2 3), create separate entries for each
@@ -850,6 +876,7 @@
                 'abs abs 'parse-long parse-long 'parse-double parse-double
                 'parse-boolean parse-boolean 'parse-uuid parse-uuid
                 'NaN? NaN? 'Inf? Inf?
+                '*assert* true
                 'random-uuid random-uuid
                 ;; with-out-str helpers
                 '--sci-with-out-str-start
