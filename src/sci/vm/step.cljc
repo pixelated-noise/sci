@@ -326,7 +326,21 @@
                              (if-let [klass (or (try-resolve-class sym-ns)
                                                 (when (map? class-config) (:class class-config))
                                                 (when (class? (get classes (symbol sym-ns))) (get classes (symbol sym-ns))))]
-                               (resolve-static-member klass sym-name)
+                               (do
+                                 ;; Check class access: only allow classes that are configured, :allow :all, or in default imports
+                                 (when (and (some? classes)
+                                            (not= :all classes)
+                                            (not= :all (:allow classes))
+                                            (not (contains? classes (symbol sym-ns)))
+                                            (not (contains? classes klass))
+                                            ;; Allow java.lang.* classes (default imports)
+                                            (not (.startsWith ^String (.getName ^Class klass) "java.lang."))
+                                            ;; Allow classes in default imports of the current namespace
+                                            (not (some (fn [[_ v]] (= v klass))
+                                                       (get-in machine [:ns (:current-ns machine) :imports]))))
+                                   (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                   {:type :sci/error :sym sym :phase "analysis"})))
+                                 (resolve-static-member klass sym-name))
                                (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                {:type :sci/error :sym sym :phase "analysis"}))))))
                          :cljs
@@ -1080,18 +1094,29 @@
              (let [method-str (str (:method-name frame))]
                (if (instance? Class f)
                  ;; Static access — try static field/method first, fall back to instance method on Class object
-                 (if (:field? frame)
-                   (m/push-value machine
-                                 (try (clojure.lang.Reflector/getStaticField ^Class f method-str)
-                                      (catch Exception _
-                                        (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))
-                   (m/push-value machine
-                                 (try
-                                   (clojure.lang.Reflector/getStaticField ^Class f method-str)
-                                   (catch Exception _
-                                     (try (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))
-                                          (catch Exception _
-                                            (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false)))))))
+                 (let [check-class-access!
+                       (fn []
+                         ;; Block instance method calls on Class objects unless java.lang.Class is explicitly configured
+                         (let [classes (:classes machine)]
+                           (when (and (some? classes) (not= :all classes) (not= :all (:allow classes))
+                                      (not (contains? classes 'java.lang.Class))
+                                      (not (contains? classes Class)))
+                             (throw (ex-info (str method-str " on java.lang.Class is not allowed!")
+                                             {:type :sci/error})))))]
+                   (if (:field? frame)
+                     (m/push-value machine
+                                   (try (clojure.lang.Reflector/getStaticField ^Class f method-str)
+                                        (catch Exception _
+                                          (check-class-access!)
+                                          (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))
+                     (m/push-value machine
+                                   (try
+                                     (clojure.lang.Reflector/getStaticField ^Class f method-str)
+                                     (catch Exception _
+                                       (try (clojure.lang.Reflector/invokeStaticMethod ^Class f method-str (to-array []))
+                                            (catch Exception _
+                                              (check-class-access!)
+                                              (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))))))
                  ;; Instance access
                  (if (:field? frame)
                    (if (:type (clojure.core/meta f))
@@ -2033,7 +2058,19 @@
              [(first method-or-call) (rest method-or-call)]
              [method-or-call args])
            method-str (name method-name) ;; use name to strip namespace (e.g. clojure.core/close → close)
-           is-field? (.startsWith ^String method-str "-")]
+           is-field? (.startsWith ^String method-str "-")
+           ;; Capture type hint from obj-expr for class validation
+           obj-tag (when (symbol? obj-expr) (:tag (meta obj-expr)))]
+       ;; Validate type hint class exists at parse time
+       (when (and obj-tag (symbol? obj-tag))
+         (let [tag-str (str obj-tag)]
+           (when-not (or (try (Class/forName tag-str) (catch ClassNotFoundException _ nil))
+                         ;; Check imports
+                         (get-in machine [:ns (:current-ns machine) :imports] obj-tag)
+                         ;; Check if it's a SCI type
+                         (try-resolve-sci-type machine tag-str))
+             (throw (ex-info (str "Unable to resolve classname: " obj-tag)
+                             {:type :sci/error})))))
        (-> machine
            (m/replace-frame {:op :eval-args
                              :pending (vec method-args)
