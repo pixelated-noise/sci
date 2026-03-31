@@ -138,7 +138,17 @@
                                 (let [excludes (get-in @ns-atom [current-ns :refer-clojure-excludes])]
                                   (and excludes (contains? excludes (symbol sym-name))))))
                 resolved (when-not excluded?
-                           #?(:clj (clojure.core/resolve sym) :cljs nil))]
+                           #?(:clj (clojure.core/resolve sym)
+                              :cljs ;; On CLJS, resolve is a macro. Check the heap instead.
+                              (when heap-atom
+                                (let [h @heap-atom]
+                                  (some (fn [ns-str]
+                                          (let [q (symbol ns-str sym-name)]
+                                            (when (get h q)
+                                              (with-meta (symbol sym-name)
+                                                {:ns (symbol ns-str) :name (symbol sym-name)}))))
+                                        ["clojure.core" "clojure.string" "clojure.set"
+                                         "clojure.walk" "clojure.edn" "clojure.repl"])))))]
             (when resolved
               (let [m (meta resolved)
                     resolved-ns (str (:ns m))]
