@@ -270,9 +270,13 @@
 
 (defn step-eval-symbol [machine frame]
   (let [sym (:expr frame)
+        ;; Special forms can't be used as values, except those that also have
+        ;; function versions in the heap (require, use, in-ns)
         _ (when (and (not (qualified-symbol? sym))
                      (contains? special-forms sym)
-                     (not (contains? (:env machine) sym)))
+                     (not (contains? (:env machine) sym))
+                     (not (contains? (if-let [a (:heap-atom machine)] @a (:heap machine))
+                                     (symbol "clojure.core" (name sym)))))
             (throw (ex-info (str "Unable to resolve symbol: " sym " in this context")
                             {:type :sci/error :sym sym :phase "analysis"})))
         ;; Check if symbol resolves to a macro — can't use macro as value
@@ -2329,6 +2333,9 @@
                               (assoc :force-reload true :reload-all true))
                             (m/push-frame {:op :eval :expr expr}))]
                  (run m2)
+                 ;; Track loaded namespace
+                 (when-let [libs-atom (some-> (:ctx machine) :loaded-libs)]
+                   (swap! libs-atom conj ns-sym))
                  ;; Return machine with updated heap and ns table
                  ;; Merge ns-atom changes (from sub-machine's ns form and transitive requires)
                  (let [loaded-ns (when-let [a (:ns-atom machine)] @a)]

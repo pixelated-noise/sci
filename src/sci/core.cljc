@@ -411,6 +411,7 @@
      :ns-atom (atom ns-table)
      :ns-objects (atom {})
      :current-ns-atom (atom (or initial-ns 'user))
+     :loaded-libs (atom #{})
      :hierarchy-atom hierarchy-atom
      :classes (or classes {})
      :features (or features #{:clj})
@@ -730,7 +731,16 @@
     (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
           ns-info (get ns-data sym)]
       (when ns-info
-        (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)))))
+        (let [ns-objs (or (:ns-objects ctx) (atom {}))
+              ns-obj (get-or-create-ns-object ns-objs sym)
+              ns-meta (ns-meta-from-info ns-info)]
+          ;; Update cached object's metadata and store back in cache
+          ;; so that identical? works (ns-aliases reads from same cache)
+          (if ns-meta
+            (let [updated (with-meta ns-obj ns-meta)]
+              (swap! ns-objs assoc sym updated)
+              updated)
+            ns-obj))))))
 
 (defn- make-the-ns-fn [ctx]
   (fn [sym-or-ns]
@@ -1254,6 +1264,13 @@
                                                   (assoc (:meta entry) :sci.impl/var-sym sym)
                                                   (:dynamic? entry))))))
                      :meta {:name 'requiring-resolve}}
+                    (symbol "clojure.core" "loaded-libs")
+                    {:val (fn [] @(:loaded-libs ctx))
+                     :meta {:name 'loaded-libs :doc "Returns a sorted set of symbols naming the currently loaded libs"}}
+                    (symbol "clojure.core" "*loaded-libs*")
+                    {:val (:loaded-libs ctx)
+                     :meta {:name '*loaded-libs* :doc "A ref to a sorted set of symbols naming loaded libs"}
+                     :dynamic? true}
                     (symbol "clojure.core" "defonce")
                     {:val (fn sci-defonce [name expr]
                             (list 'do
