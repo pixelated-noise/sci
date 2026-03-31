@@ -116,11 +116,33 @@
                                     `(get ~gs '~sym ~(get or-map sym))
                                     `(get ~gs '~sym))))))
                    binds (:syms pattern))
+            ;; Handle namespaced :ns/keys
+            binds (reduce
+                   (fn [binds [k v]]
+                     (if (and (keyword? k)
+                              (namespace k)
+                              (= "keys" (name k))
+                              (vector? v))
+                       (let [ns-part (namespace k)]
+                         (reduce (fn [binds sym-k]
+                                   (let [sym (if (keyword? sym-k) (symbol (name sym-k)) sym-k)
+                                         kw (keyword ns-part (name sym))]
+                                     (into binds
+                                           (destructure-binding
+                                            sym (if (contains? or-map sym)
+                                                  `(get ~gs ~kw ~(get or-map sym))
+                                                  `(get ~gs ~kw))))))
+                                 binds v))
+                       binds))
+                   binds pattern)
             ;; Handle regular key-value pairs: {local-sym lookup-key}
             ;; In Clojure: {foo-val k} means bind foo-val to (get map k)
             binds (reduce
                    (fn [binds [local-sym lookup-key]]
-                     (if (#{:keys :strs :syms :or :as} local-sym)
+                     (if (or (#{:keys :strs :syms :or :as} local-sym)
+                             (and (keyword? local-sym)
+                                  (namespace local-sym)
+                                  (= "keys" (name local-sym))))
                        binds
                        (into binds
                              (destructure-binding local-sym
@@ -368,8 +390,10 @@
                                                        (if (and has-kwargs? (map? orig))
                                                          (let [map-gs (gensym "kwargs__")]
                                                            (into (conj acc
-                                                                       map-gs (list 'if (list 'map? new-p)
-                                                                                    new-p
+                                                                       map-gs (list 'if (list 'clojure.core/and
+                                                                                              (list '= 1 (list 'clojure.core/count new-p))
+                                                                                              (list 'map? (list 'first new-p)))
+                                                                                    (list 'first new-p)
                                                                                     (list 'clojure.core/apply 'clojure.core/hash-map new-p)))
                                                                  (destructure-binding orig map-gs)))
                                                          (into acc (destructure-binding orig new-p)))))
