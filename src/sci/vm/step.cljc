@@ -211,7 +211,14 @@
                       type-obj
                 ;; Try as Java static field/method
                       #?(:clj
-                         (if-let [klass (try-resolve-class sym-ns)]
+                         (if-let [klass (or (try-resolve-class sym-ns)
+                                            ;; Check :classes config for the class
+                                            (let [classes (:classes machine)
+                                                  class-entry (when (map? classes) (get classes (symbol sym-ns)))]
+                                              (cond
+                                                (class? class-entry) class-entry
+                                                (and (map? class-entry) (:class class-entry)) (:class class-entry)
+                                                :else nil)))]
                            (resolve-static-member klass sym-name)
                            (throw (ex-info (str "Unable to resolve symbol: " sym)
                                            {:type :sci/error :sym sym :phase "analysis"})))
@@ -246,6 +253,15 @@
                                 #?(:clj (or (try-resolve-class sym-name)
                                             ;; Try dotted SCI type (e.g. foo.Foo → ns foo, type Foo)
                                             (try-resolve-sci-type machine sym-name)
+                                            ;; Check imports in current namespace
+                                            (get-in machine [:ns ns-sym :imports (symbol sym-name)])
+                                            ;; Check :classes config (user-provided classes)
+                                            (let [classes (:classes machine)
+                                                  class-entry (when (map? classes) (get classes (symbol sym-name)))]
+                                              (cond
+                                                (class? class-entry) class-entry
+                                                (and (map? class-entry) (:class class-entry)) (:class class-entry)
+                                                :else nil))
                                             (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                             {:type :sci/error :sym sym :phase "analysis"})))
                                    :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
@@ -2839,6 +2855,25 @@
                                   (merge {:record? is-record?}
                                          (when (seq mutable-fields) {:mutable-fields mutable-fields})
                                          (when (seq host-interfaces) {:interfaces host-interfaces})))
+        ;; Call :deftype-fn hook if present
+        deftype-fn-hook (:deftype-fn machine)
+        hook-result (when deftype-fn-hook
+                      (deftype-fn-hook {:interfaces host-interfaces
+                                        :methods method-fns
+                                        :protocols (reduce (fn [acc proto-sym]
+                                                             (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                                                                   env (:env machine)
+                                                                   proto (or (get env proto-sym)
+                                                                             (let [q (symbol (str ns-sym) (name proto-sym))
+                                                                                   cq (symbol "clojure.core" (name proto-sym))]
+                                                                               (or (:val (get heap q))
+                                                                                   (:val (get heap cq)))))]
+                                                               (if (and (map? proto) (= :sci/protocol (:type proto)))
+                                                                 (assoc acc proto-sym proto)
+                                                                 acc)))
+                                                           {} protocols-vec)}))
+        _ (when-let [err (:error hook-result)]
+            (throw (ex-info err {:type :sci/error})))
         ;; Create positional constructor ->Name
         ;; Mutable field values are wrapped in atoms
         mutable-kws (set (map keyword mutable-fields))

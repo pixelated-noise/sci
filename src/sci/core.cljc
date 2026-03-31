@@ -148,7 +148,7 @@
   [opts]
   (let [{:keys [bindings namespaces classes aliases ns-aliases imports
                 features load-fn readers deny allow file initial-ns
-                disable-arity-checks]} opts
+                disable-arity-checks deftype-fn reify-fn]} opts
         heap (host/default-heap)
         ns-table (host/default-ns-table)
         ;; Override satisfies? to handle SCI protocols
@@ -422,6 +422,8 @@
      :allow allow
      :file file
      :disable-arity-checks (boolean disable-arity-checks)
+     :deftype-fn deftype-fn
+     :reify-fn reify-fn
      #?@(:clj [:inverse-registry (host/inverse-registry heap)])}))
 
 (defn fork
@@ -1695,6 +1697,8 @@
                 (:classes ctx) (assoc :classes (:classes ctx))
                 (:inverse-registry ctx) (assoc :inverse-registry (:inverse-registry ctx))
                 (:hierarchy-atom ctx) (assoc :hierarchy-atom (:hierarchy-atom ctx))
+                (:deftype-fn ctx) (assoc :deftype-fn (:deftype-fn ctx))
+                (:reify-fn ctx) (assoc :reify-fn (:reify-fn ctx))
                 true (as-> m' m'
                       (let [f (or (:file ctx) @(clojure.core/resolve 'sci.core/file))]
                         (if f (assoc m' :current-file f) m'))))]
