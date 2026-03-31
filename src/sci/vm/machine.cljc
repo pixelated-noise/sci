@@ -14,8 +14,7 @@
    :heap    (or heap {})     ; interned vars: qualified-sym -> {:val :meta :dynamic?}
    :heap-atom (atom (or heap {}))  ; shared mutable heap for closures
    :result  nil         ; most recently computed value
-   :status  :running    ; :running | :done | :suspend | :effect
-   :effect  nil         ; when :effect, describes the requested side effect
+   :status  :running    ; :running | :done | :suspend
    :suspend-data nil    ; when :suspend, optional data from (suspend! data)
    :current-ns 'user    ; current namespace symbol
    :permissions permissions

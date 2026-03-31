@@ -816,8 +816,7 @@
     (case (:status m)
       :running (recur (sci/step m))
       :done    (:result m)
-      :suspend m
-      :effect  m)))
+      :suspend m)))
 
 (deftest prepare-returns-running-machine
   (testing "prepare returns a machine with :status :running"

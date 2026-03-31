@@ -1879,7 +1879,7 @@
              read-opts (merge (make-reader-opts current-ns aliases (:heap-atom ctx) ns-atom) reader-extra {:eof eof})
              form (edamame/parse-next reader read-opts)]
          (if (identical? form eof)
-           (if (and (map? result) (contains? #{:suspend :effect} (:status result)))
+           (if (and (map? result) (= :suspend (:status result)))
              result  ;; Return suspended machine as-is
              result)
            (let [eval-file (get (meta form) :clojure.core/eval-file)
@@ -2372,8 +2372,7 @@
    The returned machine's :status will be one of:
      :running  — more work to do, call step again
      :done     — computation finished, result in (:result machine)
-     :suspend  — code called (suspend!), data in (:suspend-data machine)
-     :effect   — code requested a side effect"
+     :suspend  — code called (suspend!), data in (:suspend-data machine)"
   [machine]
   (step/safe-step machine))
 

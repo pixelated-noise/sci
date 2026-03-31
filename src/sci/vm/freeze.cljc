@@ -266,9 +266,9 @@
 
 (defn freeze
   "Serialize a suspended or running machine to an EDN string.
-   The machine must have :status :suspend, :effect, or :running."
+   The machine must have :status :suspend or :running."
   [machine]
-  (assert (contains? #{:suspend :effect :running} (:status machine))
+  (assert (contains? #{:suspend :running} (:status machine))
           (str "Can only freeze a suspended or running machine, got status: " (:status machine)))
   #?(:clj
      (let [heap (:heap machine)

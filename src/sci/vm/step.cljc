@@ -4296,5 +4296,4 @@
                                     (assoc next-m :dynamic-bindings post-dyn))]
                        (recur next-m (unchecked-inc steps))))
           :done    (:result m)
-          :suspend m
-          :effect  m)))))
+          :suspend m)))))
