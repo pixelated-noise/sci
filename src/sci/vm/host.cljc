@@ -140,6 +140,60 @@
                             (apply f args))))
                  :meta {:name 'with-bindings* :doc #?(:clj (:doc (meta #'clojure.core/with-bindings*)) :cljs nil)}})
          :cljs identity)
+      ;; Override comp and partial so their results carry reconstruction metadata,
+      ;; enabling freeze/thaw to serialize and reconstruct composed/partial fns.
+      #?(:clj
+         (assoc 'clojure.core/comp
+                {:val (fn sci-comp
+                        ([] identity)
+                        ([f] f)
+                        ([f g]
+                         (let [result (fn
+                                        ([] (f (g)))
+                                        ([x] (f (g x)))
+                                        ([x y] (f (g x y)))
+                                        ([x y & args] (f (apply g x y args))))]
+                           (with-meta result {:sci/comp-fns [f g]})))
+                        ([f g & more]
+                         (reduce sci-comp (list* f g more))))
+                 :meta {:name 'comp :doc (:doc (meta #'clojure.core/comp))}})
+         :cljs identity)
+      #?(:clj
+         (assoc 'clojure.core/partial
+                {:val (fn sci-partial
+                        ([f] f)
+                        ([f arg1]
+                         (with-meta
+                           (fn
+                             ([] (f arg1))
+                             ([x] (f arg1 x))
+                             ([x y] (f arg1 x y))
+                             ([x y z] (f arg1 x y z))
+                             ([x y z & args] (apply f arg1 x y z args)))
+                           {:sci/partial-f f :sci/partial-args [arg1]}))
+                        ([f arg1 arg2]
+                         (with-meta
+                           (fn
+                             ([] (f arg1 arg2))
+                             ([x] (f arg1 arg2 x))
+                             ([x y] (f arg1 arg2 x y))
+                             ([x y z] (f arg1 arg2 x y z))
+                             ([x y z & args] (apply f arg1 arg2 x y z args)))
+                           {:sci/partial-f f :sci/partial-args [arg1 arg2]}))
+                        ([f arg1 arg2 arg3]
+                         (with-meta
+                           (fn
+                             ([] (f arg1 arg2 arg3))
+                             ([x] (f arg1 arg2 arg3 x))
+                             ([x y] (f arg1 arg2 arg3 x y))
+                             ([x y z & args] (apply f arg1 arg2 arg3 x y z args)))
+                           {:sci/partial-f f :sci/partial-args [arg1 arg2 arg3]}))
+                        ([f arg1 arg2 arg3 & more]
+                         (with-meta
+                           (fn [& args] (apply f arg1 arg2 arg3 (concat more args)))
+                           {:sci/partial-f f :sci/partial-args (into [arg1 arg2 arg3] more)})))
+                 :meta {:name 'partial :doc (:doc (meta #'clojure.core/partial))}})
+         :cljs identity)
       ;; Override assert with a runtime check so (set! *assert* false) takes effect.
       ;; The host clojure.core/assert macro checks *assert* at expansion time, not runtime.
       ;; Our override always emits (when *assert* ...), letting the VM evaluate *assert*

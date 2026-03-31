@@ -44,6 +44,20 @@
             ;; Return the plain closure map (already data), minus :sci/closure marker
             (dissoc closure-map :sci/closure))
 
+          ;; comp result — carries :sci/comp-fns metadata
+          (and (fn? x) (:sci/comp-fns (meta x)))
+          {:type :comp-fn
+           :fns (mapv #(replace-unserializable % inverse-reg)
+                      (:sci/comp-fns (meta x)))}
+
+          ;; partial result — carries :sci/partial-f and :sci/partial-args metadata
+          (and (fn? x) (:sci/partial-f (meta x)))
+          (let [m (meta x)]
+            {:type :partial-fn
+             :f (replace-unserializable (:sci/partial-f m) inverse-reg)
+             :args (mapv #(replace-unserializable % inverse-reg)
+                         (:sci/partial-args m))})
+
           ;; Host fn — look up in inverse registry
           (fn? x)
           (if-let [sym (.get ^java.util.IdentityHashMap inverse-reg x)]
@@ -146,6 +160,17 @@
             :ns-ref
             (let [ns-sym (symbol (:name x))]
               (or (clojure.core/find-ns ns-sym) ns-sym))
+
+            :comp-fn
+            (let [fns (:fns x)
+                  sci-comp (:val (get full-heap 'clojure.core/comp))]
+              (apply sci-comp fns))
+
+            :partial-fn
+            (let [f (:f x)
+                  args (:args x)
+                  sci-partial (:val (get full-heap 'clojure.core/partial))]
+              (apply sci-partial f args))
 
             :unknown-fn
             (fn [& _args]
