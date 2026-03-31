@@ -1032,23 +1032,8 @@
                                 (:sci.impl/var-sym m) (dissoc m :sci.impl/var-sym)
                                 :else m)))
                      :meta {:name 'meta}}
-                    (symbol "clojure.core" "with-meta")
-                    {:val (fn sci-with-meta [obj new-meta]
-                            (let [m (clojure.core/meta obj)]
-                              (if (and (fn? obj) m (:sci/closure m))
-                                ;; SCI closure: update :user-meta, keep internal closure info intact
-                                (with-meta obj (assoc m :user-meta new-meta))
-                                (with-meta obj new-meta))))
-                     :meta {:name 'with-meta}}
-                    (symbol "clojure.core" "vary-meta")
-                    {:val (fn sci-vary-meta [obj f & args]
-                            (let [m (clojure.core/meta obj)]
-                              (if (and (fn? obj) m (:sci/closure m))
-                                ;; SCI closure: apply f to :user-meta only
-                                (let [new-user-meta (apply f (:user-meta m) args)]
-                                  (with-meta obj (assoc m :user-meta new-user-meta)))
-                                (apply clojure.core/vary-meta obj f args))))
-                     :meta {:name 'vary-meta}}
+                    ;; with-meta and vary-meta are overridden later in the heap build
+                    ;; to handle both closures and SCI type metadata preservation
                     (symbol "clojure.core" "alter-meta!")
                     {:val (make-alter-meta!-fn heap-atom) :meta {:name 'alter-meta!}}
                     (symbol "clojure.core" "reset-meta!")
@@ -1431,20 +1416,40 @@
                                            (clojure.core/str x))))
                                      args))))
                      :meta {:name 'str}}
-                    ;; with-meta — preserve :type and :sci.impl/record in metadata
+                    ;; with-meta — preserve :type and :sci.impl/record unless user explicitly sets them
                     (symbol "clojure.core" "with-meta")
                     {:val (fn [obj m]
-                            (let [old-meta (clojure.core/meta obj)
-                                  preserved (select-keys old-meta [:type :sci.impl/record])]
-                              (clojure.core/with-meta obj (merge m preserved))))
+                            (let [old-meta (clojure.core/meta obj)]
+                              (if (and (fn? obj) old-meta (:sci/closure old-meta))
+                                ;; SCI closure: update :user-meta, keep internal closure info intact
+                                (clojure.core/with-meta obj (assoc old-meta :user-meta m))
+                                ;; Only preserve impl keys that user didn't explicitly provide
+                                (let [preserved (cond-> {}
+                                                  (and (contains? old-meta :type)
+                                                       (not (contains? m :type)))
+                                                  (assoc :type (:type old-meta))
+                                                  (and (contains? old-meta :sci.impl/record)
+                                                       (not (contains? m :sci.impl/record)))
+                                                  (assoc :sci.impl/record (:sci.impl/record old-meta)))]
+                                  (clojure.core/with-meta obj (merge m preserved))))))
                      :meta {:name 'with-meta :doc #?(:clj (:doc (meta #'clojure.core/with-meta)) :cljs nil)}}
-                    ;; vary-meta — preserve :type and :sci.impl/record in metadata
                     (symbol "clojure.core" "vary-meta")
                     {:val (fn [obj f & args]
-                            (let [old-meta (clojure.core/meta obj)
-                                  new-meta (apply f old-meta args)
-                                  preserved (select-keys old-meta [:type :sci.impl/record])]
-                              (clojure.core/with-meta obj (merge new-meta preserved))))
+                            (let [old-meta (clojure.core/meta obj)]
+                              (if (and (fn? obj) old-meta (:sci/closure old-meta))
+                                ;; SCI closure: apply f to :user-meta only
+                                (let [new-user-meta (apply f (:user-meta old-meta) args)]
+                                  (clojure.core/with-meta obj (assoc old-meta :user-meta new-user-meta)))
+                                ;; Only preserve impl keys that the fn didn't explicitly set
+                                (let [new-meta (apply f old-meta args)
+                                      preserved (cond-> {}
+                                                  (and (contains? old-meta :type)
+                                                       (not (contains? new-meta :type)))
+                                                  (assoc :type (:type old-meta))
+                                                  (and (contains? old-meta :sci.impl/record)
+                                                       (not (contains? new-meta :sci.impl/record)))
+                                                  (assoc :sci.impl/record (:sci.impl/record old-meta)))]
+                                  (clojure.core/with-meta obj (merge new-meta preserved))))))
                      :meta {:name 'vary-meta :doc #?(:clj (:doc (meta #'clojure.core/vary-meta)) :cljs nil)}}
                     ;; meta — hide :type and :sci.impl/record implementation keys from user code
                     (symbol "clojure.core" "meta")

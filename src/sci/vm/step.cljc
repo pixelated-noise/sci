@@ -986,12 +986,22 @@
           (let [f (:f frame)]
             (if (instance? sci.lang.Type f)
               ;; SCI type constructor with args
+              ;; For records: (new Rec field1 field2 ... meta-map ext-map)
+              ;; Extra args beyond field count are meta and ext-map
               (let [fields (.-fields ^sci.lang.Type f)
                     field-kws (mapv keyword fields)
+                    n-fields (count fields)
                     is-record? (:record? (.-opts ^sci.lang.Type f))
-                    instance (with-meta (zipmap field-kws done)
+                    [field-vals extra] (if (and is-record? (> (count done) n-fields))
+                                         [(take n-fields done) (drop n-fields done)]
+                                         [done nil])
+                    user-meta (first extra)
+                    ext-map (second extra)
+                    base-map (zipmap field-kws field-vals)
+                    instance (with-meta (if ext-map (merge base-map ext-map) base-map)
                                (merge {:type f}
-                                      (when is-record? {:sci.impl/record true})))]
+                                      (when is-record? {:sci.impl/record true})
+                                      user-meta))]
                 (m/push-value machine instance))
               #?(:clj
                  (m/push-value machine
@@ -1573,7 +1583,7 @@
         ;; Check if sym is a type name (deftype/defrecord create no var)
         type-name (symbol (name sym))
         type-obj (get-in machine [:ns ns-sym :types type-name])]
-    (if type-obj
+    (if (and type-obj (instance? sci.lang.Type type-obj))
       (throw (ex-info (str "Unable to resolve var: " sym " in this context")
                       {:type :sci/error}))
       (let [qualified (if (qualified-symbol? sym)
