@@ -2382,3 +2382,18 @@
   ([machine] (prepare-resume machine nil))
   ([machine value]
    (machine/resume machine value)))
+
+(defn inspect
+  "Return a summary map describing a machine's current state.
+   Useful for logging, debugging, or building scheduling decisions
+   during stepped execution."
+  [machine]
+  (let [frame (machine/peek-frame machine)]
+    {:status      (:status machine)
+     :op          (:op frame)
+     :expr        (:expr frame)
+     :result      (:result machine)
+     :stack-depth (count (:stack machine))
+     :current-ns  (:current-ns machine)
+     :env         (:env machine)
+     :suspend-data (:suspend-data machine)}))

@@ -870,3 +870,24 @@
           thawed (freeze/thaw frozen)]
       (is (= :running (:status thawed)))
       (is (= 7 (step-to-completion thawed))))))
+
+(deftest inspect-machine
+  (testing "inspect returns a summary of the machine state"
+    (let [m (sci/prepare "(+ 1 2)")
+          info (sci/inspect m)]
+      (is (= :running (:status info)))
+      (is (= :eval (:op info)))
+      (is (some? (:expr info)))
+      (is (= 1 (:stack-depth info)))
+      (is (= 'user (:current-ns info)))
+      (is (map? (:env info)))))
+  (testing "inspect on a done machine"
+    (let [m (step-to-completion (sci/prepare "(+ 1 2)"))
+          info (sci/inspect (sci/prepare "(+ 1 2)"))]
+      ;; just verify it doesn't throw on various states
+      (is (= :running (:status info)))))
+  (testing "inspect on a suspended machine"
+    (let [m (step-to-completion (sci/prepare "(suspend!)"))
+          info (sci/inspect m)]
+      (is (= :suspend (:status info)))
+      (is (nil? (:op info))))))
