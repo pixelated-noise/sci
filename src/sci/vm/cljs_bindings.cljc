@@ -209,7 +209,7 @@
     (list 'if (first clauses)
           (if (next clauses) (second clauses)
               (throw (ex-info "cond requires an even number of forms" {})))
-          (cons 'cond (next (next clauses))))))
+          (cons 'clojure.core/cond (next (next clauses))))))
 
 (defn- condp-impl [_ _ pred expr & clauses]
   (let [gpred (gensym "pred__")
@@ -325,6 +325,32 @@
         expand-arity (fn [sig]
                        (let [params (first sig)
                              body (rest sig)
+                             ;; Extract pre/post conditions
+                             [pre-post body] (if (and (map? (first body))
+                                                       (or (:pre (first body)) (:post (first body))))
+                                               [(first body) (rest body)]
+                                               [nil body])
+                             pre-checks (when-let [pres (:pre pre-post)]
+                                          (map (fn [p] (list 'clojure.core/assert p)) pres))
+                             post-check (:post pre-post)
+                             ;; Wrap body with pre/post conditions
+                             body (if (or pre-checks post-check)
+                                    (let [inner (if (seq pre-checks)
+                                                  (concat pre-checks body)
+                                                  body)]
+                                      (if post-check
+                                        (let [ret (gensym "ret__")]
+                                          (list (list 'let* [ret (cons 'do inner)]
+                                                      (cons 'do (map (fn [p]
+                                                                       (list 'when-not
+                                                                             (clojure.walk/postwalk-replace {'% ret} p)
+                                                                             (list 'throw (list 'ex-info
+                                                                                                (str "Assert failed: " (pr-str p))
+                                                                                                {}))))
+                                                                     post-check))
+                                                      ret)))
+                                        inner))
+                                    body)
                              ;; Check if params need destructuring
                              needs-destr? (some #(or (map? %) (vector? %)) params)]
                          (if needs-destr?
