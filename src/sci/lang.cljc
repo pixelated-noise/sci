@@ -55,6 +55,26 @@
    (defmethod print-method Var [^Var v ^java.io.Writer w]
      (.write w (str "#'" (or (:sci.impl/var-sym (.-meta-map v)) (.-sym v))))))
 
+;; DynamicVar — wraps an atom as thread-local storage for a dynamic SCI var.
+;; Distinct from plain atoms so resolve-symbol can deref it automatically.
+;; meta-map stores optional metadata (e.g. {:sci/built-in true}).
+(deftype DynamicVar [atom-ref meta-map]
+  #?@(:clj [clojure.lang.IDeref
+             (deref [_] @atom-ref)
+             clojure.lang.IMeta
+             (meta [_] meta-map)
+             clojure.lang.IAtom
+             (reset [_ v] (reset! atom-ref v))
+             (swap [_ f] (swap! atom-ref f))
+             (swap [_ f a] (swap! atom-ref f a))
+             (swap [_ f a b] (swap! atom-ref f a b))
+             (swap [_ f a b args] (apply swap! atom-ref f a b args))
+             (compareAndSet [_ ov nv] (compare-and-set! atom-ref ov nv))]
+      :cljs [IDeref
+             (-deref [_] @atom-ref)
+             IMeta
+             (-meta [_] meta-map)]))
+
 ;; Unbound — represents an unbound SCI var
 (deftype Unbound [sym]
   #?@(:clj [Object

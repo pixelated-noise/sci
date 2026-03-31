@@ -1808,9 +1808,12 @@
        (when (> idx 0)
          (let [ns-str (subs class-name 0 idx)
                type-str (subs class-name (inc idx))
-               ;; Also try un-munged namespace (underscores → dashes)
-               ns-str-unm (clojure.string/replace ns-str "_" "-")]
-           (or (get-in machine [:ns (symbol ns-str) :types (symbol type-str)])
+               ns-str-unm (clojure.string/replace ns-str "_" "-")
+               ;; Check both machine :ns and ns-atom
+               ns-table (or (when-let [a (:ns-atom machine)] @a) (:ns machine))]
+           (or (get-in ns-table [(symbol ns-str) :types (symbol type-str)])
+               (get-in ns-table [(symbol ns-str-unm) :types (symbol type-str)])
+               (get-in machine [:ns (symbol ns-str) :types (symbol type-str)])
                (get-in machine [:ns (symbol ns-str-unm) :types (symbol type-str)])))))
      :cljs nil))
 
@@ -1825,6 +1828,8 @@
            klass
            (let [short-name (symbol (.getSimpleName ^Class klass))
                  cur-ns (:current-ns machine)]
+             (when-let [a (:ns-atom machine)]
+               (swap! a update-in [cur-ns :imports] assoc short-name klass))
              (-> machine
                  (update :env assoc short-name klass)
                  (update-in [:ns cur-ns :imports] assoc short-name klass)
@@ -1833,6 +1838,9 @@
            (let [idx (.lastIndexOf ^String class-str ".")
                  short-name (symbol (subs class-str (inc idx)))
                  cur-ns (:current-ns machine)]
+             (when-let [a (:ns-atom machine)]
+               (swap! a update-in [cur-ns :types] assoc short-name sci-type)
+               (swap! a update-in [cur-ns :imports] assoc short-name sci-type))
              (-> machine
                  (update :env assoc short-name sci-type)
                  (update-in [:ns cur-ns :types] assoc short-name sci-type)
@@ -2080,8 +2088,12 @@
                      :dynamic? false}]
     (when-let [a (:heap-atom machine)]
       (swap! a assoc qualified proto-entry))
+    ;; Register protocol in namespace :types map (for import resolution)
+    (when-let [ns-atom (:ns-atom machine)]
+      (swap! ns-atom update-in [ns-sym :types] assoc proto-name protocol))
     (-> machine
         (assoc-in [:heap qualified] proto-entry)
+        (update-in [:ns ns-sym :types] assoc proto-name protocol)
         (update :env assoc proto-name protocol)
         (m/push-value proto-name))))
 
@@ -2720,10 +2732,16 @@
                     (reduce (fn [m proto-sym]
                               (let [proto-ns-str (when (qualified-symbol? proto-sym)
                                                    (namespace proto-sym))
+                                    ;; Resolve namespace alias to real ns
+                                    resolved-ns (if proto-ns-str
+                                                  (let [alias-sym (symbol proto-ns-str)
+                                                        ns-data (get-in m [:ns ns-sym])]
+                                                    (or (get (:aliases ns-data) alias-sym)
+                                                        (symbol proto-ns-str)))
+                                                  ns-sym)
                                     proto-name   (name proto-sym)
                                     proto (or (get env proto-sym)
-                                              (let [the-ns (or proto-ns-str (str ns-sym))
-                                                    q  (symbol the-ns proto-name)
+                                              (let [q  (symbol (str resolved-ns) proto-name)
                                                     cq (symbol "clojure.core" proto-name)]
                                                 (or (:val (get heap q))
                                                     (:val (get heap cq)))))]
@@ -2794,7 +2812,10 @@
                                                     q (symbol the-ns proto-name)
                                                     cq (symbol "clojure.core" proto-name)]
                                                 (or (:val (get heap q))
-                                                    (:val (get heap cq)))))]
+                                                    (:val (get heap cq))
+                                                    ;; Check :types/:imports for imported protocols
+                                                    (get-in m [:ns ns-sym :types (symbol proto-name)])
+                                                    (get-in m [:ns ns-sym :imports (symbol proto-name)]))))]
                                 (if (and (map? proto) (= :sci/protocol (:type proto)))
                                   (let [proto-methods (:methods proto)
                                         impl-fns (reduce (fn [acc [mname _]]

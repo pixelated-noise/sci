@@ -10,11 +10,16 @@
 ;; Freeze — machine → EDN string
 ;; ============================================================
 
+(def ^:private extra-namespaces
+  "Namespaces injected by make-machine-from-ctx (not user-defined, not resolvable by thaw)."
+  #{"sci.core" "clojure.lang"})
+
 (defn- host-ns?
-  "True if the qualified symbol belongs to a default (host) namespace."
+  "True if the qualified symbol belongs to a default (host) or extra namespace."
   [qualified-sym]
   (let [ns-str (namespace qualified-sym)]
-    (some #(= ns-str (str %)) host/default-namespaces)))
+    (or (some #(= ns-str (str %)) host/default-namespaces)
+        (contains? extra-namespaces ns-str))))
 
 (defn- user-heap
   "Extract only user-defined entries from the heap (not host namespaces)."
@@ -79,7 +84,7 @@
            u-heap (user-heap heap)
            ;; Build the serializable state
            state (-> machine
-                     (dissoc :heap-atom :heap)
+                     (dissoc :heap-atom :heap :inverse-registry)
                      (assoc :user-heap (replace-unserializable u-heap inverse-reg)))
            state (replace-unserializable state inverse-reg)]
        (pr-str (assoc state :version 1)))

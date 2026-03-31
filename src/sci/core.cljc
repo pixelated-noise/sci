@@ -154,7 +154,8 @@
         ;; Override satisfies? to handle SCI protocols
         heap (assoc heap (symbol "clojure.core" "satisfies?")
                     {:val (fn sci-satisfies? [protocol x]
-                            (if (and (map? protocol) (= :sci/protocol (:type protocol)))
+                            (cond
+                              (and (map? protocol) (= :sci/protocol (:type protocol)))
                               (let [impls @(:impls protocol)
                                     target-type (type x)]
                                 (boolean
@@ -166,7 +167,11 @@
                                      (when (nil? x) (get impls nil))
                                      (get impls Object)
                                      (get impls :default))))
+                              ;; Host protocol wrapped in a map (from sci/new-var)
+                              (and (map? protocol) (:protocol protocol))
+                              (clojure.core/satisfies? (:protocol protocol) x)
                               ;; Fall back to clojure.core/satisfies? for real protocols
+                              :else
                               (clojure.core/satisfies? protocol x)))
                      :meta {:name 'satisfies? :doc #?(:clj (:doc (meta #'clojure.core/satisfies?)) :cljs nil)}
                      :dynamic? false})
@@ -1385,9 +1390,16 @@
                     ;; instance? — check SCI types too
                     (symbol "clojure.core" "instance?")
                     {:val (fn [cls obj]
-                            (if (instance? sci.lang.Type cls)
+                            (cond
+                              (instance? sci.lang.Type cls)
                               ;; SCI type — check :type metadata
                               (= cls (:type (clojure.core/meta obj)))
+                              ;; SCI protocol — check if protocol is satisfied
+                              (and (map? cls) (= :sci/protocol (:type cls)))
+                              (let [type-obj (or (:type (clojure.core/meta obj)) (clojure.core/type obj))
+                                    impls @(:impls cls)]
+                                (boolean (get impls type-obj)))
+                              :else
                               ;; Host class
                               (clojure.core/instance? cls obj)))
                      :meta {:name 'instance?}}
