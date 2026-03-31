@@ -622,6 +622,17 @@
          (finally
            ~@restore-forms)))))
 
+(defn- with-out-str-impl [_ _ & body]
+  ;; with-out-str — capture print output to a string
+  ;; Expands to code that calls helper fns to redirect *print-fn* to a buffer
+  (let [state (gensym "wos__")]
+    `(let [~state (clojure.core/--sci-with-out-str-start)]
+       (try
+         (do ~@body)
+         (finally
+           (clojure.core/--sci-with-out-str-end ~state)))
+       (deref (first ~state)))))
+
 (defn- with-local-vars-impl [_ _ bindings & body]
   ;; (with-local-vars [x 1 y 2] body) — create locally-scoped vars
   (let [pairs (partition 2 bindings)
@@ -630,6 +641,25 @@
                              pairs)]
     `(let [~@let-bindings]
        ~@body)))
+
+(defn- areduce-impl [_ _ a idx ret init expr]
+  ;; (areduce a idx ret init expr) → loop over array indices
+  (list 'let* [a a]
+        (list 'loop* [idx (int 0) ret init]
+              (list 'if (list '< idx (list 'clojure.core/alength a))
+                    (list 'recur (list 'clojure.core/unchecked-inc idx) expr)
+                    ret))))
+
+(defn- ..-impl [_ _ x & forms]
+  ;; (.. x (m1) (m2)) → (. (. x (m1)) (m2))
+  (if forms
+    (let [expanded (reduce (fn [acc form]
+                             (if (seq? form)
+                               (list* '. acc form)
+                               (list '. acc form)))
+                           x forms)]
+      expanded)
+    (list '. x)))
 
 (defn- exists?-impl [_ _ sym]
   ;; exists? checks if a symbol is defined (not nil/undefined)
@@ -820,7 +850,20 @@
                 'abs abs 'parse-long parse-long 'parse-double parse-double
                 'parse-boolean parse-boolean 'parse-uuid parse-uuid
                 'NaN? NaN? 'Inf? Inf?
-                'random-uuid random-uuid}]
+                'random-uuid random-uuid
+                ;; with-out-str helpers
+                '--sci-with-out-str-start
+                (fn []
+                  (let [sb (volatile! "")
+                        old-print-fn *print-fn*
+                        old-print-err-fn *print-err-fn*]
+                    (set! *print-fn* (fn [x] (vswap! sb str x)))
+                    (set! *print-err-fn* (fn [x] (vswap! sb str x)))
+                    [sb old-print-fn old-print-err-fn]))
+                '--sci-with-out-str-end
+                (fn [[_ old-print-fn old-print-err-fn]]
+                  (set! *print-fn* old-print-fn)
+                  (set! *print-err-fn* old-print-err-fn))}]
        (reduce-kv
         (fn [acc sym v]
           (assoc acc (symbol "clojure.core" (str sym))
@@ -879,7 +922,10 @@
                    'amap       amap-impl
                    'import     import-impl
                    'with-redefs with-redefs-impl
-                   'with-local-vars with-local-vars-impl}]
+                   'with-local-vars with-local-vars-impl
+                   'with-out-str with-out-str-impl
+                   'areduce areduce-impl
+                   '.. ..-impl}]
        (reduce-kv
         (fn [acc sym v]
           (assoc acc (symbol "clojure.core" (str sym))

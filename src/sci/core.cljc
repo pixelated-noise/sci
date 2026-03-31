@@ -11,7 +11,8 @@
             [edamame.core :as edamame]
             [sci.lang]
             [sci.impl.types]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+)
 
 (declare read-eval)
 
@@ -197,7 +198,15 @@
                                               map-ctor-sym (symbol ns-str (str "map->" type-str))
                                               entry (get @heap-atom map-ctor-sym)]
                                           (when entry (:val entry)))))))
-                         :cljs nil)))))
+                         :cljs (fn [tag]
+                                (when (= 'js tag)
+                                  (fn [v]
+                                    (if (map? v)
+                                      (apply list 'js-obj
+                                             (mapcat (fn [[k val]]
+                                                       [(if (keyword? k) (name k) (str k)) val])
+                                                     v))
+                                      (apply list 'array (seq v)))))))))))
 
 (defn read-all
   "Read all forms from a string."
@@ -1782,15 +1791,17 @@
                     {:val (fn [& args]
                             (let [pr-str-fn (:val (get @heap-atom (symbol "clojure.core" "pr-str")))
                                   s (apply pr-str-fn args)]
-                              (.write ^java.io.Writer *out* ^String s)))
+                              #?(:clj (.write ^java.io.Writer *out* ^String s)
+                                 :cljs (*print-fn* s))))
                      :meta {:name 'pr :doc #?(:clj (:doc (meta #'clojure.core/pr)) :cljs nil)}}
                     ;; prn — pr followed by newline
                     (symbol "clojure.core" "prn")
                     {:val (fn [& args]
                             (let [pr-fn (:val (get @heap-atom (symbol "clojure.core" "pr")))]
                               (apply pr-fn args)
-                              (.write ^java.io.Writer *out* "\n")
-                              (when *flush-on-newline* (.flush ^java.io.Writer *out*))))
+                              #?(:clj (do (.write ^java.io.Writer *out* "\n")
+                                          (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
+                                 :cljs (*print-fn* "\n"))))
                      :meta {:name 'prn :doc #?(:clj (:doc (meta #'clojure.core/prn)) :cljs nil)}}
                     ;; print-str — like pr-str for print-str
                     (symbol "clojure.core" "print-str")
@@ -2234,6 +2245,22 @@
 ;; ============================================================
 ;; IO wrappers
 ;; ============================================================
+
+#?(:cljs
+   (defn with-out-str-fn
+     "Execute f and capture all print output to a string."
+     [f]
+     (let [sb (volatile! "")
+           old-print-fn *print-fn*
+           old-print-err-fn *print-err-fn*]
+       (set! *print-fn* (fn [x] (vswap! sb str x)))
+       (set! *print-err-fn* (fn [x] (vswap! sb str x)))
+       (try
+         (f)
+         (finally
+           (set! *print-fn* old-print-fn)
+           (set! *print-err-fn* old-print-err-fn)))
+       @sb)))
 
 (defmacro with-out-str [& body]
   `(let [sw# (java.io.StringWriter.)
