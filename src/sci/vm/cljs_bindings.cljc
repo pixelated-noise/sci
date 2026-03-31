@@ -763,7 +763,7 @@
                 'unchecked-int unchecked-int
                 'unchecked-multiply unchecked-multiply
                 'unchecked-add unchecked-add
-                'unreduced unreduced
+                'unreduced unreduced 'unquote nil 'unquote-splicing nil
                 'unchecked-subtract unchecked-subtract
                 'unchecked-inc unchecked-inc
                 'val val 'vals vals 'vary-meta vary-meta
