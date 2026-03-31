@@ -760,7 +760,15 @@
                 'chunk-first chunk-first 'chunk-rest chunk-rest
                 'chunk-next chunk-next 'chunked-seq? chunked-seq?
                 'compare-and-set! compare-and-set!
-                'dec dec 'dedupe dedupe 'deref deref
+                'dec dec 'dedupe dedupe
+                'deref (fn sci-deref [ref]
+                         (if-let [type-obj (:type (clojure.core/meta ref))]
+                           (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
+                             (let [methods (unchecked-get type-obj "methods$")
+                                   deref-fn (or (get methods 'deref) (get methods '-deref))]
+                               (if deref-fn (deref-fn ref) (deref ref)))
+                             (deref ref))
+                           (deref ref)))
                 'dissoc dissoc 'distinct distinct 'distinct? distinct?
                 'disj disj 'doall doall 'dorun dorun
                 'double double 'double? double?
@@ -820,7 +828,15 @@
                 'reductions reductions 'rand rand
                 'replace replace 'rseq rseq
                 'random-sample random-sample 'repeat repeat
-                'reset! reset! 'reset-meta! reset-meta!
+                'reset! (fn sci-reset! [ref v]
+                          (if-let [type-obj (:type (clojure.core/meta ref))]
+                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
+                              (let [methods (unchecked-get type-obj "methods$")
+                                    reset-fn (or (get methods 'reset) (get methods '-reset!))]
+                                (if reset-fn (reset-fn ref v) (reset! ref v)))
+                              (reset! ref v))
+                            (reset! ref v)))
+                'reset-meta! reset-meta!
                 'set? set? 'sequential? sequential?
                 'select-keys select-keys
                 'simple-keyword? simple-keyword?
@@ -828,7 +844,40 @@
                 'some? some? 'string? string?
                 'str str 'second second 'set set 'seq seq 'seq? seq?
                 'shuffle shuffle 'sort sort 'sort-by sort-by
-                'subs subs 'swap! swap!
+                'subs subs
+                'swap! (fn sci-swap!
+                         ([ref f]
+                          (if-let [type-obj (:type (clojure.core/meta ref))]
+                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
+                              (let [methods (unchecked-get type-obj "methods$")
+                                    swap-fn (or (get methods 'swap) (get methods '-swap!))]
+                                (if swap-fn (swap-fn ref f) (swap! ref f)))
+                              (swap! ref f))
+                            (swap! ref f)))
+                         ([ref f a]
+                          (if-let [type-obj (:type (clojure.core/meta ref))]
+                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
+                              (let [methods (unchecked-get type-obj "methods$")
+                                    swap-fn (or (get methods 'swap) (get methods '-swap!))]
+                                (if swap-fn (swap-fn ref f a) (swap! ref f a)))
+                              (swap! ref f a))
+                            (swap! ref f a)))
+                         ([ref f a b]
+                          (if-let [type-obj (:type (clojure.core/meta ref))]
+                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
+                              (let [methods (unchecked-get type-obj "methods$")
+                                    swap-fn (or (get methods 'swap) (get methods '-swap!))]
+                                (if swap-fn (swap-fn ref f a b) (swap! ref f a b)))
+                              (swap! ref f a b))
+                            (swap! ref f a b)))
+                         ([ref f a b & args]
+                          (if-let [type-obj (:type (clojure.core/meta ref))]
+                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
+                              (let [methods (unchecked-get type-obj "methods$")
+                                    swap-fn (or (get methods 'swap) (get methods '-swap!))]
+                                (if swap-fn (apply swap-fn ref f a b args) (apply swap! ref f a b args)))
+                              (apply swap! ref f a b args))
+                            (apply swap! ref f a b args))))
                 'symbol symbol 'symbol? symbol?
                 'special-symbol? special-symbol? 'subvec subvec
                 'some-fn some-fn 'some some

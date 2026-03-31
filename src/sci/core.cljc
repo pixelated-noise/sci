@@ -16,6 +16,12 @@
 
 (declare read-eval)
 
+(defn- type-methods
+  "Get the methods map from a sci.lang.Type instance.
+   Works around CLJS field munging where `methods` becomes `methods$`."
+  [^sci.lang.Type type-obj]
+  #?(:clj (.-methods type-obj)
+     :cljs (unchecked-get type-obj "methods$")))
 
 ;; ============================================================
 ;; Reader
@@ -255,7 +261,17 @@
                                            impls)
                                      (when (nil? x) (get impls nil))
                                      (get impls #?(:clj Object :cljs js/Object))
-                                     (get impls :default))))
+                                     (get impls :default)
+                                     ;; For CLJS: check if object satisfies the corresponding host protocol
+                                     #?(:cljs (let [pname (:name protocol)]
+                                                (case pname
+                                                  clojure.core/IDeref (clojure.core/satisfies? IDeref x)
+                                                  clojure.core/ISwap (clojure.core/satisfies? ISwap x)
+                                                  clojure.core/IReset (clojure.core/satisfies? IReset x)
+                                                  clojure.core/IWriter (clojure.core/satisfies? IWriter x)
+                                                  clojure.core/IPrintWithWriter (clojure.core/satisfies? IPrintWithWriter x)
+                                                  false))
+                                        :clj nil))))
                               ;; Host protocol wrapped in a map (from sci/new-var)
                               ;; clojure.core/satisfies? is a macro in CLJS — can't call with runtime protocol
                               #?@(:clj [(and (map? protocol) (:protocol protocol))
@@ -272,7 +288,7 @@
                             ([ref]
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
-                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                 (let [methods (type-methods type-obj)
                                        deref-fn (or (get methods 'deref)
                                                     (get methods '-deref))]
                                    (if deref-fn
@@ -290,7 +306,7 @@
                             ([ref f]
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
-                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                 (let [methods (type-methods type-obj)
                                        swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (swap-fn ref f)
@@ -300,7 +316,7 @@
                             ([ref f a]
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
-                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                 (let [methods (type-methods type-obj)
                                        swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (swap-fn ref f a)
@@ -310,7 +326,7 @@
                             ([ref f a b]
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
-                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                 (let [methods (type-methods type-obj)
                                        swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (swap-fn ref f a b)
@@ -320,7 +336,7 @@
                             ([ref f a b & args]
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
-                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                 (let [methods (type-methods type-obj)
                                        swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                    (if swap-fn
                                      (apply swap-fn ref f a b args)
@@ -333,7 +349,7 @@
                     {:val (fn sci-reset! [ref v]
                             (if-let [type-obj (:type (clojure.core/meta ref))]
                               (if (instance? sci.lang.Type type-obj)
-                                (let [methods (.-methods ^sci.lang.Type type-obj)
+                                (let [methods (type-methods type-obj)
                                       reset-fn (or (get methods 'reset) (get methods '-reset!))]
                                   (if reset-fn
                                     (reset-fn ref v)
@@ -347,7 +363,7 @@
                     {:val (fn sci-reset-vals! [ref newval]
                             (if-let [type-obj (:type (clojure.core/meta ref))]
                               (if (instance? sci.lang.Type type-obj)
-                                (let [methods (.-methods ^sci.lang.Type type-obj)
+                                (let [methods (type-methods type-obj)
                                       rv-fn (get methods 'resetVals)]
                                   (if rv-fn
                                     (rv-fn ref newval)
@@ -361,7 +377,7 @@
                             ([ref f]
                              (if-let [type-obj (:type (clojure.core/meta ref))]
                                (if (instance? sci.lang.Type type-obj)
-                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                 (let [methods (type-methods type-obj)
                                        sv-fn (get methods 'swapVals)]
                                    (if sv-fn
                                      (sv-fn ref f)
@@ -377,7 +393,7 @@
                     {:val (fn sci-compare-and-set! [ref oldval newval]
                             (if-let [type-obj (:type (clojure.core/meta ref))]
                               (if (instance? sci.lang.Type type-obj)
-                                (let [methods (.-methods ^sci.lang.Type type-obj)
+                                (let [methods (type-methods type-obj)
                                       cas-fn (get methods 'compareAndSet)]
                                   (if cas-fn
                                     (cas-fn ref oldval newval)
@@ -1588,7 +1604,7 @@
                             (if-let [type-obj (when-let [m (clojure.core/meta x)]
                                                 (when (instance? sci.lang.Type (:type m))
                                                   (:type m)))]
-                              (if-let [hash-fn (get (.-methods ^sci.lang.Type type-obj) 'hashCode)]
+                              (if-let [hash-fn (get (type-methods type-obj) 'hashCode)]
                                 (hash-fn x)
                                 (clojure.core/hash x))
                               (clojure.core/hash x)))
@@ -1762,7 +1778,7 @@
                                                    (when (instance? sci.lang.Type type-obj)
                                                      (or
                                                       ;; Inline protocol implementation (deftype/defrecord/reify)
-                                                      (let [methods (.-methods ^sci.lang.Type type-obj)]
+                                                      (let [methods (type-methods type-obj)]
                                                         (or (get methods '-pr-writer)
                                                             (get methods (symbol "-pr-writer"))))
                                                       ;; Extended via extend-protocol/extend-type
@@ -1803,11 +1819,11 @@
                                             ;; SCI record — print as #ns.Name{...}
                                             (and m (:sci.impl/record m))
                                             (let [type-name (when (instance? sci.lang.Type type-obj)
-                                                              (.-name ^sci.lang.Type type-obj))]
+                                                              (.getName ^sci.lang.Type type-obj))]
                                               (str "#" type-name "{" (clojure.string/join ", " (map (fn [[k v]] (str (pr1 k) " " (pr1 v))) (sort-by key x))) "}"))
                                             ;; SCI deftype (non-record) — print as #object[ns.Name]
                                             (instance? sci.lang.Type type-obj)
-                                            (str "#object[" (.-name ^sci.lang.Type type-obj) "]")
+                                            (str "#object[" (.getName ^sci.lang.Type type-obj) "]")
                                             ;; SCI Var — print as #'ns/name
                                             (instance? sci.lang.Var x) (str "#'" (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var x)) (.-sym ^sci.lang.Var x)))
                                             ;; Collections — recursive traversal to catch SCI types inside
@@ -1845,7 +1861,7 @@
                                                             (:sci.impl/record m)
                                                             (let [type-obj (:type m)
                                                                   type-name (when (instance? sci.lang.Type type-obj)
-                                                                              (.-name ^sci.lang.Type type-obj))]
+                                                                              (.getName ^sci.lang.Type type-obj))]
                                                               (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
                                                             (instance? sci.lang.Var x)
                                                             (let [v ^sci.lang.Var x]
