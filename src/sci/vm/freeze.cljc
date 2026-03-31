@@ -66,6 +66,41 @@
               :args (mapv #(replace-unserializable % inverse-reg seen)
                           (:sci/partial-args m))})
 
+           ;; juxt result — carries :sci/juxt-fns metadata
+           (and (fn? x) (:sci/juxt-fns (meta x)))
+           {:type :juxt-fn
+            :fns (mapv #(replace-unserializable % inverse-reg seen)
+                       (:sci/juxt-fns (meta x)))}
+
+           ;; complement result
+           (and (fn? x) (:sci/complement-f (meta x)))
+           {:type :complement-fn
+            :f (replace-unserializable (:sci/complement-f (meta x)) inverse-reg seen)}
+
+           ;; every-pred result
+           (and (fn? x) (:sci/every-pred-fns (meta x)))
+           {:type :every-pred-fn
+            :fns (mapv #(replace-unserializable % inverse-reg seen)
+                       (:sci/every-pred-fns (meta x)))}
+
+           ;; some-fn result
+           (and (fn? x) (:sci/some-fn-fns (meta x)))
+           {:type :some-fn-fn
+            :fns (mapv #(replace-unserializable % inverse-reg seen)
+                       (:sci/some-fn-fns (meta x)))}
+
+           ;; memoize result
+           (and (fn? x) (:sci/memoize-f (meta x)))
+           {:type :memoize-fn
+            :f (replace-unserializable (:sci/memoize-f (meta x)) inverse-reg seen)}
+
+           ;; fnil result
+           (and (fn? x) (:sci/fnil-f (meta x)))
+           (let [m (meta x)]
+             {:type :fnil-fn
+              :f (replace-unserializable (:sci/fnil-f m) inverse-reg seen)
+              :defaults (:sci/fnil-defaults m)})
+
            ;; Multimethod — carries :sci/multimethod type in metadata
            (and (fn? x) (= :sci/multimethod (:type (meta x))))
            (let [m (meta x)
@@ -283,9 +318,15 @@
             (let [ns-sym (symbol (:name x))]
               (or (clojure.core/find-ns ns-sym) ns-sym))
 
-            ;; comp/partial — deferred to second pass (fns may be closure maps)
+            ;; HOF results — deferred to second pass (inner fns may be closure maps)
             :comp-fn x
             :partial-fn x
+            :juxt-fn x
+            :complement-fn x
+            :every-pred-fn x
+            :some-fn-fn x
+            :memoize-fn x
+            :fnil-fn x
 
             ;; Multimethod — deferred to second pass (methods may contain closures)
             :multimethod
@@ -356,6 +397,33 @@
                   args (:args x)
                   sci-partial (:val (get (:heap machine) 'clojure.core/partial))]
               (apply sci-partial f args))
+
+            :juxt-fn
+            (let [fns (:fns x)
+                  sci-juxt (:val (get (:heap machine) 'clojure.core/juxt))]
+              (apply sci-juxt fns))
+
+            :complement-fn
+            (let [sci-complement (:val (get (:heap machine) 'clojure.core/complement))]
+              (sci-complement (:f x)))
+
+            :every-pred-fn
+            (let [fns (:fns x)
+                  sci-every-pred (:val (get (:heap machine) 'clojure.core/every-pred))]
+              (apply sci-every-pred fns))
+
+            :some-fn-fn
+            (let [fns (:fns x)
+                  sci-some-fn (:val (get (:heap machine) 'clojure.core/some-fn))]
+              (apply sci-some-fn fns))
+
+            :memoize-fn
+            (let [sci-memoize (:val (get (:heap machine) 'clojure.core/memoize))]
+              (sci-memoize (:f x)))
+
+            :fnil-fn
+            (let [sci-fnil (:val (get (:heap machine) 'clojure.core/fnil))]
+              (apply sci-fnil (:f x) (:defaults x)))
 
             :multimethod
             (let [mm-name (symbol (:name x))

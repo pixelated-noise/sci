@@ -194,6 +194,190 @@
                            {:sci/partial-f f :sci/partial-args (into [arg1 arg2 arg3] more)})))
                  :meta {:name 'partial :doc (:doc (meta #'clojure.core/partial))}})
          :cljs identity)
+      ;; Override juxt so freeze/thaw can reconstruct the composed fn.
+      #?(:clj
+         (assoc 'clojure.core/juxt
+                {:val (fn sci-juxt
+                        ([f]
+                         (with-meta
+                           (fn
+                             ([] [(f)])
+                             ([x] [(f x)])
+                             ([x y] [(f x y)])
+                             ([x y z] [(f x y z)])
+                             ([x y z & args] [(apply f x y z args)]))
+                           {:sci/juxt-fns [f]}))
+                        ([f g]
+                         (with-meta
+                           (fn
+                             ([] [(f) (g)])
+                             ([x] [(f x) (g x)])
+                             ([x y] [(f x y) (g x y)])
+                             ([x y z] [(f x y z) (g x y z)])
+                             ([x y z & args] [(apply f x y z args) (apply g x y z args)]))
+                           {:sci/juxt-fns [f g]}))
+                        ([f g h]
+                         (with-meta
+                           (fn
+                             ([] [(f) (g) (h)])
+                             ([x] [(f x) (g x) (h x)])
+                             ([x y] [(f x y) (g x y) (h x y)])
+                             ([x y z] [(f x y z) (g x y z) (h x y z)])
+                             ([x y z & args] [(apply f x y z args) (apply g x y z args) (apply h x y z args)]))
+                           {:sci/juxt-fns [f g h]}))
+                        ([f g h & fs]
+                         (let [all (list* f g h fs)]
+                           (with-meta
+                             (fn [& args] (vec (map #(apply % args) all)))
+                             {:sci/juxt-fns (vec all)}))))
+                 :meta {:name 'juxt :doc (:doc (meta #'clojure.core/juxt))}})
+         :cljs identity)
+      ;; Override complement so freeze/thaw can reconstruct it.
+      #?(:clj
+         (assoc 'clojure.core/complement
+                {:val (fn sci-complement [f]
+                        (with-meta
+                          (fn
+                            ([] (not (f)))
+                            ([x] (not (f x)))
+                            ([x y] (not (f x y)))
+                            ([x y & zs] (not (apply f x y zs))))
+                          {:sci/complement-f f}))
+                 :meta {:name 'complement :doc (:doc (meta #'clojure.core/complement))}})
+         :cljs identity)
+      ;; Override every-pred so freeze/thaw can reconstruct it.
+      #?(:clj
+         (assoc 'clojure.core/every-pred
+                {:val (fn sci-every-pred
+                        ([p] (with-meta
+                               (fn ep1
+                                 ([] true)
+                                 ([x] (boolean (p x)))
+                                 ([x y] (boolean (and (p x) (p y))))
+                                 ([x y z] (boolean (and (p x) (p y) (p z))))
+                                 ([x y z & args] (boolean (and (ep1 x y z) (every? p args)))))
+                               {:sci/every-pred-fns [p]}))
+                        ([p1 p2]
+                         (with-meta
+                           (fn ep2
+                             ([] true)
+                             ([x] (boolean (and (p1 x) (p2 x))))
+                             ([x y] (boolean (and (p1 x) (p2 x) (p1 y) (p2 y))))
+                             ([x y z] (boolean (and (p1 x) (p2 x) (p1 y) (p2 y) (p1 z) (p2 z))))
+                             ([x y z & args] (boolean (and (ep2 x y z)
+                                                           (every? #(and (p1 %) (p2 %)) args)))))
+                           {:sci/every-pred-fns [p1 p2]}))
+                        ([p1 p2 p3]
+                         (with-meta
+                           (fn ep3
+                             ([] true)
+                             ([x] (boolean (and (p1 x) (p2 x) (p3 x))))
+                             ([x y] (boolean (and (p1 x) (p2 x) (p3 x) (p1 y) (p2 y) (p3 y))))
+                             ([x y z] (boolean (and (p1 x) (p2 x) (p3 x) (p1 y) (p2 y) (p3 y)
+                                                    (p1 z) (p2 z) (p3 z))))
+                             ([x y z & args] (boolean (and (ep3 x y z)
+                                                           (every? #(and (p1 %) (p2 %) (p3 %)) args)))))
+                           {:sci/every-pred-fns [p1 p2 p3]}))
+                        ([p1 p2 p3 & ps]
+                         (let [all (list* p1 p2 p3 ps)]
+                           (with-meta
+                             (fn epn
+                               ([] true)
+                               ([x] (every? #(% x) all))
+                               ([x y] (and (every? #(% x) all) (every? #(% y) all)))
+                               ([x y z] (and (every? #(% x) all) (every? #(% y) all) (every? #(% z) all)))
+                               ([x y z & args] (boolean (and (epn x y z)
+                                                              (every? (fn [a] (every? #(% a) all)) args)))))
+                             {:sci/every-pred-fns (vec all)}))))
+                 :meta {:name 'every-pred :doc (:doc (meta #'clojure.core/every-pred))}})
+         :cljs identity)
+      ;; Override some-fn so freeze/thaw can reconstruct it.
+      #?(:clj
+         (assoc 'clojure.core/some-fn
+                {:val (fn sci-some-fn
+                        ([p] (with-meta
+                               (fn sp1
+                                 ([] nil)
+                                 ([x] (p x))
+                                 ([x y] (or (p x) (p y)))
+                                 ([x y z] (or (p x) (p y) (p z)))
+                                 ([x y z & args] (or (sp1 x y z) (some p args))))
+                               {:sci/some-fn-fns [p]}))
+                        ([p1 p2]
+                         (with-meta
+                           (fn sp2
+                             ([] nil)
+                             ([x] (or (p1 x) (p2 x)))
+                             ([x y] (or (p1 x) (p2 x) (p1 y) (p2 y)))
+                             ([x y z] (or (p1 x) (p2 x) (p1 y) (p2 y) (p1 z) (p2 z)))
+                             ([x y z & args] (or (sp2 x y z) (some #(or (p1 %) (p2 %)) args))))
+                           {:sci/some-fn-fns [p1 p2]}))
+                        ([p1 p2 p3]
+                         (with-meta
+                           (fn sp3
+                             ([] nil)
+                             ([x] (or (p1 x) (p2 x) (p3 x)))
+                             ([x y] (or (p1 x) (p2 x) (p3 x) (p1 y) (p2 y) (p3 y)))
+                             ([x y z] (or (p1 x) (p2 x) (p3 x) (p1 y) (p2 y) (p3 y)
+                                          (p1 z) (p2 z) (p3 z)))
+                             ([x y z & args] (or (sp3 x y z) (some #(or (p1 %) (p2 %) (p3 %)) args))))
+                           {:sci/some-fn-fns [p1 p2 p3]}))
+                        ([p1 p2 p3 & ps]
+                         (let [all (list* p1 p2 p3 ps)]
+                           (with-meta
+                             (fn spn
+                               ([] nil)
+                               ([x] (some #(% x) all))
+                               ([x y] (or (some #(% x) all) (some #(% y) all)))
+                               ([x y z] (or (some #(% x) all) (some #(% y) all) (some #(% z) all)))
+                               ([x y z & args] (or (spn x y z)
+                                                    (some (fn [a] (some #(% a) all)) args))))
+                             {:sci/some-fn-fns (vec all)}))))
+                 :meta {:name 'some-fn :doc (:doc (meta #'clojure.core/some-fn))}})
+         :cljs identity)
+      ;; Override memoize so freeze/thaw can reconstruct it.
+      #?(:clj
+         (assoc 'clojure.core/memoize
+                {:val (fn sci-memoize [f]
+                        (let [mem (atom {})]
+                          (with-meta
+                            (fn [& args]
+                              (if-let [e (find @mem args)]
+                                (val e)
+                                (let [ret (apply f args)]
+                                  (swap! mem assoc args ret)
+                                  ret)))
+                            {:sci/memoize-f f})))
+                 :meta {:name 'memoize :doc (:doc (meta #'clojure.core/memoize))}})
+         :cljs identity)
+      ;; Override fnil so freeze/thaw can reconstruct it.
+      #?(:clj
+         (assoc 'clojure.core/fnil
+                {:val (fn sci-fnil
+                        ([f x]
+                         (with-meta
+                           (fn
+                             ([a] (f (if (nil? a) x a)))
+                             ([a b] (f (if (nil? a) x a) b))
+                             ([a b c] (f (if (nil? a) x a) b c))
+                             ([a b c & ds] (apply f (if (nil? a) x a) b c ds)))
+                           {:sci/fnil-f f :sci/fnil-defaults [x]}))
+                        ([f x y]
+                         (with-meta
+                           (fn
+                             ([a b] (f (if (nil? a) x a) (if (nil? b) y b)))
+                             ([a b c] (f (if (nil? a) x a) (if (nil? b) y b) c))
+                             ([a b c & ds] (apply f (if (nil? a) x a) (if (nil? b) y b) c ds)))
+                           {:sci/fnil-f f :sci/fnil-defaults [x y]}))
+                        ([f x y z]
+                         (with-meta
+                           (fn
+                             ([a b] (f (if (nil? a) x a) (if (nil? b) y b)))
+                             ([a b c] (f (if (nil? a) x a) (if (nil? b) y b) (if (nil? c) z c)))
+                             ([a b c & ds] (apply f (if (nil? a) x a) (if (nil? b) y b) (if (nil? c) z c) ds)))
+                           {:sci/fnil-f f :sci/fnil-defaults [x y z]})))
+                 :meta {:name 'fnil :doc (:doc (meta #'clojure.core/fnil))}})
+         :cljs identity)
       ;; Override assert with a runtime check so (set! *assert* false) takes effect.
       ;; The host clojure.core/assert macro checks *assert* at expansion time, not runtime.
       ;; Our override always emits (when *assert* ...), letting the VM evaluate *assert*

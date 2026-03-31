@@ -668,10 +668,10 @@
       (is (= 4 result)))))
 
 ;; ============================================================
-;; Known limitations — host HOFs that return closures
+;; Host HOFs that return closures
 ;; ============================================================
 
-(deftest ^:known-limitation freeze-thaw-juxt
+(deftest freeze-thaw-juxt
   (testing "juxt of user fns should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defn double-it [x] (* 2 x))
@@ -684,7 +684,7 @@
           result (sci/resume thawed)]
       (is (= [10 6] result)))))
 
-(deftest ^:known-limitation freeze-thaw-every-pred
+(deftest freeze-thaw-every-pred
   (testing "every-pred should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [f (every-pred pos? even?)]
@@ -695,7 +695,7 @@
           result (sci/resume thawed)]
       (is (= [true false false] result)))))
 
-(deftest ^:known-limitation freeze-thaw-some-fn
+(deftest freeze-thaw-some-fn
   (testing "some-fn should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [f (some-fn :a :b)]
@@ -706,7 +706,7 @@
           result (sci/resume thawed)]
       (is (= [1 2 nil] result)))))
 
-(deftest ^:known-limitation freeze-thaw-complement
+(deftest freeze-thaw-complement
   (testing "complement should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [f (complement pos?)]
@@ -717,7 +717,7 @@
           result (sci/resume thawed)]
       (is (= [false true true] result)))))
 
-(deftest ^:known-limitation freeze-thaw-memoize
+(deftest freeze-thaw-memoize
   (testing "memoize should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defn slow-fn [x] (* x x))
@@ -729,7 +729,7 @@
           result (sci/resume thawed)]
       (is (= [9 16] result)))))
 
-(deftest ^:known-limitation freeze-thaw-fnil
+(deftest freeze-thaw-fnil
   (testing "fnil should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [f (fnil + 0 0)]
