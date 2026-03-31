@@ -2323,11 +2323,63 @@
    (step/run (machine/resume machine value))))
 
 (defn freeze
-  "Serialize a suspended machine to an EDN string."
+  "Serialize a suspended or running machine to an EDN string."
   [machine]
   (vm-freeze/freeze machine))
 
 (defn thaw
-  "Deserialize an EDN string back into a live (suspended) machine."
+  "Deserialize an EDN string back into a live machine."
   [edn-str]
   (vm-freeze/thaw edn-str))
+
+;; ============================================================
+;; Single-step execution API
+;; ============================================================
+
+(defn prepare
+  "Parse code and create a machine ready for stepping, without executing it.
+   Returns a machine map with :status :running.
+   opts are the same as eval-string (context options or an initialized context)."
+  ([s] (prepare s nil))
+  ([s opts]
+   (let [ctx (if (and opts (:heap opts))
+               opts
+               (init (or opts {})))
+         reader-extra (cond-> {}
+                        (:features ctx) (assoc :features (:features ctx))
+                        (:readers ctx) (assoc :readers (:readers ctx)))
+         current-ns-atom (or (:current-ns-atom ctx) (atom 'user))
+         current-ns @current-ns-atom
+         ns-atom (or (:ns-atom ctx) (atom {}))
+         ns-info (get @ns-atom current-ns)
+         aliases (:aliases ns-info)
+         reader (edamame/reader s)
+         eof (Object.)
+         read-opts (merge (make-reader-opts current-ns aliases (:heap-atom ctx) ns-atom)
+                          reader-extra {:eof eof})
+         forms (loop [acc []]
+                 (let [form (edamame/parse-next reader read-opts)]
+                   (if (identical? form eof)
+                     acc
+                     (recur (conj acc form)))))]
+     (make-machine-from-ctx ctx forms))))
+
+(defn step
+  "Execute a single VM operation on a machine.
+   Returns the updated machine. Only steps if status is :running;
+   otherwise returns the machine unchanged.
+
+   The returned machine's :status will be one of:
+     :running  — more work to do, call step again
+     :done     — computation finished, result in (:result machine)
+     :suspend  — code called (suspend!), data in (:suspend-data machine)
+     :effect   — code requested a side effect"
+  [machine]
+  (step/safe-step machine))
+
+(defn prepare-resume
+  "Prepare a suspended machine for stepping again.
+   Like resume, but returns the :running machine instead of running it to completion."
+  ([machine] (prepare-resume machine nil))
+  ([machine value]
+   (machine/resume machine value)))

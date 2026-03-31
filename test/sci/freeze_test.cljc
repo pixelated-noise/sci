@@ -804,3 +804,70 @@
           thawed (freeze/thaw frozen)
           result (sci/resume thawed)]
       (is (= "Counter(42)" result)))))
+
+;; ============================================================
+;; Single-step execution API
+;; ============================================================
+
+(defn- step-to-completion
+  "Step a machine one operation at a time until done. Returns the result."
+  [m]
+  (loop [m m]
+    (case (:status m)
+      :running (recur (sci/step m))
+      :done    (:result m)
+      :suspend m
+      :effect  m)))
+
+(deftest prepare-returns-running-machine
+  (testing "prepare returns a machine with :status :running"
+    (let [m (sci/prepare "(+ 1 2)")]
+      (is (map? m))
+      (is (= :running (:status m))))))
+
+(deftest step-to-completion-simple
+  (testing "stepping to completion produces correct result"
+    (is (= 3 (step-to-completion (sci/prepare "(+ 1 2)"))))
+    (is (= 7 (step-to-completion (sci/prepare "(+ 1 (* 2 3))"))))))
+
+(deftest step-to-completion-multi-form
+  (testing "multi-form string works with prepare"
+    (is (= 3 (step-to-completion (sci/prepare "(def x 1) (+ x 2)"))))))
+
+(deftest step-idempotent-on-done
+  (testing "step on a non-running machine returns it unchanged"
+    (let [m (sci/prepare "(+ 1 2)")
+          done (loop [m m]
+                 (if (= :running (:status m))
+                   (recur (sci/step m))
+                   m))]
+      (is (= :done (:status done)))
+      (is (identical? done (sci/step done))))))
+
+(deftest step-budget
+  (testing "can stop after N steps and continue later"
+    (let [m (sci/prepare "(+ 1 (* 2 3))")
+          ;; Step 5 times
+          m (nth (iterate sci/step m) 5)]
+      (is (= :running (:status m)))
+      ;; Continue to completion
+      (is (= 7 (step-to-completion m))))))
+
+(deftest step-with-suspend
+  (testing "stepping reaches suspend, then prepare-resume continues"
+    (let [m (step-to-completion (sci/prepare "(let [x (suspend!)] (+ x 10))"))
+          _ (is (= :suspend (:status m)))
+          m2 (sci/prepare-resume m 42)]
+      (is (= :running (:status m2)))
+      (is (= 52 (step-to-completion m2))))))
+
+(deftest freeze-thaw-running-machine
+  (testing "can freeze a :running machine and thaw+step to completion"
+    (let [m (sci/prepare "(+ 1 (* 2 3))")
+          ;; Step a few times
+          m (nth (iterate sci/step m) 3)
+          _ (is (= :running (:status m)))
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)]
+      (is (= :running (:status thawed)))
+      (is (= 7 (step-to-completion thawed))))))
