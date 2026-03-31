@@ -2368,11 +2368,15 @@
           ;; Nested: expand prefix and process each sub-spec
           (let [prefix first-elem]
             (reduce (fn [m sub-spec]
-                      (let [expanded (if (symbol? sub-spec)
-                                       [(symbol (str prefix "." sub-spec))]
-                                       (vec (cons (symbol (str prefix "." (first sub-spec)))
-                                                  (rest sub-spec))))]
-                        (process-require-spec m expanded)))
+                      (let [sub-name (if (symbol? sub-spec) (str sub-spec) (str (first sub-spec)))]
+                        (when (clojure.string/includes? sub-name ".")
+                          (throw (ex-info (str "lib names inside prefix lists must not contain periods")
+                                          {:type :sci/error})))
+                        (let [expanded (if (symbol? sub-spec)
+                                         [(symbol (str prefix "." sub-spec))]
+                                         (vec (cons (symbol (str prefix "." (first sub-spec)))
+                                                    (rest sub-spec))))]
+                          (process-require-spec m expanded))))
                     machine
                     (rest spec)))
           ;; Normal: [ns-sym :as alias :refer [syms] :as-alias alias]
@@ -2425,6 +2429,13 @@
                             m
                             refers))))))
 
+      ;; Keywords like :reload, :reload-all are valid flags; others are unsupported
+      (keyword? spec)
+      (if (contains? #{:reload :reload-all :verbose} spec)
+        machine
+        (throw (ex-info (str "Unsupported option(s) supplied: " spec)
+                        {:type :sci/error})))
+
       :else machine)))
 
 (defn step-eval-require [machine frame]
@@ -2471,6 +2482,18 @@
                                           (merge {:aliases {} :refers {} :imports {}}
                                                  structural
                                                  (when ns-meta ns-meta))))))]
+    ;; Pre-validate require specs for unsupported options
+    (doseq [ref refs]
+      (when (seq? ref)
+        (let [ref-type (first ref)]
+          (when (= :require ref-type)
+            (doseq [spec (rest ref)]
+              (when (and (keyword? spec) (not (contains? #{:reload :reload-all :verbose} spec)))
+                (let [ref-loc (form-location (:expr frame))]
+                  (throw (ex-info (str "Unsupported option(s) supplied: " spec)
+                                  (merge {:type :sci/error}
+                                         (when ref-loc {:line (:line ref-loc) :column (:column ref-loc)
+                                                        :sci.impl/callstack [{:ns ns-sym :line (:line ref-loc) :column (:column ref-loc)}]})))))))))))
     ;; Process references like (:require ...) (:import ...)
     (let [machine (reduce
                    (fn [m ref]
@@ -2570,7 +2593,14 @@
                                                   m' heap)))
                                    m ref-specs)
                            m))
-                       m))
+                       ;; Non-list refs that aren't vectors (libspecs) are unsupported
+                       (if (or (vector? ref) (symbol? ref))
+                         (process-require-spec m ref)  ;; bare libspec
+                         (let [ref-loc (form-location (:expr frame))]
+                           (throw (ex-info (str "Unsupported option(s) supplied: " ref)
+                                          (merge {:type :sci/error}
+                                                 (when ref-loc {:line (:line ref-loc) :column (:column ref-loc)
+                                                                :sci.impl/callstack [{:ns (:current-ns m) :line (:line ref-loc) :column (:column ref-loc)}]}))))))))
                    machine
                    refs)]
       (m/push-value (sync-ns-atom! machine) ns-sym))))
