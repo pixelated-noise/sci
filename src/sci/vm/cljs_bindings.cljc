@@ -812,7 +812,8 @@
                 'partial partial 'partition partition
                 'partition-all partition-all 'partition-by partition-by
                 'pr pr 'prn prn 'pr-str pr-str 'prn-str prn-str
-                'print print 'println println 'print-str print-str
+                'print print 'println println
+                'print-str print-str
                 'qualified-ident? qualified-ident?
                 'qualified-symbol? qualified-symbol?
                 'qualified-keyword? qualified-keyword?
@@ -1115,8 +1116,7 @@
                 'postwalk-replace walk/postwalk-replace
                 'prewalk-replace walk/prewalk-replace
                 'keywordize-keys walk/keywordize-keys
-                'stringify-keys  walk/stringify-keys
-                'macroexpand-all walk/macroexpand-all}]
+                'stringify-keys  walk/stringify-keys}]
        (reduce-kv
         (fn [acc sym v]
           (assoc acc (symbol "clojure.walk" (str sym))

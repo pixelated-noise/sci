@@ -1488,8 +1488,63 @@
                      {:val (make-find-doc-fn ctx heap-atom)
                       :meta {:name 'find-doc
                              :doc "Prints documentation for any var whose documentation or name\n contains a match for re-string-or-pattern"}}
+                     (symbol "clojure.repl" "dir")
+                     {:val (fn [sci-dir-nsname]
+                             (let [heap @heap-atom
+                                   ns-str (str sci-dir-nsname)
+                                   matching (sort (keep (fn [[k _]]
+                                                          (let [ks (str k)]
+                                                            (when (and (qualified-symbol? k)
+                                                                       (= ns-str (clojure.core/namespace k)))
+                                                              (symbol (clojure.core/name k)))))
+                                                        heap))]
+                               (when (empty? matching)
+                                 (throw (ex-info (str "No namespace '" ns-str "' found")
+                                                 {:type :sci/error})))
+                               (list 'do
+                                     (cons 'do (map (fn [s] (list 'println (list 'quote s))) matching))
+                                     nil)))
+                      :meta {:macro true :name 'dir
+                             :doc "Prints a sorted directory of public vars in a namespace"}
+                      :macro? true}
+                     (symbol "clojure.repl" "apropos")
+                     {:val (fn [str-or-pattern]
+                             (let [re (re-pattern (str str-or-pattern))
+                                   heap @heap-atom]
+                               (sort (keep (fn [[k _]]
+                                             (when (and (qualified-symbol? k)
+                                                        (re-find re (str k)))
+                                               k))
+                                           heap))))
+                      :meta {:name 'apropos
+                             :doc "Given a regular expression or stringable thing, return a seq of all public definitions in all currently-loaded namespaces that match the str_or_pattern."}}
+                     (symbol "clojure.repl" "dir-fn")
+                     {:val (fn [ns-sym]
+                             (let [heap @heap-atom
+                                   ns-str (str ns-sym)]
+                               (sort (keep (fn [[k _]]
+                                             (when (and (qualified-symbol? k)
+                                                        (= ns-str (clojure.core/namespace k)))
+                                               (symbol (clojure.core/name k))))
+                                           heap))))
+                      :meta {:name 'dir-fn
+                             :doc "Returns a sorted seq of symbols naming public vars in a namespace"}}
                      (symbol "clojure.repl" "source-fn")
                      {:val (fn [_] nil) :meta {:name 'source-fn}}
+                     ;; clojure.walk/macroexpand-all — uses SCI's macroexpand
+                     (symbol "clojure.walk" "macroexpand-all")
+                     {:val (fn sci-macroexpand-all [form]
+                             (let [me1-fn (:val (get @heap-atom (symbol "clojure.core" "macroexpand-1")))]
+                               (clojure.walk/prewalk
+                                (fn [x]
+                                  (if (seq? x)
+                                    (loop [f x]
+                                      (let [expanded (me1-fn f)]
+                                        (if (= expanded f) f (recur expanded))))
+                                    x))
+                                form)))
+                      :meta {:name 'macroexpand-all
+                             :doc "Recursively performs all possible macroexpansions in form."}}
                      (symbol "clojure.core" "load-string")
                      {:val (make-load-string-fn ctx heap-atom) :meta {:name 'load-string}}
                      (symbol "clojure.core" "read-string")
