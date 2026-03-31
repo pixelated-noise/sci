@@ -666,3 +666,131 @@
           thawed (freeze/thaw frozen)
           result (sci/resume thawed)]
       (is (= 4 result)))))
+
+;; ============================================================
+;; Known limitations — host HOFs that return closures
+;; ============================================================
+
+(deftest ^:known-limitation freeze-thaw-juxt
+  (testing "juxt of user fns should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defn double-it [x] (* 2 x))
+                  (defn inc-it [x] (+ 1 x))
+                  (let [f (juxt double-it inc-it)]
+                    (suspend!)
+                    (f 5)))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [10 6] result)))))
+
+(deftest ^:known-limitation freeze-thaw-every-pred
+  (testing "every-pred should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [f (every-pred pos? even?)]
+                (suspend!)
+                [(f 4) (f 3) (f -2)])")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [true false false] result)))))
+
+(deftest ^:known-limitation freeze-thaw-some-fn
+  (testing "some-fn should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [f (some-fn :a :b)]
+                (suspend!)
+                [(f {:a 1}) (f {:b 2}) (f {:c 3})])")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [1 2 nil] result)))))
+
+(deftest ^:known-limitation freeze-thaw-complement
+  (testing "complement should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [f (complement pos?)]
+                (suspend!)
+                [(f 1) (f -1) (f 0)])")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [false true true] result)))))
+
+(deftest ^:known-limitation freeze-thaw-memoize
+  (testing "memoize should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defn slow-fn [x] (* x x))
+                  (let [f (memoize slow-fn)]
+                    (suspend!)
+                    [(f 3) (f 4)]))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [9 16] result)))))
+
+(deftest ^:known-limitation freeze-thaw-fnil
+  (testing "fnil should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [f (fnil + 0 0)]
+                (suspend!)
+                [(f 1 2) (f nil 5) (f 3 nil)])")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [3 5 3] result)))))
+
+;; ============================================================
+;; Known limitations — data types
+;; ============================================================
+
+(deftest ^:known-limitation freeze-thaw-sorted-set
+  (testing "sorted-set ordering should be preserved after freeze/thaw"
+    (let [m (eval-suspend
+             "(let [s (sorted-set 5 3 1 4 2)]
+                (suspend!)
+                (vec s))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [1 2 3 4 5] result)))))
+
+(deftest ^:known-limitation freeze-thaw-delay
+  (testing "delay should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [d (delay (+ 1 2))]
+                (suspend!)
+                @d)")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 3 result)))))
+
+(deftest ^:known-limitation freeze-thaw-volatile
+  (testing "volatile should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [v (volatile! 42)]
+                (suspend!)
+                @v)")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 42 result)))))
+
+;; ============================================================
+;; Known limitations — deftype Object method dispatch
+;; ============================================================
+
+(deftest ^:known-limitation freeze-thaw-deftype-object-methods
+  (testing "deftype Object methods (toString) should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (deftype Counter [n]
+                    Object
+                    (toString [this] (str \"Counter(\" (:n this) \")\")))
+                  (let [c (->Counter 42)]
+                    (suspend!)
+                    (str c)))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "Counter(42)" result)))))
