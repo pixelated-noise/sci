@@ -4,7 +4,8 @@
             [sci.vm.host :as host]
             [sci.lang]
             [clojure.string]
-            [edamame.core :as edamame]))
+            [edamame.core :as edamame]
+            #?(:cljs [goog.object :as gobject])))
 
 (declare match-arity bind-params run check-permission form-location do-extend try-resolve-sci-type)
 
@@ -1183,7 +1184,34 @@
                          (m/push-value machine
                                        (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))))))
              :cljs
-             (throw (ex-info "Interop not supported in CLJS" {})))
+             (let [method-str (str (:method-name frame))]
+               (if (:field? frame)
+                 ;; Field access: (.-field obj)
+                 (if (:type (meta f))
+                   ;; SCI type instance — field access via keyword
+                   (let [v (get f (keyword method-str))
+                         type-obj (:type (meta f))
+                         mutable? (and (instance? sci.lang.Type type-obj)
+                                       (contains? (:mutable-fields (.-opts ^sci.lang.Type type-obj))
+                                                  (symbol method-str)))]
+                     (m/push-value machine (if mutable? @v v)))
+                   ;; JS property access
+                   (m/push-value machine (gobject/get f method-str)))
+                 ;; Method call with no args: (.method obj)
+                 (if (:type (meta f))
+                   ;; SCI type method override
+                   (let [sci-type (:type (meta f))
+                         sci-method (when (instance? sci.lang.Type sci-type)
+                                      (get (.-methods ^sci.lang.Type sci-type)
+                                           (symbol method-str)))]
+                     (if sci-method
+                       (m/push-value machine (sci-method f))
+                       (m/push-value machine (gobject/get f method-str))))
+                   ;; JS method with no args
+                   (let [method (gobject/get f method-str)]
+                     (if (fn? method)
+                       (m/push-value machine (.call method f))
+                       (m/push-value machine method)))))))
           (:new? frame)
           (if (instance? sci.lang.Type f)
             ;; SCI type constructor
@@ -1275,7 +1303,21 @@
                                                                    " args for class " (class obj))
                                                               {:type :sci/error}))))))))))
                :cljs
-               (throw (ex-info "Interop not supported in CLJS" {}))))
+               ;; CLJS instance method call with args
+               (let [sci-type (when-let [m (meta obj)]
+                                (when (instance? sci.lang.Type (:type m))
+                                  (:type m)))
+                     sci-method (when sci-type
+                                  (get (.-methods ^sci.lang.Type sci-type)
+                                       (symbol method-str)))]
+                 (if sci-method
+                   (m/push-value machine (apply sci-method obj args))
+                   (let [method (gobject/get obj method-str)]
+                     (if (fn? method)
+                       (m/push-value machine (.apply method obj (to-array args)))
+                       (throw (ex-info (str "No matching method " method-str
+                                            " on " (type obj))
+                                       {:type :sci/error}))))))))
           (:new? frame)
           (let [f (:f frame)]
             (if (instance? sci.lang.Type f)
@@ -2208,7 +2250,25 @@
            (m/push-frame {:op :eval :expr obj-expr}))))
    :cljs
    (defn step-eval-dot [machine frame]
-     (throw (ex-info ". interop not implemented for ClojureScript" {}))))
+     (let [form (:expr frame)
+           [_ obj-expr method-or-call & args] form
+           [method-name method-args]
+           (if (seq? method-or-call)
+             [(first method-or-call) (rest method-or-call)]
+             [method-or-call args])
+           method-str (name method-name)
+           is-field? (clojure.string/starts-with? method-str "-")]
+       (-> machine
+           (m/replace-frame (cond-> {:op :eval-args
+                                     :pending (vec method-args)
+                                     :done []
+                                     :phase :eval-f
+                                     :dot? true
+                                     :method-name (if is-field?
+                                                    (symbol (subs method-str 1))
+                                                    (symbol method-str))
+                                     :field? is-field?}))
+           (m/push-frame {:op :eval :expr obj-expr})))))
 
 ;; ============================================================
 ;; import*
