@@ -1598,11 +1598,14 @@
             entry (get heap qualified)
             ;; For raw :bindings entries (:user-binding? true), don't inject :name/:ns
             ;; so that clojure.repl/doc produces no output for undocumented plain bindings.
+            ;; If the entry was created by refer, :sci.impl/var-sym points to the original
+            ;; qualified symbol (e.g. clojure.string/join). Use it for :name/:ns.
+            original-sym (or (:sci.impl/var-sym (:meta entry)) qualified)
             extra-meta (if (:user-binding? entry)
                          {:sci.impl/var-sym qualified
                           :file (or (:file (:meta entry)) (:current-file machine))}
-                         {:name (symbol (name qualified))
-                          :ns (symbol (namespace qualified))
+                         {:name (symbol (name original-sym))
+                          :ns (symbol (namespace original-sym))
                           :sci.impl/var-sym qualified
                           :file (or (:file (:meta entry)) (:current-file machine))})
             var-obj (or (:var-obj entry)

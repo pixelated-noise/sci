@@ -292,7 +292,7 @@
                                     (clojure.core/compare-and-set! ref oldval newval)))
                                 (clojure.core/compare-and-set! ref oldval newval))
                               (clojure.core/compare-and-set! ref oldval newval)))
-                     :meta {:name 'compare-and-set!}
+                     :meta {:name 'compare-and-set! :doc #?(:clj (:doc (meta #'clojure.core/compare-and-set!)) :cljs nil)}
                      :dynamic? false})
         ;; Override derive/underive/isa?/parents/ancestors/descendants to:
         ;; 1. Handle SCI types (sci.lang.Type) by converting to qualified symbols
