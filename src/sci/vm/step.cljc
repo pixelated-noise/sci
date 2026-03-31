@@ -345,8 +345,24 @@
                                  (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                  {:type :sci/error :sym sym :phase "analysis"}))))))
                          :cljs
-                         (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                         {:type :sci/error :sym sym :phase "analysis"})))))))
+                         ;; Check :classes config for CLJS
+                         (let [classes (:classes machine)
+                               ;; js/* prefix → look up in the js object from :classes config
+                               js-val (when (= (str resolved-ns) "js")
+                                         (let [js-obj (or (get classes 'js)
+                                                          (when (= :all classes) js/globalThis)
+                                                          (when (and (map? classes) (= :all (:allow classes)))
+                                                            js/globalThis))]
+                                           (when js-obj
+                                             (gobject/get js-obj sym-name))))
+                               class-val (when (and (nil? js-val) (map? classes))
+                                           (or (get classes (symbol sym-ns))
+                                               (get classes qualified)))]
+                           (cond
+                             (some? js-val) js-val
+                             (some? class-val) class-val
+                             :else (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                   {:type :sci/error :sym sym :phase "analysis"})))))))))
           ;; Unqualified
               (let [ns-sym (:current-ns machine)
                     qualified (symbol (str ns-sym) sym-name)
@@ -1352,7 +1368,14 @@
                                (clojure.lang.Reflector/invokeConstructor
                                 ^Class f (to-array done)))
                  :cljs
-                 (throw (ex-info "new not supported in CLJS" {})))))
+                 ;; JS constructor: (new JsClass arg1 arg2 ...)
+                 (if (fn? f)
+                   (let [args (to-array done)
+                         ;; Use Reflect.construct for proper constructor invocation
+                         result (js/Reflect.construct f args)]
+                     (m/push-value machine result))
+                   (throw (ex-info (str "new: " f " is not a constructor")
+                                   {:type :sci/error}))))))
           (:defmethod? frame)
           ;; f = multimethod, done = [dispatch-val method-fn]
           (let [mm (:f frame)
@@ -4030,7 +4053,10 @@
       ;; (ClassName. args...) → (new ClassName args...)
       (let [head (first form)
             class-name (let [n (name head)] (subs n 0 (dec (count n))))
-            new-form (list* 'new (symbol class-name) (rest form))]
+            class-sym (if-let [ns (namespace head)]
+                        (symbol ns class-name)
+                        (symbol class-name))
+            new-form (list* 'new class-sym (rest form))]
         (m/replace-frame machine {:op :eval :expr new-form}))
 
       :invoke
