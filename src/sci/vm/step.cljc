@@ -1845,7 +1845,12 @@
               (-> machine
                   (assoc :stack new-stack)
                   (update :env merge bindings)
-                  (m/replace-frame (assoc target :body (vec body)))
+                  ;; Consume the first body element, matching step-fn-body's logic:
+                  ;; single element → tail position (phase :return, body [])
+                  ;; multiple → body is (rest body)
+                  (m/replace-frame (if (= 1 (count body))
+                                     (assoc target :body [] :phase :return)
+                                     (assoc target :body (vec (rest body)))))
                   (m/push-frame {:op :eval :expr (first body)})))
             (recur (dec i))))))))
 
