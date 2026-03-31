@@ -1414,6 +1414,15 @@
                      :meta {:macro true :name 'deftype}
                      :macro? true
                      :host-macro? true}
+                    ;; empty — return nil for SCI deftypes (not records), like Clojure
+                    (symbol "clojure.core" "empty")
+                    {:val (fn [coll]
+                            (let [m (clojure.core/meta coll)]
+                              (if (and m (:type m) (instance? sci.lang.Type (:type m))
+                                       (not (:sci.impl/record m)))
+                                nil  ;; deftype instances have no empty collection
+                                (clojure.core/empty coll))))
+                     :meta {:name 'empty}}
                     ;; = — records of different types must not be equal
                     (symbol "clojure.core" "=")
                     {:val (fn sci-equals
