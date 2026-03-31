@@ -430,18 +430,41 @@
     (let [val (resolve-symbol machine sym)
           ;; Check for functional interface adaptation from form metadata (e.g. ^Runnable f)
           adapted #?(:clj
-                     (when-let [tag (:tag (meta sym))]
-                       (when (and (fn? val) (symbol? tag))
-                         (let [klass (or (try-resolve-class (str tag))
-                                         (let [classes (:classes machine)]
-                                           (when (map? classes)
-                                             (let [entry (get classes tag)]
-                                               (cond
-                                                 (class? entry) entry
-                                                 (and (map? entry) (:class entry)) (:class entry)
-                                                 :else nil)))))]
-                           (when (and klass (class? klass) (.isInterface ^Class klass))
-                             (adapt-functional-interface klass val)))))
+                     (or
+                      (when-let [tag (:tag (meta sym))]
+                        (when (and (fn? val) (symbol? tag))
+                          (let [klass (or (try-resolve-class (str tag))
+                                          (let [classes (:classes machine)]
+                                            (when (map? classes)
+                                              (let [entry (get classes tag)]
+                                                (cond
+                                                  (class? entry) entry
+                                                  (and (map? entry) (:class entry)) (:class entry)
+                                                  :else nil)))))]
+                            (when (and klass (class? klass) (.isInterface ^Class klass))
+                              (adapt-functional-interface klass val)))))
+                      ;; Handle ^[Runnable] param-tags — wrap method fn to adapt args
+                      (when-let [param-tags (:param-tags (meta sym))]
+                        (when (and (fn? val) (vector? param-tags))
+                          (let [classes (:classes machine)
+                                resolved-types (mapv (fn [pt]
+                                                       (let [pt-sym (if (symbol? pt) pt (symbol (str pt)))]
+                                                         (or (try-resolve-class (str pt-sym))
+                                                             (when (map? classes)
+                                                               (let [entry (get classes pt-sym)]
+                                                                 (cond (class? entry) entry
+                                                                       (and (map? entry) (:class entry)) (:class entry)
+                                                                       :else nil))))))
+                                                     param-tags)]
+                            (fn [target & args]
+                              (let [adapted-args (map-indexed
+                                                  (fn [i arg]
+                                                    (let [klass (nth resolved-types i nil)]
+                                                      (if (and klass (class? klass) (.isInterface ^Class klass) (fn? arg))
+                                                        (adapt-functional-interface klass arg)
+                                                        arg)))
+                                                  args)]
+                                (apply val target adapted-args)))))))
                      :cljs nil)]
       (m/push-value machine (or adapted val)))))
 
@@ -1079,7 +1102,10 @@
                                   :callstack-depth (count (:callstack machine))
                                   :pre-call-depth pre-call-depth}
                            ;; Preserve form-level :tag for functional interface adaptation
-                           (:tag (meta form)) (assoc :invoke-tag (:tag (meta form)))))
+                           (:tag (meta form)) (assoc :invoke-tag (:tag (meta form)))
+                           ;; Preserve :param-tags from head symbol for ^[Runnable] notation
+                           (and (symbol? f-expr) (:param-tags (meta f-expr)))
+                           (assoc :invoke-param-tags (:param-tags (meta f-expr)))))
         (m/push-frame {:op :eval :expr f-expr}))))
 
 (defn step-eval-args [machine frame]
@@ -1218,15 +1244,36 @@
                                          (symbol method-str)))]
                    (if sci-method
                      (m/push-value machine (apply sci-method obj args))
-                     (m/push-value machine
-                                   (try (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))
-                                        (catch IllegalArgumentException _
-                                          (if (empty? args)
-                                            (clojure.lang.Reflector/invokeNoArgInstanceMember obj method-str false)
-                                            (throw (ex-info (str "No matching method " method-str
-                                                                 " found taking " (count args)
-                                                                 " args for class " (class obj))
-                                                            {:type :sci/error})))))))))
+                     ;; Adapt arguments based on :param-tags for overload selection
+                     (let [param-tags (:param-tags frame)
+                           adapted-args (if param-tags
+                                          (vec (map-indexed
+                                                (fn [i arg]
+                                                  (if-let [param-type-sym (nth param-tags i nil)]
+                                                    (let [param-type-sym (if (symbol? param-type-sym) param-type-sym
+                                                                            (symbol (str param-type-sym)))
+                                                          klass (or (try-resolve-class (str param-type-sym))
+                                                                    (let [classes (:classes machine)]
+                                                                      (when (map? classes)
+                                                                        (let [entry (get classes param-type-sym)]
+                                                                          (cond (class? entry) entry
+                                                                                (and (map? entry) (:class entry)) (:class entry)
+                                                                                :else nil)))))]
+                                                      (if (and klass (class? klass) (.isInterface ^Class klass) (fn? arg))
+                                                        (adapt-functional-interface klass arg)
+                                                        arg))
+                                                    arg))
+                                                args))
+                                          args)]
+                       (m/push-value machine
+                                     (try (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array adapted-args))
+                                          (catch IllegalArgumentException _
+                                            (if (empty? adapted-args)
+                                              (clojure.lang.Reflector/invokeNoArgInstanceMember obj method-str false)
+                                              (throw (ex-info (str "No matching method " method-str
+                                                                   " found taking " (count adapted-args)
+                                                                   " args for class " (class obj))
+                                                              {:type :sci/error}))))))))))
                :cljs
                (throw (ex-info "Interop not supported in CLJS" {}))))
           (:new? frame)
@@ -1301,8 +1348,39 @@
             (do-extend protocol target-type impl-map)
             (m/push-value machine nil))
           :else
-          (m/replace-frame machine {:op :apply :f (:f frame) :args done
-                                    :pre-call-depth (:pre-call-depth frame)}))
+          (let [;; Handle parameter type adaptation for overload selection
+                param-tags (or (:invoke-param-tags frame)
+                               (when (vector? (:invoke-tag frame)) (:invoke-tag frame)))
+                adapted-args
+                #?(:clj
+                   (if param-tags
+                     ;; ^[Runnable] or ^[Callable] — adapt method parameters
+                     ;; First element of done is the target object, rest are method params
+                     (let [target (first done)
+                           method-args (rest done)
+                           adapted-method-args
+                           (map-indexed
+                            (fn [i arg]
+                              (if-let [param-type-sym (nth param-tags i nil)]
+                                (let [param-type-sym (if (symbol? param-type-sym) param-type-sym
+                                                         (symbol (str param-type-sym)))
+                                      klass (or (try-resolve-class (str param-type-sym))
+                                                (let [classes (:classes machine)]
+                                                  (when (map? classes)
+                                                    (let [entry (get classes param-type-sym)]
+                                                      (cond (class? entry) entry
+                                                            (and (map? entry) (:class entry)) (:class entry)
+                                                            :else nil)))))]
+                                  (if (and klass (class? klass) (.isInterface ^Class klass) (fn? arg))
+                                    (adapt-functional-interface klass arg)
+                                    arg))
+                                arg))
+                            method-args)]
+                       (vec (cons target adapted-method-args)))
+                     done)
+                   :cljs done)]
+            (m/replace-frame machine {:op :apply :f (:f frame) :args adapted-args
+                                      :pre-call-depth (:pre-call-depth frame)})))
         (-> machine
             (m/replace-frame (assoc frame :done done
                                     :pending (subvec pending 1)))
@@ -2078,27 +2156,50 @@
            method-str (name method-name) ;; use name to strip namespace (e.g. clojure.core/close → close)
            is-field? (.startsWith ^String method-str "-")
            ;; Capture type hint from obj-expr for class validation
-           obj-tag (when (symbol? obj-expr) (:tag (meta obj-expr)))]
+           ;; First check the expression's own metadata, then check env keys for bindings with :tag
+           obj-tag (when (symbol? obj-expr)
+                     (or (:tag (meta obj-expr))
+                         ;; Look up type hint from let binding: env keys carry metadata
+                         (some (fn [k]
+                                 (when (and (symbol? k) (= k obj-expr))
+                                   (:tag (meta k))))
+                               (keys (:env machine)))))]
        ;; Validate type hint class exists at parse time
        (when (and obj-tag (symbol? obj-tag))
          (let [tag-str (str obj-tag)]
            (when-not (or (try (Class/forName tag-str) (catch ClassNotFoundException _ nil))
-                         ;; Check imports
-                         (get-in machine [:ns (:current-ns machine) :imports] obj-tag)
-                         ;; Check if it's a SCI type
-                         (try-resolve-sci-type machine tag-str))
+                         ;; Check imports in current ns and all namespaces (fn may be defined elsewhere)
+                         (some (fn [[_ns-name ns-data]]
+                                 (get (:imports ns-data) obj-tag))
+                               (:ns machine))
+                         ;; Check :classes configuration
+                         (let [classes (:classes machine)]
+                           (when (map? classes)
+                             (or (get classes obj-tag)
+                                 (get classes (symbol tag-str)))))
+                         ;; Check if it's a SCI type (qualified like foo.Rectangle)
+                         (try-resolve-sci-type machine tag-str)
+                         ;; Check unqualified SCI type in current ns and all ns types/imports
+                         (let [ns-table (or (when-let [a (:ns-atom machine)] @a) (:ns machine))]
+                           (some (fn [[_ns-name ns-data]]
+                                   (or (get (:types ns-data) obj-tag)
+                                       (get (:imports ns-data) obj-tag)))
+                                 ns-table)))
              (throw (ex-info (str "Unable to resolve classname: " obj-tag)
                              {:type :sci/error})))))
        (-> machine
-           (m/replace-frame {:op :eval-args
-                             :pending (vec method-args)
-                             :done []
-                             :phase :eval-f
-                             :dot? true
-                             :method-name (if is-field?
-                                            (symbol (subs method-str 1))
-                                            (symbol method-str))
-                             :field? is-field?})
+           (m/replace-frame (cond-> {:op :eval-args
+                                     :pending (vec method-args)
+                                     :done []
+                                     :phase :eval-f
+                                     :dot? true
+                                     :method-name (if is-field?
+                                                    (symbol (subs method-str 1))
+                                                    (symbol method-str))
+                                     :field? is-field?}
+                              ;; Propagate :param-tags for ^[Runnable] overload selection
+                              (:param-tags (meta form))
+                              (assoc :param-tags (:param-tags (meta form)))))
            (m/push-frame {:op :eval :expr obj-expr}))))
    :cljs
    (defn step-eval-dot [machine frame]
@@ -3217,42 +3318,92 @@
                               {} method-map)
         ;; Create anonymous Type object
         type-obj (sci.lang/->Type "reified" [] {} method-fns {})
-        ;; Register protocol implementations
-        machine (if (seq interfaces-vec)
-                  (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
-                        env (:env machine)]
-                    (reduce (fn [m proto-sym]
-                              (let [proto-ns-str (when (qualified-symbol? proto-sym)
-                                                   (namespace proto-sym))
-                                    proto-name (name proto-sym)
-                                    proto (or (get env proto-sym)
-                                              (let [the-ns (or proto-ns-str (str ns-sym))
-                                                    q (symbol the-ns proto-name)
-                                                    cq (symbol "clojure.core" proto-name)]
-                                                (or (:val (get heap q))
-                                                    (:val (get heap cq))
-                                                    ;; Check :types/:imports for imported protocols
-                                                    (get-in m [:ns ns-sym :types (symbol proto-name)])
-                                                    (get-in m [:ns ns-sym :imports (symbol proto-name)]))))]
-                                (if (and (map? proto) (= :sci/protocol (:type proto)))
-                                  (let [proto-methods (:methods proto)
-                                        impl-fns (reduce (fn [acc [mname _]]
-                                                           (if-let [f (get method-fns mname)]
-                                                             (assoc acc mname f)
-                                                             acc))
-                                                         {} proto-methods)]
-                                    (do-extend proto type-obj impl-fns)
-                                    m)
-                                  m)))
-                            machine interfaces-vec))
-                  machine)
-        ;; Create instance: an empty map with {:type type-obj} metadata
-        ;; Include user metadata from ^{...} reader hints (preserved from pre-expansion form)
+        ;; Separate Java interfaces from SCI protocols, and collect protocol info
+        heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+        env (:env machine)
+        java-interfaces (atom [])
+        sci-protocols (atom []) ;; [{:proto protocol-map :impl-fns {...}}]
+        protocol-syms (atom [])
+        ;; Classify interfaces and build protocol impls
+        _ (when (seq interfaces-vec)
+            (doseq [proto-sym interfaces-vec]
+              (let [proto-ns-str (when (qualified-symbol? proto-sym)
+                                   (namespace proto-sym))
+                    proto-name (name proto-sym)
+                    proto (or (get env proto-sym)
+                              (let [the-ns (or proto-ns-str (str ns-sym))
+                                    q (symbol the-ns proto-name)
+                                    cq (symbol "clojure.core" proto-name)]
+                                (or (:val (get heap q))
+                                    (:val (get heap cq))
+                                    ;; Check :types/:imports for imported protocols
+                                    (get-in machine [:ns ns-sym :types (symbol proto-name)])
+                                    (get-in machine [:ns ns-sym :imports (symbol proto-name)]))))]
+                (if (and (map? proto) (= :sci/protocol (:type proto)))
+                  (let [proto-methods (:methods proto)
+                        impl-fns (reduce (fn [acc [mname _]]
+                                           (if-let [f (get method-fns mname)]
+                                             (assoc acc mname f)
+                                             acc))
+                                         {} proto-methods)]
+                    (swap! sci-protocols conj {:proto proto :impl-fns impl-fns})
+                    (swap! protocol-syms conj proto-sym))
+                  ;; Not a protocol — check if it's a Java interface/class
+                  #?(:clj
+                     (let [resolved-class
+                           (cond
+                             (class? proto) proto
+                             :else
+                             (let [classes (:classes machine)
+                                   cls-sym (symbol proto-name)]
+                               (or (get-in machine [:ns ns-sym :imports cls-sym])
+                                   (when (map? classes)
+                                     (or (get classes proto-sym)
+                                         (get classes cls-sym)))
+                                   (try (Class/forName (str proto-sym)) (catch Exception _ nil)))))]
+                       (when (and resolved-class (class? resolved-class))
+                         (swap! java-interfaces conj resolved-class)))
+                     :cljs nil)))))
+        ;; Create instance
+        reify-fn (:reify-fn machine)
         form-meta (meta form)
         user-meta (when form-meta
                     (dissoc form-meta :end-line :end-column :end-row :row))
         instance-meta (merge {:type type-obj} user-meta)
-        instance (with-meta {} instance-meta)]
+        instance
+        (if reify-fn
+          ;; Use the user-provided reify-fn
+          (reify-fn {:interfaces @java-interfaces
+                     :methods method-fns
+                     :protocols @protocol-syms})
+          #?(:clj
+             (if (seq @java-interfaces)
+               ;; Create a Java proxy that implements the interfaces and delegates to method-fns
+               (let [ifaces (into-array Class @java-interfaces)
+                     handler (reify java.lang.reflect.InvocationHandler
+                               (invoke [_ _proxy method args]
+                                 (let [mname (symbol (.getName ^java.lang.reflect.Method method))
+                                       f (get method-fns mname)]
+                                   (if f
+                                     (apply f _proxy (when args (seq args)))
+                                     ;; Fallback for Object methods
+                                     (case (str mname)
+                                       "toString" (str "#object[reified]")
+                                       "hashCode" (System/identityHashCode _proxy)
+                                       "equals" (identical? _proxy (first args))
+                                       (throw (ex-info (str "No implementation for method " mname " in reify")
+                                                       {:type :sci/error})))))))]
+                 (java.lang.reflect.Proxy/newProxyInstance
+                  (.getContextClassLoader (Thread/currentThread))
+                  ifaces
+                  handler))
+               (with-meta {} instance-meta))
+             :cljs (with-meta {} instance-meta)))
+        ;; Register protocol implementations using the actual instance type
+        ;; (must happen after instance creation so we know the real class for reify-fn objects)
+        extend-type (if (or reify-fn (seq @java-interfaces)) (type instance) type-obj)
+        _ (doseq [{:keys [proto impl-fns]} @sci-protocols]
+            (do-extend proto extend-type impl-fns))]
     (m/push-value machine instance)))
 
 ;; ============================================================
@@ -3741,7 +3892,12 @@
                             (symbol raw-name))
               obj-expr (second form)
               args (drop 2 form)
-              dot-form (list* '. obj-expr member-name args)]
+              dot-form (list* '. obj-expr member-name args)
+              ;; Preserve :param-tags from head symbol for ^[Runnable] notation
+              param-tags #?(:clj (:param-tags (meta head)) :cljs nil)
+              dot-form (if param-tags
+                         (with-meta dot-form (merge (meta dot-form) {:param-tags param-tags}))
+                         dot-form)]
           (m/replace-frame machine {:op :eval :expr dot-form})))
 
       :new-call

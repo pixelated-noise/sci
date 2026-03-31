@@ -652,7 +652,7 @@
   "Special forms handled directly by the VM step dispatcher — macroexpand-1 must not expand these."
   #{'ns 'in-ns 'def 'do 'if 'let 'let* 'fn 'fn* 'quote 'var 'try 'catch 'finally
     'throw 'loop 'loop* 'recur 'new 'set! 'import* 'deftype* 'reify*
-    '. 'binding 'case 'case*})
+    '. 'binding 'case*})
 
 (defn- make-macroexpand-1-fn [heap-atom]
   (fn sci-macroexpand-1
@@ -1606,7 +1606,7 @@
                                                  (str "#" (.-name ^sci.lang.Type type-obj)
                                                       (clojure.core/pr-str (into (sorted-map) x))))
                                                (instance? sci.lang.Var x)
-                                               (str "#'" (.-sym ^sci.lang.Var x))
+                                               (str "#'" (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var x)) (.-sym ^sci.lang.Var x)))
                                                (vector? x) (str "[" (clojure.string/join " " (map sci-pr-str x)) "]")
                                                (set? x) (str "#{" (clojure.string/join ", " (map sci-pr-str x)) "}")
                                                (map? x) (str "{" (clojure.string/join ", " (map (fn [[k v]] (str (sci-pr-str k) " " (sci-pr-str v))) x)) "}")
@@ -1747,7 +1747,15 @@
                                                            (get method-table type-obj)))))
                                                    :cljs nil))]
                             (fn sci-pr [& args]
-                              (letfn [(pr1 [x]
+                              (letfn [(meta-prefix [x s]
+                                        (if (and *print-meta*
+                                                 (instance? clojure.lang.IMeta x)
+                                                 (seq (clojure.core/meta x))
+                                                 (not (:sci.impl/record (clojure.core/meta x)))
+                                                 (not (instance? sci.lang.Type (:type (clojure.core/meta x)))))
+                                          (str "^" (pr1 (clojure.core/meta x)) " " s)
+                                          s))
+                                      (pr1 [x]
                                         (let [m (clojure.core/meta x)
                                               type-obj (when m (:type m))
                                               custom-pm-fn (get-custom-pm type-obj)]
@@ -1768,12 +1776,12 @@
                                             (instance? sci.lang.Type type-obj)
                                             (str "#object[" (.-name ^sci.lang.Type type-obj) "]")
                                             ;; SCI Var — print as #'ns/name
-                                            (instance? sci.lang.Var x) (str "#'" (.-sym ^sci.lang.Var x))
+                                            (instance? sci.lang.Var x) (str "#'" (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var x)) (.-sym ^sci.lang.Var x)))
                                             ;; Collections — recursive traversal to catch SCI types inside
-                                            (vector? x) (str "[" (clojure.string/join " " (map pr1 x)) "]")
-                                            (set? x) (str "#{" (clojure.string/join " " (map pr1 (sort x))) "}")
-                                            (map? x) (str "{" (clojure.string/join ", " (map (fn [[k v]] (str (pr1 k) " " (pr1 v))) x)) "}")
-                                            (seq? x) (str "(" (clojure.string/join " " (map pr1 x)) ")")
+                                            (vector? x) (meta-prefix x (str "[" (clojure.string/join " " (map pr1 x)) "]"))
+                                            (set? x) (meta-prefix x (str "#{" (clojure.string/join " " (map pr1 (sort x))) "}"))
+                                            (map? x) (meta-prefix x (str "{" (clojure.string/join ", " (map (fn [[k v]] (str (pr1 k) " " (pr1 v))) x)) "}"))
+                                            (seq? x) (meta-prefix x (str "(" (clojure.string/join " " (map pr1 x)) ")"))
                                             :else (clojure.core/pr-str x))))]
                                 (clojure.string/join " " (map pr1 args)))))
                      :meta {:name 'pr-str}}
@@ -1805,8 +1813,8 @@
                                                            (.-name ^sci.lang.Type type-obj))]
                                            (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
                                          (instance? sci.lang.Var x)
-                                         (let [sym (.-sym ^sci.lang.Var x)]
-                                           (str "#'" sym))
+                                         (let [v ^sci.lang.Var x]
+                                           (str "#'" (or (:sci.impl/var-sym (.-meta-map v)) (.-sym v))))
                                          :else (clojure.core/print-str x))))
                                    args)))
                      :meta {:name 'print-str}}
