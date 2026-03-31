@@ -1423,6 +1423,17 @@
                                 nil  ;; deftype instances have no empty collection
                                 (clojure.core/empty coll))))
                      :meta {:name 'empty}}
+                    ;; hash — dispatch to hashCode override for SCI deftypes
+                    (symbol "clojure.core" "hash")
+                    {:val (fn [x]
+                            (if-let [type-obj (when-let [m (clojure.core/meta x)]
+                                                (when (instance? sci.lang.Type (:type m))
+                                                  (:type m)))]
+                              (if-let [hash-fn (get (.-methods ^sci.lang.Type type-obj) 'hashCode)]
+                                (hash-fn x)
+                                (clojure.core/hash x))
+                              (clojure.core/hash x)))
+                     :meta {:name 'hash}}
                     ;; = — records of different types must not be equal
                     (symbol "clojure.core" "=")
                     {:val (fn sci-equals

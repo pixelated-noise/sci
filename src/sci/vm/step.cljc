@@ -437,6 +437,7 @@
                           :bindings binding-pairs
                           :body (vec body)
                           :saved-env (:env machine)
+                          :saved-mutable-fields (:mutable-fields machine)
                           :bind-idx 0}))))
 
 (defn step-let [machine frame]
@@ -448,6 +449,10 @@
             val (:result machine)]
         (-> machine
             (update :env assoc sym val)
+            ;; If let binding shadows a mutable field, remove from mutable-fields
+            (as-> m (if (contains? (:mutable-fields m) sym)
+                      (update m :mutable-fields dissoc sym)
+                      m))
             (m/replace-frame (assoc frame :bind-idx (:next-idx frame)
                                     :bind-sym nil
                                     :next-idx nil))))
@@ -457,11 +462,14 @@
           (if (empty? body)
             (-> machine
                 (assoc :env (:saved-env frame))
+                (merge (when-let [smf (:saved-mutable-fields frame)]
+                         {:mutable-fields smf}))
                 (m/push-value nil))
             (-> machine
                 (m/replace-frame {:op :do-restore-env
                                   :body body
-                                  :saved-env (:saved-env frame)})
+                                  :saved-env (:saved-env frame)
+                                  :saved-mutable-fields (:saved-mutable-fields frame)})
                 (m/push-frame {:op :eval :expr (first body)}))))
         ;; Evaluate next binding value
         (let [[sym expr] (nth bindings idx)]
@@ -476,9 +484,11 @@
   (let [body (:body frame)
         remaining (vec (rest body))]
     (if (empty? remaining)
-      ;; Last expression done — restore env
+      ;; Last expression done — restore env and mutable-fields
       (-> machine
           (assoc :env (:saved-env frame))
+          (merge (when-let [smf (:saved-mutable-fields frame)]
+                   {:mutable-fields smf}))
           (m/pop-frame))
       ;; More body expressions
       (-> machine
@@ -906,8 +916,14 @@
                      ;; SCI type instance — field access via keyword
                      (let [field-name (if (.startsWith ^String method-str "-")
                                         (subs method-str 1)
-                                        method-str)]
-                       (m/push-value machine (get f (keyword field-name))))
+                                        method-str)
+                           v (get f (keyword field-name))
+                           ;; Mutable fields are stored as atoms — deref them
+                           type-obj (:type (clojure.core/meta f))
+                           mutable? (and (instance? sci.lang.Type type-obj)
+                                         (contains? (:mutable-fields (.-opts ^sci.lang.Type type-obj))
+                                                    (symbol field-name)))]
+                       (m/push-value machine (if mutable? @v v)))
                      ;; For .-field syntax, try field access first, fall back to method
                      (m/push-value machine
                                    (try (clojure.lang.Reflector/getInstanceField f method-str)
@@ -922,8 +938,17 @@
                                      "isBound" (some? (.-val ^sci.lang.Var f))
                                      "isDynamic" (boolean (.-dynamic? ^sci.lang.Var f))
                                      "get" (.-val ^sci.lang.Var f)))
-                     (m/push-value machine
-                                   (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))))
+                     ;; Check for SCI type method override (e.g. toString, hashCode)
+                     (let [sci-type (when-let [m (clojure.core/meta f)]
+                                      (when (instance? sci.lang.Type (:type m))
+                                        (:type m)))
+                           sci-method (when sci-type
+                                        (get (.-methods ^sci.lang.Type sci-type)
+                                             (symbol method-str)))]
+                       (if sci-method
+                         (m/push-value machine (sci-method f))
+                         (m/push-value machine
+                                       (clojure.lang.Reflector/invokeNoArgInstanceMember f method-str false))))))))
              :cljs
              (throw (ex-info "Interop not supported in CLJS" {})))
           (:new? frame)
@@ -976,16 +1001,25 @@
                    (m/push-value machine (first (first args)))
                    (m/push-value machine
                                  (clojure.lang.Reflector/invokeStaticMethod ^Class obj method-str (to-array args))))
-                 ;; Instance method call — fall back to field access if method not found
-                 (m/push-value machine
-                               (try (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))
-                                    (catch IllegalArgumentException _
-                                      (if (empty? args)
-                                        (clojure.lang.Reflector/invokeNoArgInstanceMember obj method-str false)
-                                        (throw (ex-info (str "No matching method " method-str
-                                                             " found taking " (count args)
-                                                             " args for class " (class obj))
-                                                        {:type :sci/error})))))))
+                 ;; Instance method call
+                 ;; Check if this is a SCI deftype with a method override first
+                 (let [sci-type (when-let [m (clojure.core/meta obj)]
+                                  (when (instance? sci.lang.Type (:type m))
+                                    (:type m)))
+                       sci-method (when sci-type
+                                    (get (.-methods ^sci.lang.Type sci-type)
+                                         (symbol method-str)))]
+                   (if sci-method
+                     (m/push-value machine (apply sci-method obj args))
+                     (m/push-value machine
+                                   (try (clojure.lang.Reflector/invokeInstanceMethod obj method-str (to-array args))
+                                        (catch IllegalArgumentException _
+                                          (if (empty? args)
+                                            (clojure.lang.Reflector/invokeNoArgInstanceMember obj method-str false)
+                                            (throw (ex-info (str "No matching method " method-str
+                                                                 " found taking " (count args)
+                                                                 " args for class " (class obj))
+                                                            {:type :sci/error})))))))))
                :cljs
                (throw (ex-info "Interop not supported in CLJS" {}))))
           (:new? frame)
@@ -998,12 +1032,20 @@
                     field-kws (mapv keyword fields)
                     n-fields (count fields)
                     is-record? (:record? (.-opts ^sci.lang.Type f))
+                    mutable-flds (:mutable-fields (.-opts ^sci.lang.Type f))
                     [field-vals extra] (if (and is-record? (> (count done) n-fields))
                                          [(take n-fields done) (drop n-fields done)]
                                          [done nil])
                     user-meta (first extra)
                     ext-map (second extra)
-                    base-map (zipmap field-kws field-vals)
+                    ;; Wrap mutable field values in atoms
+                    wrapped-vals (if (seq mutable-flds)
+                                   (map-indexed (fn [i v]
+                                                  (if (contains? mutable-flds (nth fields i))
+                                                    (atom v) v))
+                                                field-vals)
+                                   field-vals)
+                    base-map (zipmap field-kws wrapped-vals)
                     instance (with-meta (if ext-map (merge base-map ext-map) base-map)
                                (merge {:type f}
                                       (when is-record? {:sci.impl/record true})
@@ -1743,27 +1785,38 @@
 
 (defn step-set!-apply [machine frame]
   (let [sym (:target-sym frame)
-        val (:result machine)
-        qualified (resolve-var-qualified machine sym)]
-    (if (and (:dynamic-bindings machine)
-             (contains? (:dynamic-bindings machine) qualified))
-      (-> machine
-          (assoc-in [:dynamic-bindings qualified] val)
-          (m/push-value val))
-      ;; Check if this is a dynamic var — if so, set! is only allowed inside binding
-      (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
-            entry (get heap qualified)]
-        (if (and (:dynamic? entry) (:user-defined? entry))
-          ;; User-defined dynamic var: set! outside binding is an error (Clojure semantics)
-          (throw (ex-info (str "Can't set! root binding of dynamic var: " qualified)
-                          {:type :sci/error}))
-          ;; Non-dynamic var: update root binding in heap
-          (let [new-entry (assoc entry :val val)]
-            (when-let [a (:heap-atom machine)]
-              (swap! a assoc qualified new-entry))
-            (-> machine
-                (assoc-in [:heap qualified] new-entry)
-                (m/push-value val))))))))
+        val (:result machine)]
+    ;; Check if this is a mutable field set!
+    (if-let [mutable-atom (get (:mutable-fields machine) sym)]
+      ;; Mutable field — reset! the atom and return the new value
+      (do (reset! mutable-atom val)
+          (-> machine
+              (update :env assoc sym val)
+              (m/push-value val)))
+      ;; If the field was mutable but got shadowed by a let, throw
+      (if (contains? (:mutable-field-names machine) sym)
+        (throw (ex-info (str "Cannot assign to non-mutable field: " sym)
+                        {:type :sci/error}))
+      (let [qualified (resolve-var-qualified machine sym)]
+        (if (and (:dynamic-bindings machine)
+                 (contains? (:dynamic-bindings machine) qualified))
+          (-> machine
+              (assoc-in [:dynamic-bindings qualified] val)
+              (m/push-value val))
+          ;; Check if this is a dynamic var — if so, set! is only allowed inside binding
+          (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                entry (get heap qualified)]
+            (if (and (:dynamic? entry) (:user-defined? entry))
+              ;; User-defined dynamic var: set! outside binding is an error (Clojure semantics)
+              (throw (ex-info (str "Can't set! root binding of dynamic var: " qualified)
+                              {:type :sci/error}))
+              ;; Non-dynamic var: update root binding in heap
+              (let [new-entry (assoc entry :val val)]
+                (when-let [a (:heap-atom machine)]
+                  (swap! a assoc qualified new-entry))
+                (-> machine
+                    (assoc-in [:heap qualified] new-entry)
+                    (m/push-value val)))))))))))
 
 ;; ============================================================
 ;; new
@@ -2671,16 +2724,28 @@
 
 (defn- make-deftype-method-fn
   "Create a Clojure closure for a deftype method.
-   fields = field-name symbols; params = [this ...]; body = seq of exprs."
-  [machine ns-sym fields params body]
+   fields = field-name symbols; params = [this ...]; body = seq of exprs.
+   mutable-fields = set of field symbols that are ^:volatile-mutable."
+  [machine ns-sym fields params body & [mutable-fields]]
   (let [heap-atom (:heap-atom machine)
         ns-atom   (:ns-atom machine)
-        base-env  (:env machine)]
+        base-env  (:env machine)
+        mutable-fields (or mutable-fields #{})]
     (fn [& args]
       (let [this-obj       (first args)
             ;; Bind field values from the instance map
-            field-bindings (zipmap fields (map #(get this-obj (keyword %)) fields))
+            ;; Mutable fields are stored as atoms — deref them
+            field-bindings (reduce (fn [acc f]
+                                    (let [v (get this-obj (keyword f))]
+                                      (assoc acc f (if (contains? mutable-fields f)
+                                                     @v v))))
+                                  {} fields)
             fn-env         (merge base-env field-bindings (zipmap params args))
+            ;; Track mutable field atoms so set! can update them
+            mutable-atom-map (when (seq mutable-fields)
+                               (reduce (fn [acc f]
+                                         (assoc acc f (get this-obj (keyword f))))
+                                       {} mutable-fields))
             heap           (if heap-atom @heap-atom (:heap machine))
             ;; Use latest ns-table (picks up types defined after this closure was created)
             ns-table       (if ns-atom @ns-atom (:ns machine))
@@ -2689,6 +2754,9 @@
                                       :heap-atom heap-atom
                                       :ns-atom ns-atom
                                       :current-ns ns-sym)
+                               (merge (when (seq mutable-atom-map)
+                                        {:mutable-fields mutable-atom-map
+                                         :mutable-field-names (set (keys mutable-atom-map))}))
                                (m/push-frame {:op :eval
                                               :expr (if (= 1 (count body))
                                                       (first body)
@@ -2713,6 +2781,12 @@
         is-record?    (:sci.impl/record (meta form))
         ns-sym        (:current-ns machine)
         type-name     (symbol (name qualified-sym))
+        ;; Detect mutable fields (^:volatile-mutable or ^:unsynchronized-mutable)
+        mutable-fields (set (keep (fn [f]
+                                    (when (or (:volatile-mutable (meta f))
+                                              (:unsynchronized-mutable (meta f)))
+                                      (with-meta f nil)))
+                                  fields-vec))
         clean-fields  (mapv #(with-meta % nil) fields-vec)
         field-keywords (mapv keyword clean-fields)
         ;; Build method-map: mname -> [{:params [...] :body [...] :fields [...]} ...]
@@ -2731,7 +2805,7 @@
         ;; are backtick-qualified (e.g. user/proto from `(defrecord ...)).
         method-fns (reduce-kv (fn [acc mname arities]
                                 (let [fns (mapv (fn [{:keys [params body fields]}]
-                                                  {:fn (make-deftype-method-fn machine ns-sym fields params body)
+                                                  {:fn (make-deftype-method-fn machine ns-sym fields params body mutable-fields)
                                                    :arity (count params)})
                                                 arities)
                                       ;; If single arity, use the fn directly; otherwise dispatch by arity
@@ -2763,14 +2837,22 @@
         ;; Create the Type object — store method fns so str/prn can call them
         type-obj (sci.lang/->Type dotted-sym clean-fields {} method-fns
                                   (merge {:record? is-record?}
+                                         (when (seq mutable-fields) {:mutable-fields mutable-fields})
                                          (when (seq host-interfaces) {:interfaces host-interfaces})))
         ;; Create positional constructor ->Name
+        ;; Mutable field values are wrapped in atoms
+        mutable-kws (set (map keyword mutable-fields))
         ctor-fn (if is-record?
                   (fn [& args]
                     (with-meta (zipmap field-keywords args)
                       {:type type-obj :sci.impl/record true}))
                   (fn [& args]
-                    (with-meta (zipmap field-keywords args)
+                    (with-meta (zipmap field-keywords
+                                      (map-indexed (fn [i v]
+                                                     (if (contains? mutable-kws (nth field-keywords i))
+                                                       (atom v)
+                                                       v))
+                                                   args))
                       {:type type-obj})))
         ctor-sym      (symbol (str "->" type-name))
         ctor-qualified (symbol (str ns-sym) (str ctor-sym))
