@@ -4478,3 +4478,22 @@
                        (recur next-m (unchecked-inc steps))))
           :done    (:result m)
           :suspend m)))))
+
+(defn safe-step
+  "Execute one VM step with exception handling and dynamic binding sync.
+   Returns the updated machine. Callers should check (:status machine) to
+   decide whether to continue stepping."
+  [machine]
+  (binding [current-dynamic-bindings nil
+            *current-form-loc* nil]
+    (let [pre-dyn (:dynamic-bindings machine)
+          _ (set! current-dynamic-bindings pre-dyn)
+          next-m (try
+                   (step machine)
+                   (catch #?(:clj Throwable :cljs :default) ex
+                     (handle-exception machine ex)))
+          post-dyn current-dynamic-bindings
+          next-m (if (identical? post-dyn pre-dyn)
+                   next-m
+                   (assoc next-m :dynamic-bindings post-dyn))]
+      next-m)))

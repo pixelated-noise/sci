@@ -2419,7 +2419,9 @@
      :done     — computation finished, result in (:result machine)
      :suspend  — code called (suspend!), data in (:suspend-data machine)"
   [machine]
-  (step/safe-step machine))
+  (if (= :running (:status machine))
+    (step/safe-step machine)
+    machine))
 
 (defn prepare-resume
   "Prepare a suspended machine for stepping again.
