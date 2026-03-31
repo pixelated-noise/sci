@@ -291,7 +291,7 @@
 
 (defn- dotimes-impl [_ _ bindings & body]
   (let [[i n] bindings]
-    `(let [n# (long ~n)]
+    `(let [n# (int ~n)]
        (loop [~i 0]
          (when (< ~i n#)
            ~@body
