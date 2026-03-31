@@ -1,0 +1,848 @@
+(ns sci.vm.cljs-bindings
+  "CLJS-specific bindings for the SCI VM heap.
+   On JVM, host functions are auto-discovered via ns-publics.
+   On CLJS, they must be listed explicitly."
+  #?(:cljs (:refer-clojure :exclude [type]))
+  (:require [clojure.string :as str]
+            [clojure.set :as set]
+            [clojure.walk :as walk]
+            #?(:cljs [cljs.reader :as edn])))
+
+;; ============================================================
+;; Helper to build heap entries
+;; ============================================================
+
+(defn- entry
+  "Create a heap entry for a regular function/value."
+  ([val] {:val val :meta {:name nil}})
+  ([val m] {:val val :meta m}))
+
+(defn- macro-entry
+  "Create a heap entry for a macro.
+   Macro fns receive [&form &env & args]."
+  [val m]
+  {:val val :meta (assoc m :macro true) :macro? true :host-macro? true})
+
+(defn- dynamic-entry
+  "Create a heap entry for a dynamic var."
+  [val m]
+  {:val val :meta m :dynamic? true})
+
+;; ============================================================
+;; Destructuring support
+;; ============================================================
+
+(defn- vec-index-of
+  "Find index of val in vector, or -1 if not found."
+  [v val]
+  (loop [i 0]
+    (if (>= i (count v))
+      -1
+      (if (= val (nth v i)) i (recur (inc i))))))
+
+(defn- destructure-binding
+  "Expand a single destructuring binding pair [pattern expr] into a flat
+   vector of [sym val sym val ...] for let*."
+  [pattern expr]
+  (cond
+    ;; Simple symbol — no destructuring needed
+    (symbol? pattern) [pattern expr]
+
+    ;; Sequential destructuring: [a b & rest :as all]
+    (vector? pattern)
+    (let [gs (gensym "vec__")
+          as-idx (vec-index-of pattern :as)
+          as-sym (when (>= as-idx 0) (nth pattern (inc as-idx)))
+          ;; Filter out :as and its symbol
+          elems (if (>= as-idx 0)
+                  (vec (concat (subvec pattern 0 as-idx)
+                               (when (< (+ as-idx 2) (count pattern))
+                                 (subvec pattern (+ as-idx 2)))))
+                  pattern)
+          ;; Handle & rest
+          amp-idx (vec-index-of elems '&)
+          positional (if (>= amp-idx 0) (subvec elems 0 amp-idx) elems)
+          rest-sym (when (>= amp-idx 0) (nth elems (inc amp-idx)))]
+      (loop [binds [gs expr gs `(seq ~gs)]
+             pos (seq positional)
+             cur-gs gs]
+        (if pos
+          (let [elem (first pos)
+                inner (destructure-binding elem `(first ~cur-gs))
+                next-gs (gensym "seq__")]
+            (recur (into (into binds inner) [next-gs `(next ~cur-gs)])
+                   (next pos) next-gs))
+          (let [binds (if rest-sym
+                        (into binds (destructure-binding rest-sym cur-gs))
+                        binds)
+                binds (if as-sym (into binds [as-sym gs]) binds)]
+            binds))))
+
+    ;; Associative destructuring: {:keys [a b] :strs [c] :or {a 1} :as m}
+    (map? pattern)
+    (let [gs (gensym "map__")
+          as-sym (:as pattern)
+          or-map (or (:or pattern) {})]
+      (let [binds [gs expr]
+            ;; Handle :keys
+            binds (reduce
+                   (fn [binds k]
+                     (let [sym (if (keyword? k) (symbol (name k))
+                                   (if (symbol? k) k (symbol (str k))))
+                           kw (if (keyword? k) k (keyword (name (if (symbol? k) k (symbol (str k))))))
+                           default (get or-map sym)]
+                       (into binds
+                             (destructure-binding
+                              sym (if default `(get ~gs ~kw ~default) `(get ~gs ~kw))))))
+                   binds (:keys pattern))
+            ;; Handle :strs
+            binds (reduce
+                   (fn [binds k]
+                     (let [sym (symbol k)
+                           default (get or-map sym)]
+                       (into binds
+                             (destructure-binding
+                              sym (if default `(get ~gs (str '~sym) ~default) `(get ~gs (str '~sym)))))))
+                   binds (:strs pattern))
+            ;; Handle :syms
+            binds (reduce
+                   (fn [binds k]
+                     (let [sym k
+                           default (get or-map sym)]
+                       (into binds
+                             (destructure-binding
+                              sym (if default `(get ~gs '~sym ~default) `(get ~gs '~sym))))))
+                   binds (:syms pattern))
+            ;; Handle regular key-value pairs: {local-sym :key}
+            binds (reduce
+                   (fn [binds [k v]]
+                     (if (#{:keys :strs :syms :or :as} k)
+                       binds
+                       (let [default (get or-map v)]
+                         (into binds
+                               (destructure-binding v (if default `(get ~gs ~k ~default) `(get ~gs ~k)))))))
+                   binds pattern)
+            ;; Handle :as
+            binds (if as-sym (into binds [as-sym gs]) binds)]
+        binds))
+
+    :else (throw (ex-info (str "Unsupported binding form: " (pr-str pattern)) {}))))
+
+(defn- sci-destructure
+  "Like clojure.core/destructure — expand bindings vector into flat let* bindings."
+  [bindings]
+  (let [pairs (partition 2 bindings)]
+    (reduce (fn [acc [pattern expr]]
+              (into acc (destructure-binding pattern expr)))
+            [] pairs)))
+
+;; ============================================================
+;; Core macro implementations for CLJS
+;; These produce forms using special forms that the VM handles.
+;; Signature: [&form &env & args]
+;; ============================================================
+
+(defn- when-impl [_ _ test & body]
+  (list 'if test (cons 'do body)))
+
+(defn- when-not-impl [_ _ test & body]
+  (list 'if test nil (cons 'do body)))
+
+(defn- when-let-impl [_ _ bindings & body]
+  (let [[sym test] bindings]
+    `(let [temp# ~test]
+       (when temp#
+         (let [~sym temp#]
+           ~@body)))))
+
+(defn- when-first-impl [_ _ bindings & body]
+  (let [[sym expr] bindings]
+    `(when-let [xs# (seq ~expr)]
+       (let [~sym (first xs#)]
+         ~@body))))
+
+(defn- when-some-impl [_ _ bindings & body]
+  (let [[sym test] bindings]
+    `(let [temp# ~test]
+       (when (some? temp#)
+         (let [~sym temp#]
+           ~@body)))))
+
+(defn- if-let-impl [_ _ bindings then else]
+  (let [[sym test] bindings]
+    `(let [temp# ~test]
+       (if temp#
+         (let [~sym temp#] ~then)
+         ~else))))
+
+(defn- if-some-impl
+  ([_ _ bindings then] (if-some-impl nil nil bindings then nil))
+  ([_ _ bindings then else]
+   (let [[sym test] bindings]
+     `(let [temp# ~test]
+        (if (some? temp#)
+          (let [~sym temp#] ~then)
+          ~else)))))
+
+(defn- and-impl
+  ([_ _] true)
+  ([_ _ x] x)
+  ([_ _ x & next]
+   `(let [and# ~x]
+      (if and# (and ~@next) and#))))
+
+(defn- or-impl
+  ([_ _] nil)
+  ([_ _ x] x)
+  ([_ _ x & next]
+   `(let [or# ~x]
+      (if or# or# (or ~@next)))))
+
+(defn- cond-impl [_ _ & clauses]
+  (when (seq clauses)
+    (list 'if (first clauses)
+          (if (next clauses) (second clauses)
+              (throw (ex-info "cond requires an even number of forms" {})))
+          (cons 'cond (next (next clauses))))))
+
+(defn- condp-impl [_ _ pred expr & clauses]
+  (let [gpred (gensym "pred__")
+        gexpr (gensym "expr__")
+        emit (fn emit [pred expr args]
+               (let [[[a b c :as clause] more]
+                     (split-at (if (= :>> (second args)) 3 2) args)
+                     n (count clause)]
+                 (cond
+                   (= 0 n) `(throw (ex-info (str "No matching clause: " ~expr) {}))
+                   (= 1 n) a
+                   (= 2 n) `(if (~pred ~a ~expr) ~b ~(emit pred expr more))
+                   :else `(if-let [p# (~pred ~a ~expr)] (~c p#) ~(emit pred expr more)))))]
+    `(let [~gpred ~pred ~gexpr ~expr]
+       ~(emit gpred gexpr clauses))))
+
+(defn- ->-impl [_ _ x & forms]
+  (loop [x x, forms forms]
+    (if forms
+      (let [form (first forms)
+            threaded (if (seq? form)
+                       (with-meta `(~(first form) ~x ~@(next form)) (meta form))
+                       (list form x))]
+        (recur threaded (next forms)))
+      x)))
+
+(defn- ->>-impl [_ _ x & forms]
+  (loop [x x, forms forms]
+    (if forms
+      (let [form (first forms)
+            threaded (if (seq? form)
+                       (with-meta `(~(first form) ~@(next form) ~x) (meta form))
+                       (list form x))]
+        (recur threaded (next forms)))
+      x)))
+
+(defn- as->-impl [_ _ expr name & forms]
+  `(let [~name ~expr
+         ~@(interleave (repeat name) (butlast forms))]
+     ~(if (empty? forms) name (last forms))))
+
+(defn- cond->-impl [_ _ expr & clauses]
+  (let [g (gensym)
+        steps (map (fn [[test step]] `(if ~test (-> ~g ~step) ~g))
+                   (partition 2 clauses))]
+    `(let [~g ~expr
+           ~@(interleave (repeat g) steps)]
+       ~g)))
+
+(defn- cond->>-impl [_ _ expr & clauses]
+  (let [g (gensym)
+        steps (map (fn [[test step]] `(if ~test (->> ~g ~step) ~g))
+                   (partition 2 clauses))]
+    `(let [~g ~expr
+           ~@(interleave (repeat g) steps)]
+       ~g)))
+
+(defn- some->-impl [_ _ expr & forms]
+  (let [g (gensym)
+        steps (map (fn [step] `(if (nil? ~g) nil (-> ~g ~step)))
+                   forms)]
+    `(let [~g ~expr
+           ~@(interleave (repeat g) steps)]
+       ~g)))
+
+(defn- some->>-impl [_ _ expr & forms]
+  (let [g (gensym)
+        steps (map (fn [step] `(if (nil? ~g) nil (->> ~g ~step)))
+                   forms)]
+    `(let [~g ~expr
+           ~@(interleave (repeat g) steps)]
+       ~g)))
+
+(defn- doto-impl [_ _ x & forms]
+  (let [gx (gensym)]
+    `(let [~gx ~x]
+       ~@(map (fn [f]
+                (with-meta
+                  (if (seq? f)
+                    `(~(first f) ~gx ~@(next f))
+                    `(~f ~gx))
+                  (meta f)))
+              forms)
+       ~gx)))
+
+(defn- dotimes-impl [_ _ bindings & body]
+  (let [[i n] bindings]
+    `(let [n# (long ~n)]
+       (loop [~i 0]
+         (when (< ~i n#)
+           ~@body
+           (recur (inc ~i)))))))
+
+(defn- while-impl [_ _ test & body]
+  `(loop []
+     (when ~test
+       ~@body
+       (recur))))
+
+(defn- let-impl [_ _ bindings & body]
+  `(let* ~(sci-destructure bindings) ~@body))
+
+(defn- fn-impl [_ _ & sigs]
+  (let [[name sigs] (if (symbol? (first sigs))
+                      [(first sigs) (rest sigs)]
+                      [nil sigs])
+        sigs (if (vector? (first sigs))
+               ;; single arity: (fn [a b] body)
+               (list sigs)
+               ;; multi-arity: (fn ([a] ...) ([a b] ...))
+               sigs)
+        ;; Expand destructuring in params
+        expand-arity (fn [sig]
+                       (let [params (first sig)
+                             body (rest sig)
+                             ;; Check if params need destructuring
+                             needs-destr? (some #(or (map? %) (vector? %)) params)]
+                         (if needs-destr?
+                           (let [;; Replace complex params with gensyms
+                                 new-params (mapv (fn [p] (if (symbol? p) p (gensym "p__"))) params)
+                                 ;; Build let bindings for destructured params
+                                 let-binds (reduce (fn [acc [orig new-p]]
+                                                     (if (symbol? orig)
+                                                       acc
+                                                       (into acc (destructure-binding orig new-p))))
+                                                   [] (map vector params new-params))]
+                             (if (seq let-binds)
+                               `(~new-params (let* ~let-binds ~@body))
+                               `(~params ~@body)))
+                           `(~params ~@body))))
+        expanded (map expand-arity sigs)]
+    (if (= 1 (count expanded))
+      (if name
+        `(fn* ~name ~@(first expanded))
+        `(fn* ~@(first expanded)))
+      (if name
+        `(fn* ~name ~@expanded)
+        `(fn* ~@expanded)))))
+
+(defn- loop-impl [_ _ bindings & body]
+  (let [pairs (partition 2 bindings)
+        syms (mapv first pairs)
+        needs-destr? (some #(or (map? %) (vector? %)) syms)]
+    (if needs-destr?
+      ;; Destructuring in loop bindings: use temp syms and let
+      (let [temps (mapv (fn [s] (if (symbol? s) s (gensym "loop__"))) syms)
+            init-vals (mapv second pairs)
+            let-binds (reduce (fn [acc [orig temp]]
+                                (if (symbol? orig)
+                                  acc
+                                  (into acc (destructure-binding orig temp))))
+                              [] (map vector syms temps))]
+        `(loop* ~(vec (interleave temps init-vals))
+                (let* ~let-binds ~@body)))
+      `(loop* ~bindings ~@body))))
+
+(defn- letfn-impl [_ _ fnspecs & body]
+  (let [bindings (vec (mapcat (fn [spec]
+                                (let [[name & sigs] spec]
+                                  [name `(fn ~name ~@sigs)]))
+                              fnspecs))]
+    `(letfn* ~bindings ~@body)))
+
+(defn- declare-impl [_ _ & names]
+  (list* 'do (map (fn [n] (list 'def n)) names)))
+
+(defn- defn-impl [_ _ & args]
+  (let [[name args] [(first args) (rest args)]
+        [docstring args] (if (string? (first args))
+                           [(first args) (rest args)]
+                           [nil args])
+        [attr-map args] (if (map? (first args))
+                          [(first args) (rest args)]
+                          [nil args])
+        ;; fn body — single arity or multi-arity
+        fn-form (if (vector? (first args))
+                  ;; single arity: (defn name [params] body...)
+                  `(fn ~name ~@args)
+                  ;; multi-arity: (defn name ([p1] b1) ([p2 p3] b2) ...)
+                  `(fn ~name ~@args))
+        meta-map (merge (when docstring {:doc docstring})
+                        attr-map)]
+    (if (seq meta-map)
+      `(def ~(with-meta name (merge (meta name) meta-map)) ~fn-form)
+      `(def ~name ~fn-form))))
+
+(defn- defn--impl [_ _ & args]
+  (let [[name & rest-args] args]
+    `(defn ~(with-meta name (assoc (meta name) :private true)) ~@rest-args)))
+
+(defn- defonce-impl [_ _ name expr]
+  ;; In SCI, just def if not yet defined
+  `(when-not (clojure.core/resolve '~name)
+     (def ~name ~expr)))
+
+(defn- doseq-impl [_ _ seq-exprs & body]
+  ;; Simple single-binding doseq
+  (if (= 2 (count seq-exprs))
+    (let [[bind expr] seq-exprs]
+      `(loop [s# (seq ~expr)]
+         (when s#
+           (let [~bind (first s#)]
+             ~@body)
+           (recur (next s#)))))
+    ;; Multi-binding: expand recursively
+    (let [[bind expr & more] seq-exprs]
+      (if (keyword? bind)
+        ;; :let, :when, :while modifiers
+        (cond
+          (= :let bind)
+          `(let ~expr (doseq ~(vec more) ~@body))
+          (= :when bind)
+          `(when ~expr (doseq ~(vec more) ~@body))
+          (= :while bind)
+          `(if ~expr (doseq ~(vec more) ~@body) nil))
+        `(loop [s# (seq ~expr)]
+           (when s#
+             (let [~bind (first s#)]
+               (doseq ~(vec more) ~@body))
+             (recur (next s#))))))))
+
+(defn- for-impl [_ _ seq-exprs body-expr]
+  ;; Simplified for — single binding only
+  (let [[bind expr & more] seq-exprs]
+    (if (and (nil? more) (not (keyword? bind)))
+      `(map (fn [~bind] ~body-expr) ~expr)
+      ;; Complex for with multiple bindings/modifiers — basic recursive expansion
+      (if (keyword? bind)
+        (cond
+          (= :let bind)
+          `(let ~expr (for ~(vec more) ~body-expr))
+          (= :when bind)
+          `(if ~expr (for ~(vec more) ~body-expr) ())
+          (= :while bind)
+          `(if ~expr (for ~(vec more) ~body-expr) ()))
+        `(mapcat (fn [~bind] (for ~(vec more) ~body-expr)) ~expr)))))
+
+(defn- comment-impl [_ _ & _body] nil)
+
+(defn- assert-impl
+  ([_ _ x]
+   `(when-not ~x
+      (throw (ex-info (str "Assert failed: " '~x) {}))))
+  ([_ _ x message]
+   `(when-not ~x
+      (throw (ex-info (str "Assert failed: " ~message "\n" '~x) {})))))
+
+(defn- if-not-impl
+  ([_ _ test then] `(if (not ~test) ~then nil))
+  ([_ _ test then else] `(if (not ~test) ~then ~else)))
+
+(defn- case-impl [_ _ expr & clauses]
+  ;; The VM case* expects: (case* expr shift mask default case-map mode keys-type)
+  ;; where case-map is {hash [test-val result-expr], ...}
+  (let [default (when (odd? (count clauses)) (last clauses))
+        clauses (if (odd? (count clauses)) (butlast clauses) clauses)
+        pairs (partition 2 clauses)
+        ge (gensym "case__")
+        ;; Build case-map: for each test constant, map its hash to [test result]
+        ;; For grouped tests like (2 3), create separate entries for each
+        case-map (reduce (fn [acc [test then]]
+                           (if (and (sequential? test) (not (vector? test)))
+                             ;; Multiple test values: (2 3) matches either
+                             (reduce (fn [a t]
+                                       (assoc a (hash t) [t then]))
+                                     acc test)
+                             (assoc acc (hash test) [test then])))
+                         {} pairs)
+        default-expr (or default (list 'throw (list 'ex-info (list 'str "No matching clause: " ge) {})))]
+    (list 'let* [ge expr]
+          (list 'case* ge 0 0 default-expr case-map :int nil))))
+
+(defn- lazy-seq-impl [_ _ & body]
+  (list 'clojure.core/lazy-seq* (list 'fn* [] (cons 'do body))))
+
+(defn- delay-impl [_ _ & body]
+  (list 'clojure.core/delay* (list 'fn* [] (cons 'do body))))
+
+(defn- with-meta-impl [_ _ obj m]
+  `(clojure.core/with-meta ~obj ~m))
+
+(defn- reify-impl [_ _ & specs]
+  ;; Parse specs: alternating protocol-name then method forms
+  ;; (reify Protocol (method [this] body) Protocol2 (method2 [this] body))
+  ;; => (reify* [Protocol Protocol2] (method [this] body) (method2 [this] body))
+  (let [{:keys [interfaces methods]}
+        (reduce (fn [acc spec]
+                  (if (symbol? spec)
+                    (update acc :interfaces conj spec)
+                    (update acc :methods conj spec)))
+                {:interfaces [] :methods []}
+                specs)]
+    (list* 'reify* interfaces methods)))
+
+(defn- exists?-impl [_ _ sym]
+  ;; exists? checks if a symbol is defined (not nil/undefined)
+  ;; In SCI context, try to resolve it and check
+  (list 'clojure.core/some? (list 'try sym (list 'catch 'js/Error '_ nil))))
+
+;; ============================================================
+;; clojure.core function registry for CLJS
+;; ============================================================
+
+#?(:cljs
+   (defn cljs-core-functions
+     "Returns a map of qualified-symbol -> heap-entry for clojure.core functions."
+     []
+     (let [fns {'= = '< < '<= <= '> > '>= >= '+ + '- - '* * '/ /
+                '== == 'aget aget 'alength alength 'apply apply
+                'assoc assoc 'assoc-in assoc-in 'associative? associative?
+                'array-map array-map 'atom atom
+                'bit-and-not bit-and-not 'bit-set bit-set
+                'bit-shift-left bit-shift-left 'bit-shift-right bit-shift-right
+                'bit-xor bit-xor 'boolean boolean 'boolean? boolean?
+                'butlast butlast 'bit-test bit-test
+                'bit-and bit-and 'bounded-count bounded-count
+                'bit-or bit-or 'bit-flip bit-flip 'bit-not bit-not
+                'cat cat 'char char 'char? char?
+                'conj conj 'cons cons 'contains? contains? 'count count
+                'cycle cycle 'comp comp 'concat concat
+                'comparator comparator 'coll? coll? 'compare compare
+                'complement complement 'constantly constantly
+                'completing completing 'counted? counted?
+                'chunk chunk 'chunk-append chunk-append
+                'chunk-buffer chunk-buffer 'chunk-cons chunk-cons
+                'chunk-first chunk-first 'chunk-rest chunk-rest
+                'chunk-next chunk-next 'chunked-seq? chunked-seq?
+                'compare-and-set! compare-and-set!
+                'dec dec 'dedupe dedupe 'deref deref
+                'dissoc dissoc 'distinct distinct 'distinct? distinct?
+                'disj disj 'double double 'double? double?
+                'drop drop 'drop-last drop-last 'drop-while drop-while
+                'eduction eduction 'empty empty 'empty? empty?
+                'even? even? 'every? every? 'every-pred every-pred
+                'ensure-reduced ensure-reduced 'ex-info ex-info
+                'ex-message ex-message 'ex-data ex-data 'ex-cause ex-cause
+                'first first 'float? float? 'fnil fnil
+                'fnext fnext 'ffirst ffirst 'flatten flatten
+                'false? false? 'filter filter 'filterv filterv
+                'find find 'frequencies frequencies 'fn? fn?
+                'get get 'get-in get-in 'group-by group-by
+                'gensym gensym 'hash hash 'hash-map hash-map
+                'hash-set hash-set 'hash-unordered-coll hash-unordered-coll
+                'ident? ident? 'identical? identical? 'identity identity
+                'inc inc 'int-array int-array 'interleave interleave
+                'into into 'iterate iterate 'int int 'int? int?
+                'interpose interpose 'indexed? indexed?
+                'integer? integer? 'into-array into-array
+                'juxt juxt 'keep keep 'keep-indexed keep-indexed
+                'key key 'keys keys 'keyword keyword 'keyword? keyword?
+                'last last 'list list 'list? list? 'list* list*
+                'long-array long-array
+                'map clojure.core/map 'map? map? 'map-indexed map-indexed
+                'map-entry? map-entry? 'mapv mapv 'mapcat mapcat
+                'max max 'max-key max-key 'meta meta
+                'merge merge 'merge-with merge-with
+                'min min 'min-key min-key 'munge munge 'mod mod
+                'make-array make-array 'name name
+                'namespace namespace 'newline newline
+                'nfirst nfirst 'not not 'not= not=
+                'not-every? not-every? 'neg? neg? 'neg-int? neg-int?
+                'nth nth 'nthnext nthnext 'nthrest nthrest
+                'nil? nil? 'nat-int? nat-int? 'number? number?
+                'not-empty not-empty 'not-any? not-any?
+                'next next 'nnext nnext
+                'odd? odd? 'object-array object-array
+                'peek peek 'pop pop 'pos? pos? 'pos-int? pos-int?
+                'partial partial 'partition partition
+                'partition-all partition-all 'partition-by partition-by
+                'pr pr 'prn prn 'pr-str pr-str 'prn-str prn-str
+                'print print 'println println 'print-str print-str
+                'qualified-ident? qualified-ident?
+                'qualified-symbol? qualified-symbol?
+                'qualified-keyword? qualified-keyword?
+                'quot quot
+                're-seq re-seq 're-find re-find
+                're-pattern re-pattern 're-matches re-matches
+                'rem rem 'remove remove 'rest rest
+                'repeatedly repeatedly 'reverse reverse
+                'rand-int rand-int 'rand-nth rand-nth
+                'range range 'reduce reduce 'reduce-kv reduce-kv
+                'reduced reduced 'reduced? reduced?
+                'reversible? reversible? 'rsubseq rsubseq
+                'reductions reductions 'rand rand
+                'replace replace 'rseq rseq
+                'random-sample random-sample 'repeat repeat
+                'reset! reset! 'reset-meta! reset-meta!
+                'set? set? 'sequential? sequential?
+                'select-keys select-keys
+                'simple-keyword? simple-keyword?
+                'simple-symbol? simple-symbol?
+                'some? some? 'string? string?
+                'str str 'second second 'set set 'seq seq 'seq? seq?
+                'shuffle shuffle 'sort sort 'sort-by sort-by
+                'subs subs 'swap! swap!
+                'symbol symbol 'symbol? symbol?
+                'special-symbol? special-symbol? 'subvec subvec
+                'some-fn some-fn 'some some
+                'split-at split-at 'split-with split-with
+                'sorted-set sorted-set 'subseq subseq
+                'sorted-set-by sorted-set-by
+                'sorted-map-by sorted-map-by
+                'sorted-map sorted-map 'sorted? sorted?
+                'simple-ident? simple-ident?
+                'sequence sequence 'seqable? seqable?
+                'take take 'take-last take-last
+                'take-nth take-nth 'take-while take-while
+                'trampoline trampoline 'transduce transduce
+                'tree-seq tree-seq
+                'type clojure.core/type
+                'true? true? 'to-array to-array
+                'update update 'update-in update-in
+                'uri? uri? 'uuid? uuid?
+                'unchecked-inc-int unchecked-inc-int
+                'unchecked-negate unchecked-negate
+                'unsigned-bit-shift-right unsigned-bit-shift-right
+                'unchecked-add-int unchecked-add-int
+                'unchecked-multiply-int unchecked-multiply-int
+                'unchecked-int unchecked-int
+                'unchecked-multiply unchecked-multiply
+                'unchecked-add unchecked-add
+                'unreduced unreduced
+                'unchecked-subtract unchecked-subtract
+                'unchecked-inc unchecked-inc
+                'val val 'vals vals 'vary-meta vary-meta
+                'vec vec 'vector vector 'vector? vector?
+                'volatile! volatile! 'vreset! vreset!
+                'vswap! (fn [vol f & args] (vreset! vol (apply f @vol args)))
+                'with-meta with-meta
+                'zipmap zipmap 'zero? zero?
+                ;; Additional CLJS functions
+                'clj->js clj->js 'js->clj js->clj
+                'undefined? undefined?
+                'array array 'js-obj js-obj
+                'regexp? regexp?
+                ;; Atoms / state
+                'add-watch add-watch 'remove-watch remove-watch
+                ;; Lazy seqs
+                'lazy-seq* (fn [thunk] (lazy-seq (thunk)))
+                'delay* (fn [thunk] (delay (thunk)))
+                'force force 'delay? delay?
+                'realized? realized?
+                ;; Collections
+                'transient transient 'persistent! persistent!
+                'conj! conj! 'assoc! assoc! 'dissoc! dissoc!
+                'pop! pop! 'disj! disj!
+                ;; Multimethods support
+                'make-hierarchy make-hierarchy
+                ;; Misc
+                'tagged-literal tagged-literal 'tagged-literal? tagged-literal?
+                'inst? inst? 'inst-ms inst-ms
+                'abs abs 'parse-long parse-long 'parse-double parse-double
+                'parse-boolean parse-boolean 'parse-uuid parse-uuid
+                'NaN? NaN? 'Inf? Inf?
+                'random-uuid random-uuid}]
+       (reduce-kv
+        (fn [acc sym v]
+          (assoc acc (symbol "clojure.core" (str sym))
+                 {:val v :meta {:name sym}}))
+        {} fns))))
+
+;; ============================================================
+;; clojure.core macros for CLJS
+;; ============================================================
+
+#?(:cljs
+   (defn cljs-core-macros
+     "Returns a map of qualified-symbol -> macro heap-entry for clojure.core macros."
+     []
+     (let [macros {'let        let-impl
+                   'fn         fn-impl
+                   'loop       loop-impl
+                   'letfn      letfn-impl
+                   'when       when-impl
+                   'when-not   when-not-impl
+                   'when-let   when-let-impl
+                   'when-first when-first-impl
+                   'when-some  when-some-impl
+                   'if-let     if-let-impl
+                   'if-some    if-some-impl
+                   'if-not     if-not-impl
+                   'and        and-impl
+                   'or         or-impl
+                   'cond       cond-impl
+                   'condp      condp-impl
+                   '->         ->-impl
+                   '->>        ->>-impl
+                   'as->       as->-impl
+                   'cond->     cond->-impl
+                   'cond->>    cond->>-impl
+                   'some->     some->-impl
+                   'some->>    some->>-impl
+                   'doto       doto-impl
+                   'dotimes    dotimes-impl
+                   'while      while-impl
+                   'declare    declare-impl
+                   'defn       defn-impl
+                   'defn-      defn--impl
+                   'defonce    defonce-impl
+                   'doseq      doseq-impl
+                   'for        for-impl
+                   'comment    comment-impl
+                   'assert     assert-impl
+                   'case       case-impl
+                   'lazy-seq   lazy-seq-impl
+                   'delay      delay-impl
+                   'reify      reify-impl
+                   'exists?    exists?-impl}]
+       (reduce-kv
+        (fn [acc sym v]
+          (assoc acc (symbol "clojure.core" (str sym))
+                 {:val v
+                  :meta {:name sym :macro true}
+                  :macro? true
+                  :host-macro? true}))
+        {} macros))))
+
+;; ============================================================
+;; clojure.string for CLJS
+;; ============================================================
+
+#?(:cljs
+   (defn cljs-string-ns
+     "Returns a map of qualified-symbol -> heap-entry for clojure.string."
+     []
+     (let [fns {'blank?        str/blank?
+                'capitalize    str/capitalize
+                'ends-with?    str/ends-with?
+                'escape        str/escape
+                'includes?     str/includes?
+                'index-of      str/index-of
+                'join          str/join
+                'last-index-of str/last-index-of
+                'lower-case    str/lower-case
+                'replace       str/replace
+                'replace-first str/replace-first
+                'reverse       str/reverse
+                'split         str/split
+                'split-lines   str/split-lines
+                'starts-with?  str/starts-with?
+                'trim          str/trim
+                'trim-newline  str/trim-newline
+                'triml         str/triml
+                'trimr         str/trimr
+                'upper-case    str/upper-case}]
+       (reduce-kv
+        (fn [acc sym v]
+          (assoc acc (symbol "clojure.string" (str sym))
+                 {:val v :meta {:name sym}}))
+        {} fns))))
+
+;; ============================================================
+;; clojure.set for CLJS
+;; ============================================================
+
+#?(:cljs
+   (defn cljs-set-ns
+     "Returns a map of qualified-symbol -> heap-entry for clojure.set."
+     []
+     (let [fns {'difference  set/difference
+                'index       set/index
+                'intersection set/intersection
+                'join        set/join
+                'map-invert  set/map-invert
+                'project     set/project
+                'rename      set/rename
+                'rename-keys set/rename-keys
+                'select      set/select
+                'subset?     set/subset?
+                'superset?   set/superset?
+                'union       set/union}]
+       (reduce-kv
+        (fn [acc sym v]
+          (assoc acc (symbol "clojure.set" (str sym))
+                 {:val v :meta {:name sym}}))
+        {} fns))))
+
+;; ============================================================
+;; clojure.walk for CLJS
+;; ============================================================
+
+#?(:cljs
+   (defn cljs-walk-ns
+     "Returns a map of qualified-symbol -> heap-entry for clojure.walk."
+     []
+     (let [fns {'walk            walk/walk
+                'postwalk        walk/postwalk
+                'prewalk         walk/prewalk
+                'postwalk-replace walk/postwalk-replace
+                'prewalk-replace walk/prewalk-replace
+                'keywordize-keys walk/keywordize-keys
+                'stringify-keys  walk/stringify-keys
+                'macroexpand-all walk/macroexpand-all}]
+       (reduce-kv
+        (fn [acc sym v]
+          (assoc acc (symbol "clojure.walk" (str sym))
+                 {:val v :meta {:name sym}}))
+        {} fns))))
+
+;; ============================================================
+;; clojure.edn for CLJS
+;; ============================================================
+
+#?(:cljs
+   (defn cljs-edn-ns
+     "Returns a map of qualified-symbol -> heap-entry for clojure.edn."
+     []
+     (let [fns {'read-string edn/read-string}]
+       (reduce-kv
+        (fn [acc sym v]
+          (assoc acc (symbol "clojure.edn" (str sym))
+                 {:val v :meta {:name sym}}))
+        {} fns))))
+
+;; ============================================================
+;; Combined CLJS heap
+;; ============================================================
+
+#?(:cljs
+   (defn- mirror-cljs-core
+     "For every clojure.core/* entry, add a cljs.core/* alias pointing to the
+      same heap entry. This is needed because syntax-quote in CLJS qualifies
+      symbols as cljs.core/foo, but the VM heap registers them as clojure.core/foo."
+     [heap]
+     (reduce-kv
+      (fn [acc sym entry]
+        (if (= "clojure.core" (namespace sym))
+          (assoc acc (symbol "cljs.core" (name sym)) entry)
+          acc))
+      heap heap)))
+
+#?(:cljs
+   (defn cljs-heap
+     "Build the full CLJS heap with all namespace bindings."
+     []
+     (-> (merge (cljs-core-functions)
+                (cljs-core-macros)
+                (cljs-string-ns)
+                (cljs-set-ns)
+                (cljs-walk-ns)
+                (cljs-edn-ns))
+         (mirror-cljs-core))))

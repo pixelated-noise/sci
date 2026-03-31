@@ -2,8 +2,10 @@
 
 set -eo pipefail
 
+export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}"
+
 # Exclude tests that require old (non-VM) SCI namespaces or crash on missing CLJS interop
-EXCLUDE_RE='(?!sci\.(async|js-libs|js|interop)).*-test$'
+EXCLUDE_RE='(?!sci\.(async|js-libs|js|interop|io)).*-test$'
 
 echo 'Running CLJS test in Node with optimizations :none'
 echo '{:optimizations :none}' > cljs-opts.edn

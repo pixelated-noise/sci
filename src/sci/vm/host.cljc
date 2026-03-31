@@ -4,10 +4,12 @@
   (:require [clojure.string :as str]
             [clojure.set]
             [clojure.walk]
-            [clojure.edn]
-            [clojure.repl]
-            [clojure.pprint]
-            [sci.lang]))
+            #?(:clj [clojure.edn]
+               :cljs [cljs.reader :as edn])
+            #?(:clj [clojure.repl])
+            #?(:clj [clojure.pprint])
+            [sci.lang]
+            #?(:cljs [sci.vm.cljs-bindings :as cljs-bindings])))
 
 (defn- make-ns-registry
   "Generate a registry of all public vars from a namespace."
@@ -52,9 +54,10 @@
 (defn default-heap
   "Build the default heap with all host functions."
   []
-  (-> (reduce (fn [heap ns-sym] (merge heap (make-ns-registry ns-sym)))
-              {}
-              default-namespaces)
+  (-> #?(:clj (reduce (fn [heap ns-sym] (merge heap (make-ns-registry ns-sym)))
+                       {}
+                       default-namespaces)
+         :cljs (cljs-bindings/cljs-heap))
       (add-private-vars)
       #?(:clj
          ;; Add seq-to-map-for-destructuring behavior for Clojure 1.11 kwargs map support.
