@@ -2585,10 +2585,11 @@
                                                              (or (nil? only-syms)
                                                                  (contains? (set only-syms)
                                                                             (symbol (name k)))))
-                                                      (let [target (symbol (str (:current-ns m'')) (name k))]
+                                                      (let [target (symbol (str (:current-ns m'')) (name k))
+                                                            v' (update v :meta #(assoc (or % {}) :sci.impl/var-sym k))]
                                                         (when heap-atom
-                                                          (swap! heap-atom assoc target v))
-                                                        (assoc-in m'' [:heap target] v))
+                                                          (swap! heap-atom assoc target v'))
+                                                        (assoc-in m'' [:heap target] v'))
                                                       m''))
                                                   m' heap)))
                                    m ref-specs)
@@ -2735,8 +2736,23 @@
                                                                         {:type :sci/error}))))))]
                                   (assoc acc (symbol (name mname)) method-fn)))
                               {} method-map)
+        ;; Pre-resolve host Java interfaces from :implements list
+        host-interfaces #?(:clj (set (keep (fn [proto-sym]
+                                             (or (try-resolve-class (str proto-sym))
+                                                 (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                                                       env (:env machine)
+                                                       proto (or (get env proto-sym)
+                                                                 (let [q (symbol (str ns-sym) (name proto-sym))
+                                                                       cq (symbol "clojure.core" (name proto-sym))]
+                                                                   (or (:val (get heap q))
+                                                                       (:val (get heap cq)))))]
+                                                   (when (class? proto) proto))))
+                                           protocols-vec))
+                            :cljs #{})
         ;; Create the Type object — store method fns so str/prn can call them
-        type-obj (sci.lang/->Type dotted-sym clean-fields {} method-fns {:record? is-record?})
+        type-obj (sci.lang/->Type dotted-sym clean-fields {} method-fns
+                                  (merge {:record? is-record?}
+                                         (when (seq host-interfaces) {:interfaces host-interfaces})))
         ;; Create positional constructor ->Name
         ctor-fn (if is-record?
                   (fn [& args]
@@ -2874,7 +2890,12 @@
                             machine interfaces-vec))
                   machine)
         ;; Create instance: an empty map with {:type type-obj} metadata
-        instance (with-meta {} {:type type-obj})]
+        ;; Include user metadata from ^{...} reader hints (preserved from pre-expansion form)
+        form-meta (meta form)
+        user-meta (when form-meta
+                    (dissoc form-meta :end-line :end-column :end-row :row))
+        instance-meta (merge {:type type-obj} user-meta)
+        instance (with-meta {} instance-meta)]
     (m/push-value machine instance)))
 
 ;; ============================================================
@@ -3036,10 +3057,10 @@
                                (apply macro-fn form current-env (rest form))
                              ;; Internal SCI macros: just args
                                (apply macro-fn (rest form))))
-                ;; Preserve source location from original form on expanded form
-                  expanded (if (and (seq? expanded) (:line (meta form)))
+                ;; Preserve metadata from original form on expanded form
+                  expanded (if (and (seq? expanded) (meta form))
                              (with-meta expanded
-                               (merge (meta expanded) (select-keys (meta form) [:line :column])))
+                               (merge (meta expanded) (meta form)))
                              expanded)]
               [true expanded])
             [false form]))))))
@@ -3485,7 +3506,7 @@
   (let [ex #?(:clj (if (instance? java.util.concurrent.ExecutionException ex)
                      (or (.getCause ^java.util.concurrent.ExecutionException ex) ex)
                      ex)
-              :cljs ex)])
+              :cljs ex)]
   (if-let [[idx try-frame] (find-try-frame (:stack machine))]
     ;; Found a try frame — look for matching catch
     (let [catches (:catches try-frame)
@@ -3644,7 +3665,7 @@
                                    {:line (:line loc)
                                     :column (:column loc)})
                                  {:file (or (:file loc) (:current-file machine))})
-                          (if already-wrapped? (ex-cause ex) ex))))))))
+                          (if already-wrapped? (ex-cause ex) ex)))))))))
 
 (def ^:dynamic *max-steps*
   "Maximum number of VM steps before throwing. nil = unlimited.

@@ -730,11 +730,7 @@
     (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
           ns-info (get ns-data sym)]
       (when ns-info
-        (let [ns-obj (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)
-              ns-meta (ns-meta-from-info ns-info)]
-          (if ns-meta
-            (with-meta ns-obj ns-meta)
-            ns-obj))))))
+        (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)))))
 
 (defn- make-the-ns-fn [ctx]
   (fn [sym-or-ns]
@@ -1160,6 +1156,28 @@
                                            (assoc m k (get-or-create-ns-object ns-objs v)))
                                          {} aliases)))
                      :meta {:name 'ns-aliases}}
+                    (symbol "clojure.core" "require")
+                    {:val (fn sci-require [& specs]
+                            (let [eval-f (fn [form]
+                                           (let [ns-atom (:ns-atom ctx)
+                                                 ns-table (if ns-atom @ns-atom (:ns-table ctx))
+                                                 m2 (machine/make-machine
+                                                     {:heap @heap-atom
+                                                      :ns-table ns-table
+                                                      :permissions {:allow (:allow ctx)
+                                                                    :deny  (:deny ctx)}})
+                                                 m2 (cond-> (assoc m2 :heap-atom heap-atom :ctx ctx)
+                                                      ns-atom (assoc :ns-atom ns-atom)
+                                                      (:current-ns-atom ctx)
+                                                      (assoc :current-ns-atom (:current-ns-atom ctx)
+                                                             :current-ns @(:current-ns-atom ctx))
+                                                      (:load-fn ctx) (assoc :load-fn (:load-fn ctx)))
+                                                 m2 (machine/push-frame m2 {:op :eval :expr form})]
+                                             (step/run m2)))]
+                              ;; Build require form from function args and evaluate via the VM
+                              (eval-f (cons 'require (map (fn [s] (list 'quote s)) specs)))
+                              nil))
+                     :meta {:name 'require :doc #?(:clj (:doc (meta #'clojure.core/require)) :cljs nil)}}
                     (symbol "clojure.core" "use")
                     {:val (fn sci-use [& specs]
                             (let [eval-f (fn [form]
@@ -1360,7 +1378,15 @@
         ;; Override ns-aliases to read from ns-atom
         heap (assoc (merge @heap-atom extra-heap)
                     (symbol "clojure.core" "ns-aliases")
-                    {:val (fn [ns-sym] (or (:aliases (get @ns-atom ns-sym)) {}))
+                    {:val (fn [ns-sym-or-obj]
+                            (let [ns-sym (if (sci-namespace? ns-sym-or-obj)
+                                           (:name ns-sym-or-obj)
+                                           ns-sym-or-obj)
+                                  aliases (or (:aliases (get @ns-atom ns-sym)) {})
+                                  ns-objs (or (:ns-objects ctx) (atom {}))]
+                              (reduce-kv (fn [m k v]
+                                           (assoc m k (get-or-create-ns-object ns-objs v)))
+                                         {} aliases)))
                      :meta {:name 'ns-aliases}}
                     (symbol "clojure.core" "defrecord")
                     {:val (make-defrecord-fn ctx)
@@ -1385,8 +1411,13 @@
                                     impls @(:impls cls)]
                                 (boolean (get impls type-obj)))
                               :else
-                              ;; Host class
-                              (clojure.core/instance? cls obj)))
+                              ;; Host class — check real instance first, then SCI type interfaces
+                              (boolean
+                               (or (clojure.core/instance? cls obj)
+                                   #?(:clj (when-let [type-obj (:type (clojure.core/meta obj))]
+                                             (when (instance? sci.lang.Type type-obj)
+                                               (contains? (:interfaces (.-opts ^sci.lang.Type type-obj)) cls)))
+                                      :cljs false)))))
                      :meta {:name 'instance?}}
                     ;; type — check SCI type metadata
                     (symbol "clojure.core" "type")
