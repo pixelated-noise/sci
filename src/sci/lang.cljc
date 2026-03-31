@@ -9,7 +9,9 @@
   (getName [_] (str name))
   #?@(:clj [Object
              (toString [_] (str name))]
-      :cljs [IPrintWithWriter
+      :cljs [Object
+             (toString [_] (str name))
+             IPrintWithWriter
              (-pr-writer [_ writer _] (-write writer (str name)))]))
 
 ;; Namespace — represents an SCI namespace
