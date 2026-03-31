@@ -129,6 +129,64 @@
                (Class/forName arr-desc))))))))
 
 #?(:clj
+   (defn- functional-interface-method
+     "If klass is a functional interface (single abstract method), return the Method. Otherwise nil."
+     ^java.lang.reflect.Method [^Class klass]
+     (when (.isInterface klass)
+       (let [methods (.getMethods klass)
+             abstract-methods (filter (fn [^java.lang.reflect.Method m]
+                                        (and (java.lang.reflect.Modifier/isAbstract (.getModifiers m))
+                                             ;; Exclude default methods and Object methods
+                                             (not (.isDefault m))))
+                                      methods)
+             ;; Filter out methods that are also in Object (equals, hashCode, toString)
+             obj-methods #{"equals" "hashCode" "toString"}
+             abstract-methods (remove (fn [^java.lang.reflect.Method m]
+                                        (contains? obj-methods (.getName m)))
+                                      abstract-methods)]
+         (when (= 1 (count abstract-methods))
+           (first abstract-methods))))))
+
+#?(:clj
+   (defn- adapt-functional-interface
+     "Wrap a Clojure fn as a proxy implementing the given functional interface."
+     [^Class iface f]
+     (when-let [sam (functional-interface-method iface)]
+       (let [method-name (.getName sam)]
+         (java.lang.reflect.Proxy/newProxyInstance
+           (.getClassLoader iface)
+           (into-array Class [iface])
+           (reify java.lang.reflect.InvocationHandler
+             (invoke [_ _proxy method args]
+               (if (= method-name (.getName ^java.lang.reflect.Method method))
+                 (apply f (when args (seq args)))
+                 ;; Default Object methods
+                 (let [mname (.getName ^java.lang.reflect.Method method)]
+                   (case mname
+                     "toString" (str f)
+                     "hashCode" (int (hash f))
+                     "equals" (= f (first args))
+                     (throw (UnsupportedOperationException. (str "Method not implemented: " mname)))))))))))))
+
+#?(:clj
+   (defn- maybe-adapt-type-hint
+     "If sym has a :tag metadata that resolves to a functional interface, wrap val in a proxy."
+     [machine sym val]
+     (when-let [tag (:tag (meta sym))]
+       (let [tag-str (str tag)
+             klass (or (try-resolve-class tag-str)
+                       ;; Check :classes config
+                       (let [classes (:classes machine)]
+                         (when (map? classes)
+                           (let [entry (get classes (symbol tag-str))]
+                             (cond
+                               (class? entry) entry
+                               (and (map? entry) (:class entry)) (:class entry)
+                               :else nil)))))]
+         (when (and klass (class? klass) (.isInterface ^Class klass) (fn? val))
+           (adapt-functional-interface klass val))))))
+
+#?(:clj
    (defn- check-class-access
      "Check if a class is allowed by the :classes sandbox config.
       Throws if not allowed."
@@ -355,7 +413,23 @@
               (when (:macro? entry)
                 (throw (ex-info (str "Can't take value of a macro: " sym)
                                 {:type :sci/error})))))]
-    (m/push-value machine (resolve-symbol machine sym))))
+    (let [val (resolve-symbol machine sym)
+          ;; Check for functional interface adaptation from form metadata (e.g. ^Runnable f)
+          adapted #?(:clj
+                     (when-let [tag (:tag (meta sym))]
+                       (when (and (fn? val) (symbol? tag))
+                         (let [klass (or (try-resolve-class (str tag))
+                                         (let [classes (:classes machine)]
+                                           (when (map? classes)
+                                             (let [entry (get classes tag)]
+                                               (cond
+                                                 (class? entry) entry
+                                                 (and (map? entry) (:class entry)) (:class entry)
+                                                 :else nil)))))]
+                           (when (and klass (class? klass) (.isInterface ^Class klass))
+                             (adapt-functional-interface klass val)))))
+                     :cljs nil)]
+      (m/push-value machine (or adapted val)))))
 
 (defn step-eval-vector [machine frame]
   (let [exprs (:expr frame)
@@ -436,15 +510,36 @@
 
 (defn step-apply-meta [machine frame]
   (let [val (:value frame)
-        evaled-meta (:result machine)]
-    (if (and (fn? val) (:sci/closure (clojure.core/meta val)))
-      ;; SCI closure: store user meta in :user-meta key (keeps internal closure info intact)
-      (m/push-value machine (with-meta val (assoc (clojure.core/meta val) :user-meta evaled-meta)))
-      ;; Other values: merge normally
-      (let [new-meta (if (clojure.core/meta val)
-                       (merge (clojure.core/meta val) evaled-meta)
-                       evaled-meta)]
-        (m/push-value machine (with-meta val new-meta))))))
+        evaled-meta (:result machine)
+        ;; Check for functional interface adaptation: ^Runnable expr, ^Callable expr, etc.
+        adapted #?(:clj
+                   (when-let [tag (:tag evaled-meta)]
+                     (when (fn? val)
+                       (let [klass (cond
+                                     (class? tag) tag
+                                     (symbol? tag)
+                                     (or (try-resolve-class (str tag))
+                                         (let [classes (:classes machine)]
+                                           (when (map? classes)
+                                             (let [entry (get classes tag)]
+                                               (cond
+                                                 (class? entry) entry
+                                                 (and (map? entry) (:class entry)) (:class entry)
+                                                 :else nil)))))
+                                     :else nil)]
+                         (when (and klass (class? klass) (.isInterface ^Class klass))
+                           (adapt-functional-interface klass val)))))
+                   :cljs nil)]
+    (if adapted
+      (m/push-value machine adapted)
+      (if (and (fn? val) (:sci/closure (clojure.core/meta val)))
+        ;; SCI closure: store user meta in :user-meta key (keeps internal closure info intact)
+        (m/push-value machine (with-meta val (assoc (clojure.core/meta val) :user-meta evaled-meta)))
+        ;; Other values: merge normally
+        (let [new-meta (if (clojure.core/meta val)
+                         (merge (clojure.core/meta val) evaled-meta)
+                         evaled-meta)]
+          (m/push-value machine (with-meta val new-meta)))))))
 
 ;; ============================================================
 ;; if
@@ -511,7 +606,10 @@
     (if (nil? idx)
       ;; :bind-result phase — binding value just evaluated
       (let [sym (:bind-sym frame)
-            val (:result machine)]
+            val (:result machine)
+            ;; Functional interface adaptation: ^Runnable f, ^Callable f, etc.
+            val #?(:clj (or (maybe-adapt-type-hint machine sym val) val)
+                   :cljs val)]
         (-> machine
             (update :env assoc sym val)
             ;; If let binding shadows a mutable field, remove from mutable-fields
@@ -918,9 +1016,26 @@
           (m/replace-frame {:op :apply-meta :value callable})
           (m/push-frame {:op :eval :expr (into {} user-meta)}))
       ;; Store user metadata in :user-meta key so meta/with-meta overrides can expose it
-      (if (seq user-meta)
-        (m/push-value machine (with-meta callable (assoc (clojure.core/meta callable) :user-meta user-meta)))
-        (m/push-value machine callable)))))
+      ;; Also check for functional interface adaptation
+      (let [adapted #?(:clj
+                       (when-let [tag (:tag user-meta)]
+                         (when (and (fn? callable) (symbol? tag))
+                           (let [klass (or (try-resolve-class (str tag))
+                                           (let [classes (:classes machine)]
+                                             (when (map? classes)
+                                               (let [entry (get classes tag)]
+                                                 (cond
+                                                   (class? entry) entry
+                                                   (and (map? entry) (:class entry)) (:class entry)
+                                                   :else nil)))))]
+                             (when (and klass (class? klass) (.isInterface ^Class klass))
+                               (adapt-functional-interface klass callable)))))
+                       :cljs nil)]
+        (if adapted
+          (m/push-value machine adapted)
+          (if (seq user-meta)
+            (m/push-value machine (with-meta callable (assoc (clojure.core/meta callable) :user-meta user-meta)))
+            (m/push-value machine callable)))))))
 
 ;; ============================================================
 ;; Function application
@@ -943,12 +1058,14 @@
                            :file (:current-file machine)})
                   machine)]
     (-> machine
-        (m/replace-frame {:op :eval-args
-                          :pending arg-exprs
-                          :done []
-                          :phase :eval-f
-                          :callstack-depth (count (:callstack machine))
-                          :pre-call-depth pre-call-depth})
+        (m/replace-frame (cond-> {:op :eval-args
+                                  :pending arg-exprs
+                                  :done []
+                                  :phase :eval-f
+                                  :callstack-depth (count (:callstack machine))
+                                  :pre-call-depth pre-call-depth}
+                           ;; Preserve form-level :tag for functional interface adaptation
+                           (:tag (meta form)) (assoc :invoke-tag (:tag (meta form)))))
         (m/push-frame {:op :eval :expr f-expr}))))
 
 (defn step-eval-args [machine frame]
@@ -3602,14 +3719,22 @@
               (m/replace-frame machine {:op :eval :expr new-form})
               ;; Check for (Integer/SIZE) — static field access with parens but no args
               #?(:clj
-                 (let [head (first form)]
+                 (let [head (first form)
+                       ;; Check for functional interface tag on the invoke form
+                       form-tag (:tag (meta form))]
                    (if (and (symbol? head)
                             (namespace head)
                             (empty? (rest form))
                             (try-resolve-class (namespace head)))
                      ;; Looks like (ClassName/field) — just evaluate head
                      (m/replace-frame machine {:op :eval :expr head})
-                     (step-eval-invoke machine frame)))
+                     ;; If form has a :tag for functional interface adaptation,
+                     ;; wrap in an adapt frame
+                     (if form-tag
+                       (-> machine
+                           (m/replace-frame {:op :adapt-fn-interface :tag form-tag})
+                           (m/push-frame {:op :eval :expr (with-meta form (dissoc (meta form) :tag))}))
+                       (step-eval-invoke machine frame))))
                  :cljs
                  (step-eval-invoke machine frame))))))))
 
@@ -3647,6 +3772,29 @@
         :binding-body    (step-binding-body machine frame)
         :set!-apply      (step-set!-apply machine frame)
         :suspend-apply   (step-suspend-apply machine frame)
+        :adapt-fn-interface
+        #?(:clj
+           (let [val (:result machine)
+                 tag (:tag frame)
+                 klass (when (and (fn? val) tag)
+                         (cond
+                           (class? tag) tag
+                           (symbol? tag)
+                           (or (try-resolve-class (str tag))
+                               (let [classes (:classes machine)]
+                                 (when (map? classes)
+                                   (let [entry (get classes tag)]
+                                     (cond
+                                       (class? entry) entry
+                                       (and (map? entry) (:class entry)) (:class entry)
+                                       :else nil)))))
+                           :else nil))
+                 adapted (when (and klass (class? klass) (.isInterface ^Class klass))
+                           (adapt-functional-interface klass val))]
+             (-> machine
+                 (m/pop-frame)
+                 (assoc :result (or adapted val))))
+           :cljs (m/pop-frame machine))
         :throw           (let [v (:result machine)]
                            (if (instance? #?(:clj Throwable :cljs js/Error) v)
                              ;; Rethrow as-is (preserve user's ex-info data)
