@@ -124,3 +124,368 @@
           thawed (freeze/thaw frozen)
           result (sci/resume thawed 21)]
       (is (= 42 result)))))
+
+;; ============================================================
+;; Loop/recur
+;; ============================================================
+
+(deftest freeze-thaw-loop-recur
+  (testing "loop/recur result available after freeze/thaw"
+    (let [m (eval-suspend
+             "(do (suspend!)
+                  (loop [i 0 acc 0]
+                    (if (= i 3) acc (recur (inc i) (+ acc i)))))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 3 result)))))
+
+(deftest freeze-thaw-loop-resume-value
+  (testing "resume value injected into loop via suspend"
+    (let [m (eval-suspend
+             "(loop [i 0 acc []]
+                (if (= i 3)
+                  acc
+                  (let [v (suspend!)]
+                    (recur (inc i) (conj acc v)))))")
+          ;; First suspend at i=0
+          frozen1 (freeze/freeze m)
+          m1 (freeze/thaw frozen1)
+          m1 (sci/resume m1 :a)  ;; resume returns next suspended machine
+          ;; Second suspend at i=1
+          frozen2 (freeze/freeze m1)
+          m2 (freeze/thaw frozen2)
+          m2 (sci/resume m2 :b)
+          ;; Third suspend at i=2
+          frozen3 (freeze/freeze m2)
+          m3 (freeze/thaw frozen3)
+          result (sci/resume m3 :c)]
+      (is (= [:a :b :c] result)))))
+
+;; ============================================================
+;; Try/catch/finally
+;; ============================================================
+
+(deftest freeze-thaw-try-catch
+  (testing "suspend inside try body survives freeze/thaw"
+    (let [m (eval-suspend
+             "(try
+                (suspend!)
+                42
+                (catch Exception e :error))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 42 result)))))
+
+(deftest freeze-thaw-try-catch-exception
+  (testing "suspend before exception in try survives freeze/thaw"
+    (let [m (eval-suspend
+             "(try
+                (let [x (suspend!)]
+                  (if (= x :throw)
+                    (throw (ex-info \"boom\" {:val x}))
+                    x))
+                (catch Exception e
+                  (str \"caught: \" (.getMessage e))))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed :throw)]
+      (is (= "caught: boom" result)))))
+
+;; ============================================================
+;; Conditionals
+;; ============================================================
+
+(deftest freeze-thaw-if-branch
+  (testing "suspend in if branch survives freeze/thaw"
+    (let [m (eval-suspend
+             "(if true
+                (do (suspend!) :yes)
+                :no)")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= :yes result)))))
+
+(deftest freeze-thaw-cond
+  (testing "suspend inside cond survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [x (suspend!)]
+                (cond
+                  (= x :a) 1
+                  (= x :b) 2
+                  :else 3))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed :b)]
+      (is (= 2 result)))))
+
+;; ============================================================
+;; Nested closures and higher-order functions
+;; ============================================================
+
+(deftest freeze-thaw-nested-closure
+  (testing "nested closures (closure over closure) survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [adder (fn [a] (fn [b] (+ a b)))
+                    add5 (adder 5)]
+                (suspend!)
+                (add5 10))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 15 result)))))
+
+(deftest freeze-thaw-higher-order-with-host
+  (testing "host higher-order fn (map) with user closure survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [double (fn [x] (* x 2))]
+                (suspend!)
+                (mapv double [1 2 3 4]))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [2 4 6 8] result)))))
+
+(deftest freeze-thaw-fn-composition
+  (testing "manual fn composition survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [f (fn [x] (str (inc x)))]
+                (suspend!)
+                (f 41))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "42" result)))))
+
+;; ============================================================
+;; Multiple suspends in sequence
+;; ============================================================
+
+(deftest freeze-thaw-multiple-suspends
+  (testing "multiple suspend/freeze/thaw cycles in sequence"
+    (let [m1 (eval-suspend
+              "(do
+                 (def a (suspend!))
+                 (def b (suspend!))
+                 (+ a b))")
+          frozen1 (freeze/freeze m1)
+          m2 (freeze/thaw frozen1)
+          m2 (sci/resume m2 10)  ;; a = 10, hits second suspend
+          frozen2 (freeze/freeze m2)
+          m3 (freeze/thaw frozen2)
+          result (sci/resume m3 32)]  ;; b = 32
+      (is (= 42 result)))))
+
+;; ============================================================
+;; Atoms in environment
+;; ============================================================
+
+(deftest freeze-thaw-atom
+  (testing "atoms in environment survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do
+                (def counter (atom 0))
+                (swap! counter inc)
+                (swap! counter inc)
+                (suspend!)
+                @counter)")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 2 result)))))
+
+(deftest freeze-thaw-atom-swap-after-resume
+  (testing "atoms remain mutable after thaw"
+    (let [m (eval-suspend
+             "(do
+                (def counter (atom 10))
+                (suspend!)
+                (swap! counter + 5)
+                @counter)")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 15 result)))))
+
+;; ============================================================
+;; Destructuring
+;; ============================================================
+
+(deftest freeze-thaw-destructuring-let
+  (testing "let destructuring survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [{:keys [a b]} (suspend!)]
+                (+ a b))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed {:a 10 :b 32})]
+      (is (= 42 result)))))
+
+(deftest freeze-thaw-destructuring-sequential
+  (testing "sequential destructuring survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [[x y & rest] (suspend!)]
+                {:x x :y y :rest rest})")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed [1 2 3 4 5])]
+      (is (= {:x 1 :y 2 :rest '(3 4 5)} result)))))
+
+;; ============================================================
+;; Metadata preservation
+;; ============================================================
+
+(deftest freeze-thaw-metadata-on-suspend-data
+  (testing "metadata on suspend-data keyword keys survives freeze/thaw"
+    (let [m (eval-suspend "(suspend! {:a 1 :b 2})")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)]
+      (is (= {:a 1 :b 2} (:suspend-data thawed))))))
+
+;; ============================================================
+;; Deep stack / nested calls
+;; ============================================================
+
+(deftest freeze-thaw-deep-calls
+  (testing "deeply nested function calls survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defn wrap [x] {:val x})
+                  (defn double-wrap [x] (wrap (wrap x)))
+                  (defn triple-wrap [x] (wrap (double-wrap x)))
+                  (suspend!)
+                  (triple-wrap 42))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= {:val {:val {:val 42}}} result)))))
+
+(deftest freeze-thaw-recursive-fn
+  (testing "recursive function defined before suspend works after thaw"
+    (let [m (eval-suspend
+             "(do (defn factorial [n]
+                    (if (<= n 1) 1 (* n (factorial (dec n)))))
+                  (suspend!)
+                  (factorial 10))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 3628800 result)))))
+
+;; ============================================================
+;; Multimethod
+;; ============================================================
+
+(deftest suspend-resume-multimethod
+  (testing "multimethod dispatch survives suspend/resume (without freeze)"
+    (let [m (eval-suspend
+             "(do (defmulti greet :lang)
+                  (defmethod greet :en [_] \"hello\")
+                  (defmethod greet :fr [_] \"bonjour\")
+                  (suspend!)
+                  [(greet {:lang :en}) (greet {:lang :fr})])")
+          result (sci/resume m)]
+      (is (= ["hello" "bonjour"] result)))))
+
+;; ============================================================
+;; Case expression
+;; ============================================================
+
+(deftest freeze-thaw-case
+  (testing "case expression after suspend survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [x (suspend!)]
+                (case x
+                  :a 1
+                  :b 2
+                  :c 3
+                  0))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed :b)]
+      (is (= 2 result)))))
+
+;; ============================================================
+;; String operations / host interop
+;; ============================================================
+
+(deftest freeze-thaw-string-ops
+  (testing "string operations (host fns from clojure.string) survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (require '[clojure.string :as str])
+                  (suspend!)
+                  (str/join \", \" [\"a\" \"b\" \"c\"]))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "a, b, c" result)))))
+
+;; ============================================================
+;; Complex data in suspend-data
+;; ============================================================
+
+(deftest freeze-thaw-complex-suspend-data
+  (testing "complex suspend data survives freeze/thaw"
+    (let [m (eval-suspend
+             "(suspend! {:items [1 2 3]
+                         :nested {:a #{:x :y}}
+                         :msg \"waiting\"})")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)]
+      (is (= {:items [1 2 3]
+              :nested {:a #{:x :y}}
+              :msg "waiting"}
+             (:suspend-data thawed))))))
+
+;; ============================================================
+;; Namespace state
+;; ============================================================
+
+(deftest freeze-thaw-def-and-defn
+  (testing "def and defn bindings survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (def pi 3.14159)
+                  (defn area [r] (* pi r r))
+                  (suspend!)
+                  (area 10))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (< (Math/abs (- 314.159 result)) 0.001)))))
+
+;; ============================================================
+;; Protocols
+;; ============================================================
+
+(deftest suspend-resume-protocol
+  (testing "protocol extension survives suspend/resume (without freeze)"
+    (let [m (eval-suspend
+             "(do (defprotocol Greetable
+                    (greet [this]))
+                  (defrecord Person [name])
+                  (extend-protocol Greetable
+                    Person
+                    (greet [this] (str \"Hello, \" (:name this))))
+                  (suspend!)
+                  (greet (->Person \"Alice\")))")
+          result (sci/resume m)]
+      (is (= "Hello, Alice" result)))))
+
+;; ============================================================
+;; Large / complex environment
+;; ============================================================
+
+(deftest freeze-thaw-large-env
+  (testing "large environment with many bindings survives freeze/thaw"
+    (let [m (eval-suspend
+             "(let [a 1 b 2 c 3 d 4 e 5
+                    f 6 g 7 h 8 i 9 j 10
+                    data {:a a :b b :c c :d d :e e
+                          :f f :g g :h h :i i :j j}]
+                (suspend!)
+                (apply + (vals data)))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 55 result)))))
