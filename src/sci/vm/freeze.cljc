@@ -94,6 +94,20 @@
                (not (instance? java.io.Serializable x)))
           {:type :unserializable :class (str (class x))}
 
+          ;; Collection/symbol with metadata — wrap so metadata survives serialization.
+          ;; postwalk doesn't descend into metadata, and pr-str doesn't print it by default.
+          (and (instance? clojure.lang.IObj x)
+               (some? (meta x))
+               (not (fn? x))
+               (not (var? x))
+               (not (instance? sci.lang.Var x))
+               (not (class? x))
+               (not (instance? clojure.lang.Atom x))
+               (not (instance? clojure.lang.Namespace x)))
+          {:type :with-meta
+           :value (with-meta x nil)
+           :meta (replace-unserializable (meta x) inverse-reg)}
+
           :else x))
       data)))
 
@@ -184,6 +198,10 @@
               ;; The full heap will be set on the machine after thaw.
               ;; For now, return the plain map — we'll wrap closures in a second pass.
               closure-map)
+
+            ;; Collection/symbol with preserved metadata
+            :with-meta
+            (with-meta (:value x) (:meta x))
 
             ;; Not a tagged map, return as-is
             x)))

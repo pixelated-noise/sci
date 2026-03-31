@@ -549,7 +549,7 @@
           result (sci/resume thawed)]
       (is (= 15 result)))))
 
-(deftest ^:known-limitation freeze-thaw-metadata
+(deftest freeze-thaw-metadata
   (testing "metadata on collections should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (def data (with-meta [1 2 3] {:source :test}))
