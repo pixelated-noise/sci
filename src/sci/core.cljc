@@ -43,8 +43,37 @@
   (fn [sym]
     (let [sym-name (name sym)]
       (cond
-        ;; Already namespace-qualified → keep as-is
-        (namespace sym) sym
+        ;; Already namespace-qualified → check for array type notation first
+        (namespace sym)
+        #?(:clj
+           (let [ns-part (namespace sym)
+                 name-part (name sym)]
+             (if-let [dims (try (let [d (Integer/parseInt name-part)]
+                                  (when (pos? d) d))
+                                (catch NumberFormatException _ nil))]
+               ;; Clojure 1.12 array notation: type/N → resolve to array class name symbol
+               (let [prim->prefix {"long" "[J" "int" "[I" "double" "[D" "float" "[F"
+                                   "short" "[S" "byte" "[B" "boolean" "[Z" "char" "[C"}]
+                 (or
+                   ;; Primitive types
+                   (when-let [prim-prefix (get prim->prefix ns-part)]
+                     (symbol (str (apply str (repeat (dec dims) \[)) prim-prefix)))
+                   ;; java.lang classes (default imports) — both short and FQ forms
+                   (let [klass (if (> (.indexOf ^String ns-part ".") -1)
+                                 ;; Fully qualified: only resolve java.lang.* classes
+                                 (when (.startsWith ^String ns-part "java.lang.")
+                                   (try (Class/forName ns-part)
+                                        (catch ClassNotFoundException _ nil)))
+                                 ;; Short name: try java.lang.* prefix
+                                 (try (Class/forName (str "java.lang." ns-part))
+                                      (catch ClassNotFoundException _ nil)))]
+                     (when klass
+                       (symbol (str (apply str (repeat dims \[))
+                                    "L" (.getName ^Class klass) ";"))))
+                   ;; Not resolvable as array type → keep as-is
+                   sym))
+               sym))
+           :cljs sym)
 
         ;; Special forms → keep as-is
         (contains? special-forms-sq sym) sym
@@ -1517,6 +1546,32 @@
                                            (clojure.core/str x))))
                                      args))))
                      :meta {:name 'str}}
+                    #?@(:clj
+                    [;; aset — coerce values for primitive arrays
+                    (symbol "clojure.core" "aset")
+                    {:val (fn
+                            ([array idx val]
+                             (let [comp-type (.getComponentType (class array))]
+                               (if (and comp-type (.isPrimitive ^Class comp-type))
+                                 (do (java.lang.reflect.Array/set
+                                       array idx
+                                       (condp = comp-type
+                                         Integer/TYPE (int val)
+                                         Long/TYPE (long val)
+                                         Double/TYPE (double val)
+                                         Float/TYPE (float val)
+                                         Short/TYPE (short val)
+                                         Byte/TYPE (byte val)
+                                         Boolean/TYPE (boolean val)
+                                         Character/TYPE (char val)
+                                         val))
+                                     val)
+                                 (do (clojure.core/aset ^"[Ljava.lang.Object;" array idx val)
+                                     val))))
+                            ([array idx idx2 & idxv]
+                             (apply (fn [a i v] (clojure.core/aset a i v))
+                                    (clojure.core/aget array idx) idx2 idxv)))
+                     :meta {:name 'aset}}])
                     ;; with-meta — preserve :type and :sci.impl/record unless user explicitly sets them
                     (symbol "clojure.core" "with-meta")
                     {:val (fn [obj m]

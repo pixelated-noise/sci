@@ -105,6 +105,30 @@
                  (recur (rest prefixes)))))))))
 
 #?(:clj
+   (def ^:private prim->array-prefix
+     "Map of primitive type names to their JVM array type prefix."
+     {"long" "[J" "int" "[I" "double" "[D" "float" "[F"
+      "short" "[S" "byte" "[B" "boolean" "[Z" "char" "[C"}))
+
+#?(:clj
+   (defn- resolve-array-type
+     "Resolve Clojure 1.12 array type notation: type/N where N is the number of dimensions.
+      Returns the array Class or nil if not an array notation."
+     [type-name dimensions-str]
+     (when-let [dims (try (Integer/parseInt dimensions-str)
+                          (catch NumberFormatException _ nil))]
+       (when (pos? dims)
+         (if-let [prim-prefix (get prim->array-prefix type-name)]
+           ;; Primitive array: each extra dimension adds a '['
+           (Class/forName (str (apply str (repeat (dec dims) \[)) prim-prefix))
+           ;; Object array: L<classname>; with '[' prefixes
+           (when-let [klass (try-resolve-class type-name)]
+             (let [internal-name (.getName ^Class klass)
+                   arr-desc (str (apply str (repeat dims \[))
+                                 "L" internal-name ";")]
+               (Class/forName arr-desc))))))))
+
+#?(:clj
    (defn- check-class-access
      "Check if a class is allowed by the :classes sandbox config.
       Throws if not allowed."
@@ -209,9 +233,12 @@
               ;; Check SCI types in the resolved namespace
                     (if-let [type-obj (get-in machine [:ns resolved-ns :types (symbol sym-name)])]
                       type-obj
+                ;; Check for Clojure 1.12 array type notation (e.g. long/1, String/2)
+                    #?(:clj
+                    (if-let [arr-class (resolve-array-type sym-ns sym-name)]
+                      arr-class
                 ;; Try as Java static field/method
-                      #?(:clj
-                         (let [classes (:classes machine)
+                      (let [classes (:classes machine)
                                ;; Find matching :classes config entry by symbol or class name
                                class-config (when (map? classes)
                                               (let [entry (get classes (symbol sym-ns))]
@@ -243,7 +270,7 @@
                                                 (when (class? (get classes (symbol sym-ns))) (get classes (symbol sym-ns))))]
                                (resolve-static-member klass sym-name)
                                (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                               {:type :sci/error :sym sym :phase "analysis"})))))
+                                               {:type :sci/error :sym sym :phase "analysis"}))))))
                          :cljs
                          (throw (ex-info (str "Unable to resolve symbol: " sym)
                                          {:type :sci/error :sym sym :phase "analysis"})))))))
