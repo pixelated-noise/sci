@@ -2278,7 +2278,11 @@
   ([machine ns-sym] (load-ns-if-needed machine ns-sym nil))
   ([machine ns-sym require-opts]
    (let [ns-table (:ns machine)
-         loaded? (contains? ns-table ns-sym)
+         loading (or (:loading machine) #{})
+         ;; A namespace is truly loaded only if it's in the ns-table AND not currently
+         ;; in the loading set (being loaded = in-progress, not yet complete)
+         loaded? (and (contains? ns-table ns-sym)
+                      (not (contains? loading ns-sym)))
          ns-str (str ns-sym)
          ;; Also check if any vars exist in the heap for this namespace
          heap-has-ns? (when-not loaded?
@@ -2291,7 +2295,7 @@
               (not (:force-reload machine)))
        machine ;; already loaded or aliased
        ;; Cyclic load detection
-       (let [loading (or (:loading machine) #{})
+       (let [loading loading ;; already bound above
              _ (when (contains? loading ns-sym)
                  (let [chain (:loading-chain machine)
                        ;; Find where ns-sym first appears in chain
@@ -3509,11 +3513,6 @@
 (defn- handle-exception
   "Handle an exception by looking for a matching catch clause on the stack."
   [machine ^Throwable ex]
-  ;; Unwrap ExecutionException (Clojure 1.10.x future.get wraps exceptions in ExecutionException)
-  (let [ex #?(:clj (if (instance? java.util.concurrent.ExecutionException ex)
-                     (or (.getCause ^java.util.concurrent.ExecutionException ex) ex)
-                     ex)
-              :cljs ex)]
   (if-let [[idx try-frame] (find-try-frame (:stack machine))]
     ;; Found a try frame — look for matching catch
     (let [catches (:catches try-frame)
@@ -3604,6 +3603,13 @@
       (if (and already-wrapped? (:line (ex-data ex)))
         ;; Already has location info — rethrow unchanged
         (throw ex)
+        ;; If this is a user-thrown exception (from 'throw' special form) that is NOT
+        ;; an ExceptionInfo, preserve the original type by rethrowing without wrapping.
+        ;; This ensures (type (ex-cause e)) returns the correct class in futures/threads.
+        (if (and throw-loc
+                 (not already-wrapped?)
+                 (not (instance? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) ex)))
+          (throw ex)
         ;; Wrap or re-wrap with location info
         (let [original-raw-callstack (:callstack machine)
               raw-callstack original-raw-callstack
