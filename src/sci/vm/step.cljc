@@ -1411,6 +1411,15 @@
                 [protocol impl-map] done]
             (do-extend protocol target-type impl-map)
             (m/push-value machine nil))
+          (:set!-field frame)
+          ;; CLJS property set!: f = obj, done = [val]
+          #?(:cljs
+             (let [obj (:f frame)
+                   val (first done)
+                   field-name (:set!-field frame)]
+               (gobject/set obj field-name val)
+               (m/push-value machine val))
+             :clj (throw (ex-info "set!-field not supported on JVM" {:type :sci/error})))
           :else
           (let [;; Handle parameter type adaptation for overload selection
                 param-tags (or (:invoke-param-tags frame)
@@ -2150,10 +2159,44 @@
           (m/push-frame {:op :eval :expr (first body)})))))
 
 (defn step-eval-set! [machine frame]
-  (let [[_ target-sym val-expr] (:expr frame)]
-    (-> machine
-        (m/replace-frame {:op :set!-apply :target-sym target-sym})
-        (m/push-frame {:op :eval :expr val-expr}))))
+  (let [form (:expr frame)
+        argc (dec (count form))]
+    #?(:cljs
+       (if (= argc 3)
+         ;; CLJS 3-arg property set!: (set! obj -field val)
+         (let [[_ obj-expr field-sym val-expr] form
+               field-name (let [s (name field-sym)]
+                            (if (clojure.string/starts-with? s "-")
+                              (subs s 1) s))]
+           ;; Eval obj first, then val, then apply
+           (-> machine
+               (m/replace-frame {:op :eval-args :pending [val-expr] :done []
+                                 :phase :eval-f :set!-field field-name})
+               (m/push-frame {:op :eval :expr obj-expr})))
+         ;; Standard 2-arg set!
+         (let [[_ target-sym val-expr] form
+               target-str (str target-sym)
+               parts (clojure.string/split target-str #"\.")]
+           (if (> (count parts) 1)
+             ;; Dotted: (set! x.a.b val) → navigate to x.a, set "b"
+             (let [obj-sym (symbol (first parts))
+                   field-chain (rest parts)
+                   nav-expr (reduce (fn [acc part] (list '. acc (symbol (str "-" part))))
+                                    obj-sym (butlast field-chain))
+                   field-name (last field-chain)]
+               (-> machine
+                   (m/replace-frame {:op :eval-args :pending [val-expr] :done []
+                                     :phase :eval-f :set!-field field-name})
+                   (m/push-frame {:op :eval :expr nav-expr})))
+             ;; Simple symbol target
+             (-> machine
+                 (m/replace-frame {:op :set!-apply :target-sym target-sym})
+                 (m/push-frame {:op :eval :expr val-expr})))))
+       :clj
+       (let [[_ target-sym val-expr] form]
+         (-> machine
+             (m/replace-frame {:op :set!-apply :target-sym target-sym})
+             (m/push-frame {:op :eval :expr val-expr}))))))
 
 (defn step-set!-apply [machine frame]
   (let [sym (:target-sym frame)
@@ -3901,6 +3944,23 @@
 
                   ;; letfn* — all fns are mutually visible; skip detailed analysis
                   (= 'letfn* head) nil
+
+                  ;; set! — 2-arg or 3-arg (CLJS property set!)
+                  ;; (set! target val) or (set! obj -field val)
+                  (= 'set! head)
+                  (let [argc (dec (count frm))]
+                    (if (= argc 3)
+                      ;; 3-arg: (set! obj -field val) — skip the field symbol
+                      (let [[_ obj-expr _field val-expr] frm]
+                        (check env obj-expr)
+                        (check env val-expr))
+                      ;; 2-arg: (set! target val) — check both
+                      (let [[_ target val-expr] frm]
+                        (when (symbol? target)
+                          ;; Don't check dotted targets (x.a.b) as symbols
+                          (when-not (clojure.string/includes? (str target) ".")
+                            (check env target)))
+                        (check env val-expr))))
 
                   ;; try / catch / finally
                   (= 'catch head)

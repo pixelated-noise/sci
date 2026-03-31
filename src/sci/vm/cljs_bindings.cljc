@@ -89,29 +89,32 @@
                    (fn [binds k]
                      (let [sym (if (keyword? k) (symbol (name k))
                                    (if (symbol? k) k (symbol (str k))))
-                           kw (if (keyword? k) k (keyword (name (if (symbol? k) k (symbol (str k))))))
-                           default (get or-map sym)]
+                           kw (if (keyword? k) k (keyword (name (if (symbol? k) k (symbol (str k))))))]
                        (into binds
                              (destructure-binding
-                              sym (if default `(get ~gs ~kw ~default) `(get ~gs ~kw))))))
+                              sym (if (contains? or-map sym)
+                                    `(get ~gs ~kw ~(get or-map sym))
+                                    `(get ~gs ~kw))))))
                    binds (:keys pattern))
             ;; Handle :strs
             binds (reduce
                    (fn [binds k]
-                     (let [sym (symbol k)
-                           default (get or-map sym)]
+                     (let [sym (symbol k)]
                        (into binds
                              (destructure-binding
-                              sym (if default `(get ~gs (str '~sym) ~default) `(get ~gs (str '~sym)))))))
+                              sym (if (contains? or-map sym)
+                                    `(get ~gs (str '~sym) ~(get or-map sym))
+                                    `(get ~gs (str '~sym)))))))
                    binds (:strs pattern))
             ;; Handle :syms
             binds (reduce
                    (fn [binds k]
-                     (let [sym k
-                           default (get or-map sym)]
+                     (let [sym k]
                        (into binds
                              (destructure-binding
-                              sym (if default `(get ~gs '~sym ~default) `(get ~gs '~sym))))))
+                              sym (if (contains? or-map sym)
+                                    `(get ~gs '~sym ~(get or-map sym))
+                                    `(get ~gs '~sym))))))
                    binds (:syms pattern))
             ;; Handle regular key-value pairs: {local-sym lookup-key}
             ;; In Clojure: {foo-val k} means bind foo-val to (get map k)
@@ -119,9 +122,11 @@
                    (fn [binds [local-sym lookup-key]]
                      (if (#{:keys :strs :syms :or :as} local-sym)
                        binds
-                       (let [default (get or-map local-sym)]
-                         (into binds
-                               (destructure-binding local-sym (if default `(get ~gs ~lookup-key ~default) `(get ~gs ~lookup-key)))))))
+                       (into binds
+                             (destructure-binding local-sym
+                               (if (contains? or-map local-sym)
+                                 `(get ~gs ~lookup-key ~(get or-map local-sym))
+                                 `(get ~gs ~lookup-key))))))
                    binds pattern)
             ;; Handle :as
             binds (if as-sym (into binds [as-sym gs]) binds)]
@@ -628,7 +633,7 @@
                 'hash-set hash-set 'hash-unordered-coll hash-unordered-coll
                 'ident? ident? 'identical? identical? 'identity identity
                 'inc inc 'int-array int-array 'interleave interleave
-                'js-in js-in
+                'js-in (fn [key obj] (js* "~{} in ~{}" key obj))
                 'into into 'iterate iterate 'int int 'int? int?
                 'interpose interpose 'indexed? indexed?
                 'integer? integer? 'into-array into-array
