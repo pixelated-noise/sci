@@ -3058,6 +3058,14 @@
                                   (merge {:record? is-record?}
                                          (when (seq mutable-fields) {:mutable-fields mutable-fields})
                                          (when (seq host-interfaces) {:interfaces host-interfaces})))
+        ;; Register host print-method for SCI records so (str [record]) works
+        _ #?(:clj (when is-record?
+              (.addMethod ^clojure.lang.MultiFn print-method type-obj
+                (fn [m ^java.io.Writer w]
+                  (.write w "#")
+                  (.write w (str dotted-sym))
+                  (print-method (into (sorted-map) m) w))))
+             :cljs nil)
         ;; Call :deftype-fn hook if present
         deftype-fn-hook (:deftype-fn machine)
         hook-result (when deftype-fn-hook

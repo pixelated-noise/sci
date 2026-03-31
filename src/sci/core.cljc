@@ -158,7 +158,8 @@
   ([current-ns ns-aliases] (make-reader-opts current-ns ns-aliases nil nil))
   ([current-ns ns-aliases heap-atom] (make-reader-opts current-ns ns-aliases heap-atom nil))
   ([current-ns ns-aliases heap-atom ns-atom]
-   {:all true
+   (cond->
+    {:all true
     :row-key :line
     :col-key :column
     :end-row-key :end-line
@@ -173,7 +174,20 @@
     :deref true
     :regex true
     :auto-resolve (merge {:current (or current-ns 'user)}
-                        ns-aliases)}))
+                        ns-aliases)}
+    ;; Add SCI record tagged literal readers when heap is available
+    heap-atom (assoc :readers
+                #?(:clj (fn [tag]
+                           (or (get clojure.core/default-data-readers tag)
+                               (let [tag-str (str tag)
+                                     idx (.lastIndexOf ^String tag-str ".")]
+                                 (when (> idx 0)
+                                   (let [ns-str (subs tag-str 0 idx)
+                                         type-str (subs tag-str (inc idx))
+                                         map-ctor-sym (symbol ns-str (str "map->" type-str))
+                                         entry (get @heap-atom map-ctor-sym)]
+                                     (when entry (:val entry)))))))
+                   :cljs nil)))))
 
 (defn read-all
   "Read all forms from a string."
@@ -1375,7 +1389,17 @@
                     (symbol "clojure.core" "load-string")
                     {:val (make-load-string-fn ctx heap-atom) :meta {:name 'load-string}}
                     (symbol "clojure.core" "read-string")
-                    {:val (fn sci-read-string
+                    {:val (let [sci-tag-reader (fn [tag]
+                                                ;; Look up SCI record constructor for tagged literal like #foo.A{...}
+                                                (let [tag-str (str tag)
+                                                      idx #?(:clj (.lastIndexOf ^String tag-str ".") :cljs -1)]
+                                                  (when (> idx 0)
+                                                    (let [ns-str (subs tag-str 0 idx)
+                                                          type-str (subs tag-str (inc idx))
+                                                          map-ctor-sym (symbol ns-str (str "map->" type-str))
+                                                          entry (get @heap-atom map-ctor-sym)]
+                                                      (when entry (:val entry))))))]
+                            (fn sci-read-string
                             ([s]
                              (let [suppress? *suppress-read*
                                    re-val    (or *read-eval* @read-eval)
@@ -1384,11 +1408,12 @@
                                    opts (cond-> (assoc (make-reader-opts) :location? (constantly false))
                                           suppress? (assoc :suppress-read true)
                                           re-val    (assoc :read-eval clojure.core/eval)
-                                          default-fn (assoc :readers
-                                                        #?(:clj (fn [tag]
-                                                                   (or (get clojure.core/default-data-readers tag)
-                                                                       (fn [val] (default-fn tag val))))
-                                                           :cljs nil))
+                                          true (assoc :readers
+                                                 #?(:clj (fn [tag]
+                                                            (or (get clojure.core/default-data-readers tag)
+                                                                (sci-tag-reader tag)
+                                                                (when default-fn (fn [val] (default-fn tag val)))))
+                                                    :cljs nil))
                                           resolver  (assoc :auto-resolve
                                                        #?(:clj (fn [alias]
                                                                   (if (= alias :current)
@@ -1406,11 +1431,12 @@
                                                               (dissoc opts :eof))
                                                  suppress? (assoc :suppress-read true)
                                                  re-val    (assoc :read-eval clojure.core/eval)
-                                                 default-fn (assoc :readers
-                                                               #?(:clj (fn [tag]
-                                                                          (or (get clojure.core/default-data-readers tag)
-                                                                              (fn [val] (default-fn tag val))))
-                                                                  :cljs nil))
+                                                 true (assoc :readers
+                                                        #?(:clj (fn [tag]
+                                                                   (or (get clojure.core/default-data-readers tag)
+                                                                       (sci-tag-reader tag)
+                                                                       (when default-fn (fn [val] (default-fn tag val)))))
+                                                           :cljs nil))
                                                  resolver  (assoc :auto-resolve
                                                               #?(:clj (fn [alias]
                                                                          (if (= alias :current)
@@ -1428,7 +1454,7 @@
                                         (not= eof-val ::none)
                                         (clojure.string/blank? s))
                                  eof-val
-                                 result))))
+                                 result)))))
                      :meta {:name 'read-string}}
                     #?@(:clj
                         [(symbol "clojure.core" "read")
@@ -1572,19 +1598,41 @@
                      :meta {:name 'record?}}
                     ;; str — dispatch toString for SCI type instances
                     (symbol "clojure.core" "str")
-                    {:val (fn [& args]
-                            (if (empty? args)
-                              ""
-                              (clojure.string/join
-                                (map (fn [x]
-                                       (if (nil? x) ""
-                                         (if-let [sci-type (:type (clojure.core/meta x))]
-                                           (let [methods (.-methods ^sci.lang.Type sci-type)]
-                                             (if-let [toString-fn (get methods 'toString)]
-                                               (toString-fn x)
-                                               (clojure.core/str "#object[" (.-name ^sci.lang.Type sci-type) "]")))
-                                           (clojure.core/str x))))
-                                     args))))
+                    {:val (let [sci-pr-str (fn sci-pr-str [x]
+                                             (cond
+                                               (nil? x) "nil"
+                                               (:sci.impl/record (clojure.core/meta x))
+                                               (let [type-obj (:type (clojure.core/meta x))]
+                                                 (str "#" (.-name ^sci.lang.Type type-obj)
+                                                      (clojure.core/pr-str (into (sorted-map) x))))
+                                               (instance? sci.lang.Var x)
+                                               (str "#'" (.-sym ^sci.lang.Var x))
+                                               (vector? x) (str "[" (clojure.string/join " " (map sci-pr-str x)) "]")
+                                               (set? x) (str "#{" (clojure.string/join ", " (map sci-pr-str x)) "}")
+                                               (map? x) (str "{" (clojure.string/join ", " (map (fn [[k v]] (str (sci-pr-str k) " " (sci-pr-str v))) x)) "}")
+                                               (seq? x) (str "(" (clojure.string/join " " (map sci-pr-str x)) ")")
+                                               :else (clojure.core/pr-str x)))]
+                            (fn [& args]
+                              (if (empty? args)
+                                ""
+                                (clojure.string/join
+                                  (map (fn [x]
+                                         (if (nil? x) ""
+                                           (if-let [sci-type (when-let [m (clojure.core/meta x)]
+                                                               (when (instance? sci.lang.Type (:type m))
+                                                                 (:type m)))]
+                                             (let [methods (.-methods ^sci.lang.Type sci-type)]
+                                               (if-let [toString-fn (get methods 'toString)]
+                                                 (toString-fn x)
+                                                 (if (:sci.impl/record (clojure.core/meta x))
+                                                   (str "#" (.-name ^sci.lang.Type sci-type)
+                                                        (clojure.core/pr-str (into (sorted-map) x)))
+                                                   (str "#object[" (.-name ^sci.lang.Type sci-type) "]"))))
+                                             ;; For collections, check if they might contain SCI records
+                                             (if (coll? x)
+                                               (sci-pr-str x)
+                                               (clojure.core/str x)))))
+                                       args)))))
                      :meta {:name 'str}}
                     #?@(:clj
                     [;; aset — coerce values for primitive arrays
@@ -1687,43 +1735,63 @@
                               ([m k] (dissoc1 m k))
                               ([m k & ks] (reduce dissoc1 (dissoc1 m k) ks)))
                        :meta {:name 'dissoc}})
-                    ;; pr-str — handle SCI records and vars
+                    ;; pr-str — handle SCI records and vars, with recursive collection traversal
                     (symbol "clojure.core" "pr-str")
-                    {:val (fn [& args]
-                            (clojure.string/join " "
-                              (map (fn [x]
-                                     (let [m (clojure.core/meta x)
-                                           type-obj (when m (:type m))
-                                           ;; Check if there's a custom print-method for this SCI type
-                                           ;; Host print-method only dispatches on keyword :type, not SCI Type objects
-                                           #?@(:clj
-                                               [custom-pm-fn
-                                                (when (instance? sci.lang.Type type-obj)
-                                                  (let [pm-entry (get @heap-atom (symbol "clojure.core" "print-method"))
-                                                        pm (:val pm-entry)]
-                                                    (when (instance? clojure.lang.MultiFn pm)
-                                                      (let [method-table (.getMethodTable ^clojure.lang.MultiFn pm)]
-                                                        (get method-table type-obj)))))])]
-                                       (cond
-                                         ;; Custom print-method registered for this SCI type
-                                         #?(:clj custom-pm-fn :cljs false)
-                                         #?(:clj
-                                            (let [sw (java.io.StringWriter.)]
-                                              (custom-pm-fn x sw)
-                                              (str sw))
-                                            :cljs nil)
-                                         ;; SCI record — print as #ns.Name{...}
-                                         (:sci.impl/record m)
-                                         (let [type-name (when (instance? sci.lang.Type type-obj)
-                                                           (.-name ^sci.lang.Type type-obj))]
-                                           (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
-                                         ;; SCI Var — print as #'ns/name
-                                         (instance? sci.lang.Var x)
-                                         (let [sym (.-sym ^sci.lang.Var x)]
-                                           (str "#'" sym))
-                                         :else (clojure.core/pr-str x))))
-                                   args)))
+                    {:val (let [get-custom-pm (fn [type-obj]
+                                                #?(:clj
+                                                   (when (instance? sci.lang.Type type-obj)
+                                                     (let [pm-entry (get @heap-atom (symbol "clojure.core" "print-method"))
+                                                           pm (:val pm-entry)]
+                                                       (when (instance? clojure.lang.MultiFn pm)
+                                                         (let [method-table (.getMethodTable ^clojure.lang.MultiFn pm)]
+                                                           (get method-table type-obj)))))
+                                                   :cljs nil))]
+                            (fn sci-pr [& args]
+                              (letfn [(pr1 [x]
+                                        (let [m (clojure.core/meta x)
+                                              type-obj (when m (:type m))
+                                              custom-pm-fn (get-custom-pm type-obj)]
+                                          (cond
+                                            ;; Custom print-method registered for this SCI type
+                                            custom-pm-fn
+                                            #?(:clj
+                                               (let [sw (java.io.StringWriter.)]
+                                                 (custom-pm-fn x sw)
+                                                 (str sw))
+                                               :cljs (clojure.core/pr-str x))
+                                            ;; SCI record — print as #ns.Name{...}
+                                            (and m (:sci.impl/record m))
+                                            (let [type-name (when (instance? sci.lang.Type type-obj)
+                                                              (.-name ^sci.lang.Type type-obj))]
+                                              (str "#" type-name "{" (clojure.string/join ", " (map (fn [[k v]] (str (pr1 k) " " (pr1 v))) (sort-by key x))) "}"))
+                                            ;; SCI deftype (non-record) — print as #object[ns.Name]
+                                            (instance? sci.lang.Type type-obj)
+                                            (str "#object[" (.-name ^sci.lang.Type type-obj) "]")
+                                            ;; SCI Var — print as #'ns/name
+                                            (instance? sci.lang.Var x) (str "#'" (.-sym ^sci.lang.Var x))
+                                            ;; Collections — recursive traversal to catch SCI types inside
+                                            (vector? x) (str "[" (clojure.string/join " " (map pr1 x)) "]")
+                                            (set? x) (str "#{" (clojure.string/join " " (map pr1 (sort x))) "}")
+                                            (map? x) (str "{" (clojure.string/join ", " (map (fn [[k v]] (str (pr1 k) " " (pr1 v))) x)) "}")
+                                            (seq? x) (str "(" (clojure.string/join " " (map pr1 x)) ")")
+                                            :else (clojure.core/pr-str x))))]
+                                (clojure.string/join " " (map pr1 args)))))
                      :meta {:name 'pr-str}}
+                    ;; pr — print using SCI-aware formatting to *out*
+                    (symbol "clojure.core" "pr")
+                    {:val (fn [& args]
+                            (let [pr-str-fn (:val (get @heap-atom (symbol "clojure.core" "pr-str")))
+                                  s (apply pr-str-fn args)]
+                              (.write ^java.io.Writer *out* ^String s)))
+                     :meta {:name 'pr :doc #?(:clj (:doc (meta #'clojure.core/pr)) :cljs nil)}}
+                    ;; prn — pr followed by newline
+                    (symbol "clojure.core" "prn")
+                    {:val (fn [& args]
+                            (let [pr-fn (:val (get @heap-atom (symbol "clojure.core" "pr")))]
+                              (apply pr-fn args)
+                              (.write ^java.io.Writer *out* "\n")
+                              (when *flush-on-newline* (.flush ^java.io.Writer *out*))))
+                     :meta {:name 'prn :doc #?(:clj (:doc (meta #'clojure.core/prn)) :cljs nil)}}
                     ;; print-str — like pr-str for print-str
                     (symbol "clojure.core" "print-str")
                     {:val (fn [& args]
