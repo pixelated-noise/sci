@@ -49,8 +49,22 @@
              (-invoke [_ a] (val a))
              (-invoke [_ a b] (val a b))
              (-invoke [_ a b c] (val a b c))
+             (-invoke [_ a b c d] (val a b c d))
+             (-invoke [_ a b c d e] (val a b c d e))
+             (-invoke [_ a b c d e f] (val a b c d e f))
+             (-invoke [_ a b c d e f g] (val a b c d e f g))
+             Object
+             (toString [_] (str "#'" (or (:sci.impl/var-sym meta-map) sym)))
+             IEquiv
+             (-equiv [_ other]
+               (and (instance? Var other)
+                    (= (or (:sci.impl/var-sym meta-map) sym)
+                       (or (:sci.impl/var-sym (.-meta-map ^Var other))
+                           (.-sym ^Var other)))))
+             IHash
+             (-hash [_] (hash (or (:sci.impl/var-sym meta-map) sym)))
              IPrintWithWriter
-             (-pr-writer [_ writer _] (-write writer (str "#'" sym)))]))
+             (-pr-writer [_ writer _] (-write writer (str "#'" (or (:sci.impl/var-sym meta-map) sym))))]))
 
 #?(:clj
    (defmethod print-method Var [^Var v ^java.io.Writer w]
@@ -74,7 +88,14 @@
       :cljs [IDeref
              (-deref [_] @atom-ref)
              IMeta
-             (-meta [_] meta-map)]))
+             (-meta [_] meta-map)
+             IReset
+             (-reset! [_ v] (reset! atom-ref v))
+             ISwap
+             (-swap! [_ f] (swap! atom-ref f))
+             (-swap! [_ f a] (swap! atom-ref f a))
+             (-swap! [_ f a b] (swap! atom-ref f a b))
+             (-swap! [_ f a b xs] (apply swap! atom-ref f a b xs))]))
 
 ;; Unbound — represents an unbound SCI var
 (deftype Unbound [sym]
