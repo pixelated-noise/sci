@@ -564,3 +564,105 @@
                   (recur (inc i) (+ acc i))))")
           result (sci/resume m)]
       (is (= 3 result)))))
+
+;; ============================================================
+;; Known limitations — these tests assert desired behavior that
+;; doesn't work yet. They are expected to FAIL.
+;; ============================================================
+
+(deftest ^:known-limitation freeze-thaw-multimethod-destructuring
+  (testing "multimethod methods with destructuring params should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defmulti area :shape)
+                  (defmethod area :circle [{:keys [r]}] (* 3.14 r r))
+                  (defmethod area :rect [{:keys [w h]}] (* w h))
+                  (suspend!)
+                  [(area {:shape :circle :r 10}) (area {:shape :rect :w 3 :h 4})])")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= [314.0 12] result)))))
+
+(deftest ^:known-limitation freeze-thaw-deftype-inline-protocol
+  (testing "deftype with inline protocol methods should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defprotocol Greetable (greet [this]))
+                  (deftype Greeter [name]
+                    Greetable
+                    (greet [this] (str \"Hi, \" (:name this))))
+                  (suspend!)
+                  (greet (->Greeter \"Bob\")))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "Hi, Bob" result)))))
+
+(deftest ^:known-limitation freeze-thaw-multiple-protocols
+  (testing "multiple protocols on the same record should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defprotocol Named (get-name [this]))
+                  (defprotocol Aged (get-age [this]))
+                  (defrecord Person [name age])
+                  (extend-protocol Named Person (get-name [this] (:name this)))
+                  (extend-protocol Aged Person (get-age [this] (:age this)))
+                  (suspend!)
+                  (let [p (->Person \"Alice\" 30)]
+                    [(get-name p) (get-age p)]))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= ["Alice" 30] result)))))
+
+(deftest ^:known-limitation freeze-thaw-extend-type
+  (testing "extend-type should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defprotocol Describable (describe [this]))
+                  (defrecord Dog [name breed])
+                  (extend-type Dog
+                    Describable
+                    (describe [this] (str (:name this) \" the \" (:breed this))))
+                  (suspend!)
+                  (describe (->Dog \"Rex\" \"Lab\")))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "Rex the Lab" result)))))
+
+(deftest ^:known-limitation freeze-thaw-comp-user-fns
+  (testing "comp of user-defined fns should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defn my-double [x] (* 2 x))
+                  (defn add1 [x] (+ 1 x))
+                  (let [f (comp my-double add1)]
+                    (suspend!)
+                    (f 5)))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 12 result)))))
+
+(deftest ^:known-limitation freeze-thaw-partial-user-fn
+  (testing "partial of user-defined fn should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defn add [a b] (+ a b))
+                  (let [add10 (partial add 10)]
+                    (suspend!)
+                    (add10 5)))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 15 result)))))
+
+(deftest ^:known-limitation freeze-thaw-atom-identity-in-closure
+  (testing "atom identity should be preserved across closure env boundaries"
+    (let [m (eval-suspend
+             "(do (let [counter (atom 0)]
+                    (defn bump [] (swap! counter inc))
+                    (bump) (bump) (bump)
+                    (suspend!)
+                    (bump)
+                    @counter))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 4 result)))))
