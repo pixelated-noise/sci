@@ -499,7 +499,7 @@
 ;; that doesn't work yet. They are expected to FAIL.
 ;; ============================================================
 
-(deftest ^:known-limitation freeze-thaw-multimethod
+(deftest freeze-thaw-multimethod
   (testing "multimethod dispatch should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defmulti greet :lang)
@@ -511,7 +511,7 @@
           result (sci/resume thawed)]
       (is (= "hello" result)))))
 
-(deftest ^:known-limitation freeze-thaw-protocol
+(deftest freeze-thaw-protocol
   (testing "protocol dispatch should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defprotocol Greetable

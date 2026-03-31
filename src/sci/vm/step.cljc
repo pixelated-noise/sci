@@ -2271,7 +2271,7 @@
 ;; Multimethods
 ;; ============================================================
 
-(defn- make-multimethod
+(defn make-multimethod
   "Create a multimethod: a callable fn that dispatches based on a dispatch-fn."
   [mm-name dispatch-fn hierarchy-atom]
   (let [methods-atom (atom {})
@@ -2381,7 +2381,52 @@
    :ns ns-sym
    :methods method-sigs
    :extend-via-metadata (:extend-via-metadata opts)
-   :impls (atom {})}) ;; type -> {method-name -> fn}
+   :impls (atom {})})
+
+(defn make-protocol-dispatch-fn
+  "Create a dispatch function for a protocol method.
+   Used by step-eval-defprotocol and freeze/thaw reconstruction."
+  [protocol mname ns-sym proto-name]
+  (let [extend-via-meta? (:extend-via-metadata protocol)
+        mname-qualified (symbol (str ns-sym) (str mname))
+        qualified-proto (symbol (str ns-sym) (str proto-name))
+        method-fn (fn protocol-dispatch [& args]
+                    (let [target (first args)
+                          sci-type (when (map? target) (:type (clojure.core/meta target)))
+                          target-type (or sci-type (type target))
+                          impls @(:impls protocol)
+                          direct-impl (get impls target-type)
+                          meta-fn (when (and extend-via-meta? (not direct-impl))
+                                    (when-let [m (clojure.core/meta target)]
+                                      (or (get m mname-qualified)
+                                          (get m (symbol (name mname))))))]
+                      (if meta-fn
+                        (apply meta-fn args)
+                        (let [impl (or direct-impl
+                                       (when (:sci.impl/record (clojure.core/meta target))
+                                         (or (get impls clojure.lang.IRecord)
+                                             (get impls clojure.lang.IPersistentMap)))
+                                       (some (fn [[t impl]]
+                                               (when (and (class? t)
+                                                          (not= t Object)
+                                                          (instance? t target))
+                                                 impl))
+                                             impls)
+                                       (when (nil? target) (get impls nil))
+                                       (get impls Object)
+                                       (get impls :default))]
+                          (if-let [f (or (get impl mname)
+                                         (get impl (keyword mname))
+                                         (get impl (symbol mname)))]
+                            (apply f args)
+                            (throw (ex-info (str "No implementation of method: :" mname
+                                                 " of protocol: #'" ns-sym "/" proto-name
+                                                 " found for: " (type target))
+                                            {:type :sci/error})))))))]
+    (with-meta method-fn {:sci/protocol-dispatch true
+                          :sci/protocol-name qualified-proto
+                          :sci/method-name mname
+                          :sci/ns ns-sym}))) ;; type -> {method-name -> fn}
 
 (defn step-eval-defprotocol [machine frame]
   ;; (defprotocol Name :extend-via-metadata true (method1 [this]) (method2 [this x]))
@@ -2429,49 +2474,7 @@
         ;; Create dispatch functions for each protocol method
         machine (reduce
                  (fn [m [mname {:keys [arglists]}]]
-                   (let [extend-via-meta? (:extend-via-metadata protocol)
-                         mname-qualified (symbol (str ns-sym) (str mname))
-                         method-fn (fn protocol-dispatch [& args]
-                                     (let [target (first args)
-                                           ;; For SCI type instances (maps with :type meta), use SCI type
-                                           sci-type (when (map? target) (:type (clojure.core/meta target)))
-                                           target-type (or sci-type (type target))
-                                           impls @(:impls protocol)
-                                           ;; Check for direct type implementation first (defrecord takes priority)
-                                           direct-impl (get impls target-type)
-                                           ;; extend-via-metadata: check target's metadata only if no direct impl
-                                           meta-fn (when (and extend-via-meta? (not direct-impl))
-                                                     (when-let [m (clojure.core/meta target)]
-                                                       (or (get m mname-qualified)
-                                                           (get m (symbol (name mname))))))]
-                                       (if meta-fn
-                                         (apply meta-fn args)
-                                     (let [;; Look up implementation: exact type, then IRecord, then interfaces, then Object
-                                           impl (or direct-impl
-                                                    ;; SCI records: check IRecord/IPersistentMap before Object
-                                                    (when (:sci.impl/record (clojure.core/meta target))
-                                                      (or (get impls clojure.lang.IRecord)
-                                                          (get impls clojure.lang.IPersistentMap)))
-                                                    ;; Check interfaces (excluding Object — handled below)
-                                                    (some (fn [[t impl]]
-                                                            (when (and (class? t)
-                                                                       (not= t Object)
-                                                                       (instance? t target))
-                                                              impl))
-                                                          impls)
-                                                    ;; Try nil
-                                                    (when (nil? target) (get impls nil))
-                                                    ;; Try Object/:default
-                                                    (get impls Object)
-                                                    (get impls :default))]
-                                       (if-let [f (or (get impl mname)
-                                                           (get impl (keyword mname))
-                                                           (get impl (symbol mname)))]
-                                         (apply f args)
-                                         (throw (ex-info (str "No implementation of method: :" mname
-                                                              " of protocol: #'" ns-sym "/" proto-name
-                                                              " found for: " (type target))
-                                                         {:type :sci/error})))))))
+                   (let [method-fn (make-protocol-dispatch-fn protocol mname ns-sym proto-name)
                          mq (symbol (str ns-sym) (str mname))
                          method-arglists arglists
                          ;; Find docstring for this method (immediately after the method-name in the definition)
@@ -3212,18 +3215,23 @@
         ;; Create positional constructor ->Name
         ;; Mutable field values are wrapped in atoms
         mutable-kws (set (map keyword mutable-fields))
-        ctor-fn (if is-record?
-                  (fn [& args]
-                    (with-meta (zipmap field-keywords args)
-                      {:type type-obj :sci.impl/record true}))
-                  (fn [& args]
-                    (with-meta (zipmap field-keywords
-                                      (map-indexed (fn [i v]
-                                                     (if (contains? mutable-kws (nth field-keywords i))
-                                                       (atom v)
-                                                       v))
-                                                   args))
-                      {:type type-obj})))
+        ctor-fn (let [f (if is-record?
+                          (fn [& args]
+                            (with-meta (zipmap field-keywords args)
+                              {:type type-obj :sci.impl/record true}))
+                          (fn [& args]
+                            (with-meta (zipmap field-keywords
+                                              (map-indexed (fn [i v]
+                                                             (if (contains? mutable-kws (nth field-keywords i))
+                                                               (atom v)
+                                                               v))
+                                                           args))
+                              {:type type-obj})))]
+                    (with-meta f {:sci/type-ctor true
+                                  :sci/type-name (str dotted-sym)
+                                  :sci/fields field-keywords
+                                  :sci/record? is-record?
+                                  :sci/mutable-fields mutable-kws}))
         ctor-sym      (symbol (str "->" type-name))
         ctor-qualified (symbol (str ns-sym) (str ctor-sym))
         ctor-entry    {:val ctor-fn
@@ -3236,9 +3244,13 @@
                     (assoc-in [:heap ctor-qualified] ctor-entry))
         ;; map->Name for records
         machine (if is-record?
-                  (let [map-ctor-fn (fn [m]
-                                      (with-meta (merge (zipmap field-keywords (repeat nil)) m)
-                                        {:type type-obj :sci.impl/record true}))
+                  (let [map-ctor-fn (with-meta
+                                      (fn [m]
+                                        (with-meta (merge (zipmap field-keywords (repeat nil)) m)
+                                          {:type type-obj :sci.impl/record true}))
+                                      {:sci/map-type-ctor true
+                                       :sci/type-name (str dotted-sym)
+                                       :sci/fields field-keywords})
                         map-ctor-sym (symbol (str "map->" type-name))
                         map-ctor-q   (symbol (str ns-sym) (str map-ctor-sym))
                         map-ctor-entry {:val map-ctor-fn
