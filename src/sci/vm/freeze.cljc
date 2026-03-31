@@ -69,6 +69,17 @@
           (instance? clojure.lang.Atom x)
           {:type :atom-ref :val (replace-unserializable @x inverse-reg)}
 
+          ;; Namespace object — serialize as symbol
+          (instance? clojure.lang.Namespace x)
+          {:type :ns-ref :name (str (.getName ^clojure.lang.Namespace x))}
+
+          ;; Any other non-serializable object — store class name for reconstruction
+          (and (not (or (string? x) (number? x) (keyword? x) (symbol? x)
+                        (nil? x) (boolean? x) (map? x) (vector? x)
+                        (set? x) (seq? x) (list? x)))
+               (not (instance? java.io.Serializable x)))
+          {:type :unserializable :class (str (class x))}
+
           :else x))
       data)))
 
@@ -84,7 +95,7 @@
            u-heap (user-heap heap)
            ;; Build the serializable state
            state (-> machine
-                     (dissoc :heap-atom :heap :inverse-registry)
+                     (dissoc :heap-atom :heap :inverse-registry :ctx :ns-atom :current-ns-atom :hierarchy-atom)
                      (assoc :user-heap (replace-unserializable u-heap inverse-reg)))
            state (replace-unserializable state inverse-reg)]
        (pr-str (assoc state :version 1)))
@@ -131,6 +142,10 @@
 
             :atom-ref
             (atom (:val x))
+
+            :ns-ref
+            (let [ns-sym (symbol (:name x))]
+              (or (clojure.core/find-ns ns-sym) ns-sym))
 
             :unknown-fn
             (fn [& _args]
