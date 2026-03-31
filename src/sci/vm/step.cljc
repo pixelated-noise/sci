@@ -173,7 +173,7 @@
         (if (= sym-name "*ns*")
           (let [ns-sym (:current-ns machine)
                 ns-info (get-in machine [:ns ns-sym])
-                ns-meta (dissoc ns-info :aliases :refers :imports)]
+                ns-meta (dissoc ns-info :aliases :refers :imports :types :refer-clojure-excludes)]
             (if (seq ns-meta)
               (with-meta ns-sym ns-meta)
               ns-sym))
@@ -2219,8 +2219,13 @@
   ([machine ns-sym require-opts]
    (let [ns-table (:ns machine)
          loaded? (contains? ns-table ns-sym)
-         ns-str (str ns-sym)]
+         ns-str (str ns-sym)
+         ;; Also check if any vars exist in the heap for this namespace
+         heap-has-ns? (when-not loaded?
+                        (let [heap (if-let [a (:heap-atom machine)] @a (:heap machine))]
+                          (some (fn [[k _]] (= ns-str (namespace k))) heap)))]
      (if (and (or loaded?
+                  heap-has-ns?
                   (contains? (set host/default-namespaces) ns-sym)
                   (get (:ns-aliases machine) ns-sym))
               (not (:force-reload machine)))

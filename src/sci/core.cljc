@@ -585,10 +585,13 @@
                      m))
                  {} heap))))
 
-(defn- make-ns-map-fn [heap-atom]
+(defn- make-ns-map-fn [heap-atom ctx]
   (fn [ns-sym]
     (let [heap   @heap-atom
-          ns-str (str ns-sym)]
+          ns-str (str ns-sym)
+          ;; Start with imports from the ns-table
+          ns-data (when-let [a (:ns-atom ctx)] @a)
+          imports (get-in ns-data [ns-sym :imports])]
       (reduce-kv (fn [m k v]
                    (let [k-ns (namespace k)]
                      (if (or (= ns-str k-ns) (= "clojure.core" k-ns))
@@ -599,7 +602,7 @@
                          (assoc m (symbol (name k))
                                 (sci.lang/->Var (symbol (name k)) (:val v) var-meta (:dynamic? v))))
                        m)))
-                 {} heap))))
+                 (or imports {}) heap))))
 
 (defn- make-ns-refers-fn [heap-atom]
   (fn [ns-sym]
@@ -662,12 +665,21 @@
        (symbol? (:name x))
        (contains? x :aliases)))
 
+(defn- ns-meta-from-info
+  "Extract user-facing metadata from a ns-table entry (exclude structural keys)."
+  [ns-info]
+  (not-empty (dissoc ns-info :aliases :refers :imports :types :refer-clojure-excludes)))
+
 (defn- make-find-ns-fn [ctx]
   (fn [sym]
     (let [ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
           ns-info (get ns-data sym)]
       (when ns-info
-        (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)))))
+        (let [ns-obj (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)
+              ns-meta (ns-meta-from-info ns-info)]
+          (if ns-meta
+            (with-meta ns-obj ns-meta)
+            ns-obj))))))
 
 (defn- make-the-ns-fn [ctx]
   (fn [sym-or-ns]
@@ -678,7 +690,11 @@
           ns-data (if-let [a (:ns-atom ctx)] @a (:ns-table ctx))
           ns-info (get ns-data sym)]
       (if ns-info
-        (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)
+        (let [ns-obj (get-or-create-ns-object (or (:ns-objects ctx) (atom {})) sym)
+              ns-meta (ns-meta-from-info ns-info)]
+          (if ns-meta
+            (with-meta ns-obj ns-meta)
+            ns-obj))
         (throw (ex-info (str "No namespace: " sym " found") {:type :sci/error}))))))
 
 (defn- make-create-ns-fn [ctx]
@@ -1052,7 +1068,7 @@
                                       (:incremental *clojure-version*) "-SCI"))
                      :meta {:name 'clojure-version}}
                     (symbol "clojure.core" "ns-map")
-                    {:val (make-ns-map-fn heap-atom) :meta {:name 'ns-map}}
+                    {:val (make-ns-map-fn heap-atom ctx) :meta {:name 'ns-map}}
                     (symbol "clojure.core" "ns-refers")
                     {:val (make-ns-refers-fn heap-atom) :meta {:name 'ns-refers}}
                     (symbol "clojure.core" "with-in-str")
