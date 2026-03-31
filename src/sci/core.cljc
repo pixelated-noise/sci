@@ -942,9 +942,8 @@
           proto-syms (vec (keep #(when (symbol? %) %) specs))
           methods    (vec (keep #(when (seq? %) %) specs))]
       (list 'do
-            (apply list 'deftype* qualified dotted fields :implements proto-syms methods)
-            (list 'def (symbol (str "->" name-sym))
-                  (list 'var (symbol (str ns-sym) (str "->" name-sym))))))))
+            (list 'declare (symbol (str "->" name-sym)))
+            (apply list 'deftype* qualified dotted fields :implements proto-syms methods)))))
 
 ;; ============================================================
 
