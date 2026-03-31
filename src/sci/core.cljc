@@ -200,9 +200,36 @@
                                      (clojure.core/swap! ref f)))
                                  (clojure.core/swap! ref f))
                                (clojure.core/swap! ref f)))
-                            ([ref f a] (clojure.core/swap! ref f a))
-                            ([ref f a b] (clojure.core/swap! ref f a b))
-                            ([ref f a b & args] (apply clojure.core/swap! ref f a b args)))
+                            ([ref f a]
+                             (if-let [type-obj (:type (clojure.core/meta ref))]
+                               (if (instance? sci.lang.Type type-obj)
+                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                       swap-fn (get methods 'swap)]
+                                   (if swap-fn
+                                     (swap-fn ref f a)
+                                     (clojure.core/swap! ref f a)))
+                                 (clojure.core/swap! ref f a))
+                               (clojure.core/swap! ref f a)))
+                            ([ref f a b]
+                             (if-let [type-obj (:type (clojure.core/meta ref))]
+                               (if (instance? sci.lang.Type type-obj)
+                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                       swap-fn (get methods 'swap)]
+                                   (if swap-fn
+                                     (swap-fn ref f a b)
+                                     (clojure.core/swap! ref f a b)))
+                                 (clojure.core/swap! ref f a b))
+                               (clojure.core/swap! ref f a b)))
+                            ([ref f a b & args]
+                             (if-let [type-obj (:type (clojure.core/meta ref))]
+                               (if (instance? sci.lang.Type type-obj)
+                                 (let [methods (.-methods ^sci.lang.Type type-obj)
+                                       swap-fn (get methods 'swap)]
+                                   (if swap-fn
+                                     (apply swap-fn ref f a b args)
+                                     (apply clojure.core/swap! ref f a b args)))
+                                 (apply clojure.core/swap! ref f a b args))
+                               (apply clojure.core/swap! ref f a b args))))
                      :meta {:name 'swap!}
                      :dynamic? false})
         heap (assoc heap (symbol "clojure.core" "reset!")
@@ -249,51 +276,72 @@
                             ([ref f a b & args] (apply clojure.core/swap-vals! ref f a b args)))
                      :meta {:name 'swap-vals! :doc #?(:clj (:doc (meta #'clojure.core/swap-vals!)) :cljs nil)}
                      :dynamic? false})
-        ;; Override derive/underive/isa? to handle SCI types (sci.lang.Type)
-        ;; SCI types are not Class or Named, so we convert them to their qualified symbol
+        heap (assoc heap (symbol "clojure.core" "compare-and-set!")
+                    {:val (fn sci-compare-and-set! [ref oldval newval]
+                            (if-let [type-obj (:type (clojure.core/meta ref))]
+                              (if (instance? sci.lang.Type type-obj)
+                                (let [methods (.-methods ^sci.lang.Type type-obj)
+                                      cas-fn (get methods 'compareAndSet)]
+                                  (if cas-fn
+                                    (cas-fn ref oldval newval)
+                                    (clojure.core/compare-and-set! ref oldval newval)))
+                                (clojure.core/compare-and-set! ref oldval newval))
+                              (clojure.core/compare-and-set! ref oldval newval)))
+                     :meta {:name 'compare-and-set!}
+                     :dynamic? false})
+        ;; Override derive/underive/isa?/parents/ancestors/descendants to:
+        ;; 1. Handle SCI types (sci.lang.Type) by converting to qualified symbols
+        ;; 2. Use a per-context hierarchy atom instead of the global one
+        hierarchy-atom (atom (clojure.core/make-hierarchy))
         heap (let [type->tag (fn [t]
                                (if (instance? sci.lang.Type t)
                                  (let [n (.getName ^sci.lang.Type t)
-                                       ;; Convert "foo.Foo" to symbol foo/Foo (namespace-qualified)
                                        idx (.lastIndexOf ^String n ".")]
                                    (if (pos? idx)
                                      (symbol (subs n 0 idx) (subs n (inc idx)))
                                      (symbol "user" n)))
                                  t))]
                (-> heap
+                   (assoc (symbol "clojure.core" "make-hierarchy")
+                          {:val clojure.core/make-hierarchy
+                           :meta {:name 'make-hierarchy}})
                    (assoc (symbol "clojure.core" "derive")
                           {:val (fn sci-derive
-                                  ([tag parent] (clojure.core/derive (type->tag tag) (type->tag parent)))
+                                  ([tag parent]
+                                   (swap! hierarchy-atom clojure.core/derive (type->tag tag) (type->tag parent))
+                                   nil)
                                   ([h tag parent] (clojure.core/derive h (type->tag tag) (type->tag parent))))
                            :meta {:name 'derive :doc #?(:clj (:doc (meta #'clojure.core/derive)) :cljs nil)}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "underive")
                           {:val (fn sci-underive
-                                  ([tag parent] (clojure.core/underive (type->tag tag) (type->tag parent)))
+                                  ([tag parent]
+                                   (swap! hierarchy-atom clojure.core/underive (type->tag tag) (type->tag parent))
+                                   nil)
                                   ([h tag parent] (clojure.core/underive h (type->tag tag) (type->tag parent))))
                            :meta {:name 'underive :doc #?(:clj (:doc (meta #'clojure.core/underive)) :cljs nil)}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "isa?")
                           {:val (fn sci-isa?
-                                  ([child parent] (clojure.core/isa? (type->tag child) (type->tag parent)))
+                                  ([child parent] (clojure.core/isa? @hierarchy-atom (type->tag child) (type->tag parent)))
                                   ([h child parent] (clojure.core/isa? h (type->tag child) (type->tag parent))))
                            :meta {:name 'isa? :doc #?(:clj (:doc (meta #'clojure.core/isa?)) :cljs nil)}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "parents")
                           {:val (fn sci-parents
-                                  ([tag] (clojure.core/parents (type->tag tag)))
+                                  ([tag] (clojure.core/parents @hierarchy-atom (type->tag tag)))
                                   ([h tag] (clojure.core/parents h (type->tag tag))))
                            :meta {:name 'parents :doc #?(:clj (:doc (meta #'clojure.core/parents)) :cljs nil)}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "ancestors")
                           {:val (fn sci-ancestors
-                                  ([tag] (clojure.core/ancestors (type->tag tag)))
+                                  ([tag] (clojure.core/ancestors @hierarchy-atom (type->tag tag)))
                                   ([h tag] (clojure.core/ancestors h (type->tag tag))))
                            :meta {:name 'ancestors :doc #?(:clj (:doc (meta #'clojure.core/ancestors)) :cljs nil)}
                            :dynamic? false})
                    (assoc (symbol "clojure.core" "descendants")
                           {:val (fn sci-descendants
-                                  ([tag] (clojure.core/descendants (type->tag tag)))
+                                  ([tag] (clojure.core/descendants @hierarchy-atom (type->tag tag)))
                                   ([h tag] (clojure.core/descendants h (type->tag tag))))
                            :meta {:name 'descendants :doc #?(:clj (:doc (meta #'clojure.core/descendants)) :cljs nil)}
                            :dynamic? false})))

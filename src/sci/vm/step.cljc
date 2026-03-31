@@ -546,8 +546,8 @@
                (check-recur-in-body e false))
              (check-recur-in-body (last body) tail? expected-argc)))
 
-        ;; (loop* [bindings...] body...) — body is a new recur target
-         (= 'loop* head) nil
+        ;; (loop* [bindings...] body...) or (loop ...) — body is a new recur target
+         (contains? '#{loop* loop} head) nil
 
         ;; (fn* ...) / (fn ...) / (letfn* ...) — new recur context, don't descend
          (contains? '#{fn* fn letfn* letfn reify*} head) nil
