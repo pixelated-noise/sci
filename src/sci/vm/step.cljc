@@ -3069,7 +3069,7 @@
 ;; deftype*
 ;; ============================================================
 
-(defn- make-deftype-method-fn
+(defn make-deftype-method-fn
   "Create a Clojure closure for a deftype method.
    fields = field-name symbols; params = [this ...]; body = seq of exprs.
    mutable-fields = set of field symbols that are ^:volatile-mutable."
@@ -3078,37 +3078,45 @@
         ns-atom   (:ns-atom machine)
         base-env  (:env machine)
         mutable-fields (or mutable-fields #{})]
-    (fn [& args]
-      (let [this-obj       (first args)
-            ;; Bind field values from the instance map
-            ;; Mutable fields are stored as atoms — deref them
-            field-bindings (reduce (fn [acc f]
-                                    (let [v (get this-obj (keyword f))]
-                                      (assoc acc f (if (contains? mutable-fields f)
-                                                     @v v))))
-                                  {} fields)
-            fn-env         (merge base-env field-bindings (zipmap params args))
-            ;; Track mutable field atoms so set! can update them
-            mutable-atom-map (when (seq mutable-fields)
-                               (reduce (fn [acc f]
-                                         (assoc acc f (get this-obj (keyword f))))
-                                       {} mutable-fields))
-            heap           (if heap-atom @heap-atom (:heap machine))
-            ;; Use latest ns-table (picks up types defined after this closure was created)
-            ns-table       (if ns-atom @ns-atom (:ns machine))
-            mini-m         (-> (m/make-machine {:heap heap :ns-table ns-table})
-                               (assoc :env fn-env
-                                      :heap-atom heap-atom
-                                      :ns-atom ns-atom
-                                      :current-ns ns-sym)
-                               (merge (when (seq mutable-atom-map)
-                                        {:mutable-fields mutable-atom-map
-                                         :mutable-field-names (set (keys mutable-atom-map))}))
-                               (m/push-frame {:op :eval
-                                              :expr (if (= 1 (count body))
-                                                      (first body)
-                                                      (cons 'do body))}))]
-        (run mini-m)))))
+    (with-meta
+      (fn [& args]
+        (let [this-obj       (first args)
+              ;; Bind field values from the instance map
+              ;; Mutable fields are stored as atoms — deref them
+              field-bindings (reduce (fn [acc f]
+                                      (let [v (get this-obj (keyword f))]
+                                        (assoc acc f (if (contains? mutable-fields f)
+                                                       @v v))))
+                                    {} fields)
+              fn-env         (merge base-env field-bindings (zipmap params args))
+              ;; Track mutable field atoms so set! can update them
+              mutable-atom-map (when (seq mutable-fields)
+                                 (reduce (fn [acc f]
+                                           (assoc acc f (get this-obj (keyword f))))
+                                         {} mutable-fields))
+              heap           (if heap-atom @heap-atom (:heap machine))
+              ;; Use latest ns-table (picks up types defined after this closure was created)
+              ns-table       (if ns-atom @ns-atom (:ns machine))
+              mini-m         (-> (m/make-machine {:heap heap :ns-table ns-table})
+                                 (assoc :env fn-env
+                                        :heap-atom heap-atom
+                                        :ns-atom ns-atom
+                                        :current-ns ns-sym)
+                                 (merge (when (seq mutable-atom-map)
+                                          {:mutable-fields mutable-atom-map
+                                           :mutable-field-names (set (keys mutable-atom-map))}))
+                                 (m/push-frame {:op :eval
+                                                :expr (if (= 1 (count body))
+                                                        (first body)
+                                                        (cons 'do body))}))]
+          (run mini-m)))
+      {:sci/deftype-method true
+       :sci/ns-sym ns-sym
+       :sci/fields (vec fields)
+       :sci/params (vec params)
+       :sci/body (vec body)
+       :sci/mutable-fields (vec mutable-fields)
+       :sci/env base-env})))
 
 (defn step-eval-deftype* [machine frame]
   ;; (deftype* qualified-sym dotted-sym [fields] :implements [Proto1 ...] (method [this] body) ...)
@@ -3158,14 +3166,17 @@
                                       ;; If single arity, use the fn directly; otherwise dispatch by arity
                                       method-fn (if (= 1 (count fns))
                                                   (:fn (first fns))
-                                                  (fn [& args]
-                                                    (let [n (count args)
-                                                          match (first (filter #(= n (:arity %)) fns))]
-                                                      (if match
-                                                        (apply (:fn match) args)
-                                                        (throw (ex-info (str "No matching arity for method " mname
-                                                                             ", got " n " args")
-                                                                        {:type :sci/error}))))))]
+                                                  (with-meta
+                                                    (fn [& args]
+                                                      (let [n (count args)
+                                                            match (first (filter #(= n (:arity %)) fns))]
+                                                        (if match
+                                                          (apply (:fn match) args)
+                                                          (throw (ex-info (str "No matching arity for method " mname
+                                                                               ", got " n " args")
+                                                                          {:type :sci/error})))))
+                                                    {:sci/deftype-multi-method true
+                                                     :sci/method-fns fns}))]
                                   (assoc acc (symbol (name mname)) method-fn)))
                               {} method-map)
         ;; Pre-resolve host Java interfaces from :implements list
@@ -3324,14 +3335,17 @@
                                                 arities)
                                       method-fn (if (= 1 (count fns))
                                                   (:fn (first fns))
-                                                  (fn [& args]
-                                                    (let [n (count args)
-                                                          match (first (filter #(= n (:arity %)) fns))]
-                                                      (if match
-                                                        (apply (:fn match) args)
-                                                        (throw (ex-info (str "No matching arity for method " mname
-                                                                             ", got " n " args")
-                                                                        {:type :sci/error}))))))]
+                                                  (with-meta
+                                                    (fn [& args]
+                                                      (let [n (count args)
+                                                            match (first (filter #(= n (:arity %)) fns))]
+                                                        (if match
+                                                          (apply (:fn match) args)
+                                                          (throw (ex-info (str "No matching arity for method " mname
+                                                                               ", got " n " args")
+                                                                          {:type :sci/error})))))
+                                                    {:sci/deftype-multi-method true
+                                                     :sci/method-fns fns}))]
                                   (assoc acc (symbol (name mname)) method-fn)))
                               {} method-map)
         ;; Create anonymous Type object

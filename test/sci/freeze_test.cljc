@@ -583,7 +583,7 @@
           result (sci/resume thawed)]
       (is (= [314.0 12] result)))))
 
-(deftest ^:known-limitation freeze-thaw-deftype-inline-protocol
+(deftest freeze-thaw-deftype-inline-protocol
   (testing "deftype with inline protocol methods should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defprotocol Greetable (greet [this]))
@@ -597,7 +597,7 @@
           result (sci/resume thawed)]
       (is (= "Hi, Bob" result)))))
 
-(deftest ^:known-limitation freeze-thaw-multiple-protocols
+(deftest freeze-thaw-multiple-protocols
   (testing "multiple protocols on the same record should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defprotocol Named (get-name [this]))
@@ -613,7 +613,7 @@
           result (sci/resume thawed)]
       (is (= ["Alice" 30] result)))))
 
-(deftest ^:known-limitation freeze-thaw-extend-type
+(deftest freeze-thaw-extend-type
   (testing "extend-type should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defprotocol Describable (describe [this]))

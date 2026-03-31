@@ -104,6 +104,26 @@
               :type-name (:sci/type-name m)
               :fields (:sci/fields m)})
 
+           ;; Deftype method fn — carries reconstruction metadata
+           (and (fn? x) (:sci/deftype-method (meta x)))
+           (let [m (meta x)]
+             {:type :deftype-method
+              :ns-sym (str (:sci/ns-sym m))
+              :fields (mapv str (:sci/fields m))
+              :params (mapv str (:sci/params m))
+              :body (:sci/body m)
+              :mutable-fields (mapv str (:sci/mutable-fields m))
+              :env (replace-unserializable (:sci/env m) inverse-reg seen)})
+
+           ;; Multi-arity deftype method dispatch fn
+           (and (fn? x) (:sci/deftype-multi-method (meta x)))
+           (let [fns (:sci/method-fns (meta x))]
+             {:type :deftype-multi-method
+              :fns (mapv (fn [{:keys [fn arity]}]
+                           {:fn (replace-unserializable fn inverse-reg seen)
+                            :arity arity})
+                         fns)})
+
            ;; Host fn — look up in inverse registry
            (fn? x)
            (if-let [sym (.get ^java.util.IdentityHashMap inverse-reg x)]
@@ -279,6 +299,10 @@
             :protocol-dispatch-ref
             x
 
+            ;; Deftype method fns — deferred to second pass (need machine context)
+            :deftype-method x
+            :deftype-multi-method x
+
             ;; SCI Type — create or reuse from type registry
             :sci-type-ref
             (let [type-name (:name x)]
@@ -358,6 +382,31 @@
                   ns-sym (:ns proto)
                   proto-name (:name proto)]
               (step/make-protocol-dispatch-fn proto method-sym ns-sym proto-name))
+
+            :deftype-method
+            (let [ns-sym (symbol (:ns-sym x))
+                  fields (mapv symbol (:fields x))
+                  params (mapv symbol (:params x))
+                  body (:body x)
+                  mutable-fields (mapv symbol (:mutable-fields x))]
+              (step/make-deftype-method-fn machine ns-sym fields params body mutable-fields))
+
+            :deftype-multi-method
+            (let [fns (mapv (fn [entry]
+                              {:fn (:fn entry) :arity (:arity entry)})
+                            (:fns x))]
+              (if (= 1 (count fns))
+                (:fn (first fns))
+                (with-meta
+                  (fn [& args]
+                    (let [n (count args)
+                          match (first (filter #(= n (:arity %)) fns))]
+                      (if match
+                        (apply (:fn match) args)
+                        (throw (ex-info (str "No matching arity for deftype method, got " n " args")
+                                        {:type :sci/error})))))
+                  {:sci/deftype-multi-method true
+                   :sci/method-fns fns})))
 
             :multimethod-self-ref
             (let [mm-name (symbol (:name x))
@@ -461,9 +510,39 @@
                                           (reduce-kv
                                            (fn [macc mname mfn]
                                              (assoc macc mname
-                                                    (if (and (map? mfn) (= :closure (:type mfn)))
+                                                    (cond
+                                                      (and (map? mfn) (= :closure (:type mfn)))
                                                       (step/make-callable-closure mfn machine)
-                                                      mfn)))
+                                                      (and (map? mfn) (= :deftype-method (:type mfn)))
+                                                      (step/make-deftype-method-fn
+                                                       machine (symbol (:ns-sym mfn))
+                                                       (mapv symbol (:fields mfn))
+                                                       (mapv symbol (:params mfn))
+                                                       (:body mfn)
+                                                       (mapv symbol (:mutable-fields mfn)))
+                                                      (and (map? mfn) (= :deftype-multi-method (:type mfn)))
+                                                      (let [fns (mapv (fn [entry]
+                                                                        (let [f (:fn entry)]
+                                                                          {:fn (if (and (map? f) (= :deftype-method (:type f)))
+                                                                                 (step/make-deftype-method-fn
+                                                                                  machine (symbol (:ns-sym f))
+                                                                                  (mapv symbol (:fields f))
+                                                                                  (mapv symbol (:params f))
+                                                                                  (:body f)
+                                                                                  (mapv symbol (:mutable-fields f)))
+                                                                                 f)
+                                                                           :arity (:arity entry)}))
+                                                                      (:fns mfn))]
+                                                        (if (= 1 (count fns))
+                                                          (:fn (first fns))
+                                                          (fn [& args]
+                                                            (let [n (count args)
+                                                                  match (first (filter #(= n (:arity %)) fns))]
+                                                              (if match
+                                                                (apply (:fn match) args)
+                                                                (throw (ex-info (str "No matching arity, got " n " args")
+                                                                                {:type :sci/error})))))))
+                                                      :else mfn)))
                                            {} methods)))
                                  {} impls)]
                     (reset! impls-atom wrapped)))
