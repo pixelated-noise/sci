@@ -489,3 +489,83 @@
           thawed (freeze/thaw frozen)
           result (sci/resume thawed)]
       (is (= 55 result)))))
+
+;; ============================================================
+;; Known limitations — these document current freeze/thaw boundaries
+;; ============================================================
+
+;; ============================================================
+;; Known limitations — these tests document desired behavior
+;; that doesn't work yet. They are expected to FAIL.
+;; ============================================================
+
+(deftest ^:known-limitation freeze-thaw-multimethod
+  (testing "multimethod dispatch should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defmulti greet :lang)
+                  (defmethod greet :en [_] \"hello\")
+                  (suspend!)
+                  (greet {:lang :en}))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "hello" result)))))
+
+(deftest ^:known-limitation freeze-thaw-protocol
+  (testing "protocol dispatch should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (defprotocol Greetable
+                    (greet [this]))
+                  (defrecord Person [name])
+                  (extend-protocol Greetable
+                    Person
+                    (greet [this] (str \"Hello, \" (:name this))))
+                  (suspend!)
+                  (greet (->Person \"Alice\")))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "Hello, Alice" result)))))
+
+(deftest ^:known-limitation freeze-thaw-comp
+  (testing "comp should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [f (comp str inc)]
+                (suspend!)
+                (f 41))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= "42" result)))))
+
+(deftest ^:known-limitation freeze-thaw-partial
+  (testing "partial should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(let [add5 (partial + 5)]
+                (suspend!)
+                (add5 10))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= 15 result)))))
+
+(deftest ^:known-limitation freeze-thaw-metadata
+  (testing "metadata on collections should survive freeze/thaw"
+    (let [m (eval-suspend
+             "(do (def data (with-meta [1 2 3] {:source :test}))
+                  (suspend!)
+                  (meta data))")
+          frozen (freeze/freeze m)
+          thawed (freeze/thaw frozen)
+          result (sci/resume thawed)]
+      (is (= {:source :test} result)))))
+
+(deftest ^:known-limitation freeze-thaw-suspend-inside-loop-body
+  (testing "suspend inside a loop body should resume to the correct value"
+    (let [m (eval-suspend
+             "(loop [i 0 acc 0]
+                (if (= i 3)
+                  (do (suspend!) acc)
+                  (recur (inc i) (+ acc i))))")
+          result (sci/resume m)]
+      (is (= 3 result)))))
