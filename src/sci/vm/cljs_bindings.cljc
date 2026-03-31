@@ -354,16 +354,31 @@
         syms (mapv first pairs)
         needs-destr? (some #(or (map? %) (vector? %)) syms)]
     (if needs-destr?
-      ;; Destructuring in loop bindings: use temp syms and let
+      ;; Destructuring in loop bindings requires:
+      ;; 1. Sequential init evaluation (later inits may reference earlier destructured names)
+      ;; 2. Simple symbols for loop* (needed by recur)
+      ;; 3. Re-destructuring on each iteration
+      ;; Strategy: use let* to sequentially init and destructure, then loop* with temps
       (let [temps (mapv (fn [s] (if (symbol? s) s (gensym "loop__"))) syms)
             init-vals (mapv second pairs)
-            let-binds (reduce (fn [acc [orig temp]]
+            ;; Build sequential let bindings: temp = init, then destructure
+            init-let-binds (reduce
+                            (fn [acc [orig temp init]]
+                              (let [acc (conj acc temp init)]
                                 (if (symbol? orig)
                                   acc
-                                  (into acc (destructure-binding orig temp))))
-                              [] (map vector syms temps))]
-        `(loop* ~(vec (interleave temps init-vals))
-                (let* ~let-binds ~@body)))
+                                  (into acc (destructure-binding orig temp)))))
+                            [] (map vector syms temps init-vals))
+            ;; Build loop body let bindings: re-destructure temps each iteration
+            loop-let-binds (reduce
+                            (fn [acc [orig temp]]
+                              (if (symbol? orig)
+                                acc
+                                (into acc (destructure-binding orig temp))))
+                            [] (map vector syms temps))]
+        `(let* ~init-let-binds
+           (loop* ~(vec (interleave temps temps))
+                  (let* ~loop-let-binds ~@body))))
       `(loop* ~bindings ~@body))))
 
 (defn- letfn-impl [_ _ fnspecs & body]
