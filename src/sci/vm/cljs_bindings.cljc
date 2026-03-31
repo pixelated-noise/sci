@@ -503,6 +503,51 @@
                 specs)]
     (list* 'reify* interfaces methods)))
 
+(defn- import-impl [_ _ & import-specs]
+  ;; (import foo.Bar) => (import* "foo.Bar")
+  ;; (import (foo Bar Baz)) => (do (import* "foo.Bar") (import* "foo.Baz"))
+  (let [forms (mapcat (fn [spec]
+                         (if (symbol? spec)
+                           [(list 'import* (str spec))]
+                           ;; List form: (package Class1 Class2)
+                           (let [package (first spec)]
+                             (map (fn [cls]
+                                    (list 'import* (str package "." cls)))
+                                  (rest spec)))))
+                       import-specs)]
+    (if (= 1 (count forms))
+      (first forms)
+      (cons 'do forms))))
+
+(defn- with-redefs-impl [_ _ bindings & body]
+  ;; (with-redefs [var val ...] body) — temporarily redefine vars
+  (let [pairs (partition 2 bindings)
+        old-syms (mapv (fn [_] (gensym "old__")) pairs)
+        save-forms (mapv (fn [old-sym [var-sym _]]
+                           [old-sym (list 'deref (list 'var var-sym))])
+                         old-syms pairs)
+        set-forms (mapv (fn [[var-sym val-expr]]
+                          (list 'set! var-sym val-expr))
+                        pairs)
+        restore-forms (mapv (fn [old-sym [var-sym _]]
+                              (list 'set! var-sym old-sym))
+                            old-syms pairs)]
+    `(let [~@(apply concat save-forms)]
+       ~@set-forms
+       (try
+         (do ~@body)
+         (finally
+           ~@restore-forms)))))
+
+(defn- with-local-vars-impl [_ _ bindings & body]
+  ;; (with-local-vars [x 1 y 2] body) — create locally-scoped vars
+  (let [pairs (partition 2 bindings)
+        let-bindings (mapcat (fn [[sym val]]
+                               [sym (list 'atom val)])
+                             pairs)]
+    `(let [~@let-bindings]
+       ~@body)))
+
 (defn- exists?-impl [_ _ sym]
   ;; exists? checks if a symbol is defined (not nil/undefined)
   ;; In SCI context, try to resolve it and check
@@ -716,7 +761,10 @@
                    'lazy-seq   lazy-seq-impl
                    'delay      delay-impl
                    'reify      reify-impl
-                   'exists?    exists?-impl}]
+                   'exists?    exists?-impl
+                   'import     import-impl
+                   'with-redefs with-redefs-impl
+                   'with-local-vars with-local-vars-impl}]
        (reduce-kv
         (fn [acc sym v]
           (assoc acc (symbol "clojure.core" (str sym))

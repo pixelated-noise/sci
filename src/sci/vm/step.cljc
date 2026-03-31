@@ -2265,7 +2265,29 @@
            (throw (ex-info (str "Unable to resolve classname: " class-str)
                            {:type :sci/error}))))
        :cljs
-       (throw (ex-info "import not supported in ClojureScript" {})))))
+       (let [class-name (str class-str)
+             ;; Try SCI type resolution (e.g. foo.Bar -> ns foo, type Bar)
+             idx (.lastIndexOf class-name ".")
+             sci-type (when (> idx 0)
+                        (let [ns-str (subs class-name 0 idx)
+                              type-str (subs class-name (inc idx))
+                              ns-str-unm (clojure.string/replace ns-str "_" "-")
+                              ns-table (or (when-let [a (:ns-atom machine)] @a) (:ns machine))]
+                          (or (get-in ns-table [(symbol ns-str) :types (symbol type-str)])
+                              (get-in ns-table [(symbol ns-str-unm) :types (symbol type-str)]))))]
+         (if sci-type
+           (let [short-name (symbol (subs class-name (inc idx)))
+                 cur-ns (:current-ns machine)]
+             (when-let [a (:ns-atom machine)]
+               (swap! a update-in [cur-ns :types] assoc short-name sci-type)
+               (swap! a update-in [cur-ns :imports] assoc short-name sci-type))
+             (-> machine
+                 (update :env assoc short-name sci-type)
+                 (update-in [:ns cur-ns :types] assoc short-name sci-type)
+                 (update-in [:ns cur-ns :imports] assoc short-name sci-type)
+                 (m/push-value sci-type)))
+           (throw (ex-info (str "Unable to resolve classname: " class-str)
+                           {:type :sci/error})))))))
 
 ;; ============================================================
 ;; Multimethods
