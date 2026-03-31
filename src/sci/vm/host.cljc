@@ -70,7 +70,16 @@
                           (first (first args))
                           (clojure.lang.Reflector/invokeStaticMethod
                            clojure.lang.PersistentHashMap "create" (to-array args))))
-                 :meta {:name 'create}})
+                 :meta {:name 'create}}
+                ;; Clojure 1.11 destructuring uses PersistentArrayMap/EMPTY and createAsIfByAssoc
+                'clojure.lang.PersistentArrayMap/EMPTY
+                {:val clojure.lang.PersistentArrayMap/EMPTY
+                 :meta {:name 'EMPTY}}
+                'clojure.lang.PersistentArrayMap/createAsIfByAssoc
+                {:val (fn [& args]
+                        (clojure.lang.Reflector/invokeStaticMethod
+                         clojure.lang.PersistentArrayMap "createAsIfByAssoc" (to-array args)))
+                 :meta {:name 'createAsIfByAssoc}})
          :cljs identity)
       ;; Override with-bindings* to handle sci.lang.Var objects.
       ;; The host clojure.core/with-bindings* expects clojure.lang.Var keys, but SCI
