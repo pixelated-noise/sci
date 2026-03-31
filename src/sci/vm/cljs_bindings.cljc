@@ -328,13 +328,25 @@
                              ;; Check if params need destructuring
                              needs-destr? (some #(or (map? %) (vector? %)) params)]
                          (if needs-destr?
-                           (let [;; Replace complex params with gensyms
+                           (let [;; Detect [... & map-pattern] for kwargs
+                                 amp-idx (vec-index-of (vec params) '&)
+                                 has-kwargs? (and (>= amp-idx 0)
+                                                  (map? (nth params (inc amp-idx) nil)))
+                                 ;; Replace complex params with gensyms
                                  new-params (mapv (fn [p] (if (symbol? p) p (gensym "p__"))) params)
                                  ;; Build let bindings for destructured params
                                  let-binds (reduce (fn [acc [orig new-p]]
                                                      (if (symbol? orig)
                                                        acc
-                                                       (into acc (destructure-binding orig new-p))))
+                                                       ;; For kwargs map pattern: convert seq to map first
+                                                       (if (and has-kwargs? (map? orig))
+                                                         (let [map-gs (gensym "kwargs__")]
+                                                           (into (conj acc
+                                                                       map-gs (list 'if (list 'map? new-p)
+                                                                                    new-p
+                                                                                    (list 'clojure.core/apply 'clojure.core/hash-map new-p)))
+                                                                 (destructure-binding orig map-gs)))
+                                                         (into acc (destructure-binding orig new-p)))))
                                                    [] (map vector params new-params))]
                              (if (seq let-binds)
                                `(~new-params (let* ~let-binds ~@body))

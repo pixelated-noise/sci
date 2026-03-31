@@ -80,7 +80,9 @@
 (deftype Unbound [sym]
   #?@(:clj [Object
              (toString [_] (str "Unbound: #'" sym))]
-      :cljs [IPrintWithWriter
+      :cljs [Object
+             (toString [_] (str "Unbound: #'" sym))
+             IPrintWithWriter
              (-pr-writer [_ writer _] (-write writer (str "Unbound: #'" sym)))]))
 
 #?(:clj
