@@ -485,7 +485,11 @@
                                   :ns (symbol (namespace found-key))
                                   :sci.impl/var-sym found-key)
                            (:dynamic? entry)))
-         type-obj type-obj)))))
+         type-obj type-obj
+         ;; Check imports (e.g. java.lang.Object imported as Object)
+         :else
+         (when-not (qualified-symbol? sym)
+           (get (:imports ns-data) sym)))))))
 
 (defn- make-eval-fn [ctx heap-atom]
   (fn sci-eval [form]
@@ -1129,8 +1133,16 @@
                     {:val (make-ns-unalias-fn ctx) :meta {:name 'ns-unalias :doc #?(:clj (:doc (meta #'clojure.core/ns-unalias)) :cljs nil)}}
                     (symbol "clojure.core" "ns-unmap")
                     {:val (fn [ns-sym sym]
-                            (let [qualified (symbol (str ns-sym) (str sym))]
+                            (let [ns-sym (if (instance? sci.lang.Namespace ns-sym) (:name ns-sym) ns-sym)
+                                  qualified (symbol (str ns-sym) (str sym))]
                               (swap! heap-atom dissoc qualified)
+                              ;; Also remove from imports, types, refers in ns-atom
+                              (when-let [ns-atom (:ns-atom ctx)]
+                                (swap! ns-atom (fn [ns-table]
+                                                 (-> ns-table
+                                                     (update-in [ns-sym :imports] dissoc sym)
+                                                     (update-in [ns-sym :types] dissoc sym)
+                                                     (update-in [ns-sym :refers] dissoc sym)))))
                               nil))
                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs nil)}}
                     (symbol "clojure.core" "ns-imports")
@@ -1583,12 +1595,29 @@
                     {:val (fn [& args]
                             (clojure.string/join " "
                               (map (fn [x]
-                                     (let [m (clojure.core/meta x)]
+                                     (let [m (clojure.core/meta x)
+                                           type-obj (when m (:type m))
+                                           ;; Check if there's a custom print-method for this SCI type
+                                           ;; Host print-method only dispatches on keyword :type, not SCI Type objects
+                                           #?@(:clj
+                                               [custom-pm-fn
+                                                (when (instance? sci.lang.Type type-obj)
+                                                  (let [pm-entry (get @heap-atom (symbol "clojure.core" "print-method"))
+                                                        pm (:val pm-entry)]
+                                                    (when (instance? clojure.lang.MultiFn pm)
+                                                      (let [method-table (.getMethodTable ^clojure.lang.MultiFn pm)]
+                                                        (get method-table type-obj)))))])]
                                        (cond
+                                         ;; Custom print-method registered for this SCI type
+                                         #?(:clj custom-pm-fn :cljs false)
+                                         #?(:clj
+                                            (let [sw (java.io.StringWriter.)]
+                                              (custom-pm-fn x sw)
+                                              (str sw))
+                                            :cljs nil)
                                          ;; SCI record — print as #ns.Name{...}
                                          (:sci.impl/record m)
-                                         (let [type-obj (:type m)
-                                               type-name (when (instance? sci.lang.Type type-obj)
+                                         (let [type-name (when (instance? sci.lang.Type type-obj)
                                                            (.-name ^sci.lang.Type type-obj))]
                                            (str "#" type-name (into (sorted-map) (map (fn [[k v]] [k v]) x))))
                                          ;; SCI Var — print as #'ns/name
