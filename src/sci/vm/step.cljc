@@ -1211,7 +1211,7 @@
                                                   (symbol method-str)))]
                      (m/push-value machine (if mutable? @v v)))
                    ;; JS property access
-                   (m/push-value machine (gobject/get f method-str)))
+                   (m/push-value machine (unchecked-get f method-str)))
                  ;; Method call with no args: (.method obj)
                  (if (:type (meta f))
                    ;; SCI type method override
@@ -1223,7 +1223,7 @@
                        (m/push-value machine (sci-method f))
                        (m/push-value machine (gobject/get f method-str))))
                    ;; JS method with no args
-                   (let [method (gobject/get f method-str)]
+                   (let [method (unchecked-get f method-str)]
                      (if (fn? method)
                        (m/push-value machine (.call method f))
                        (m/push-value machine method)))))))
@@ -1327,7 +1327,7 @@
                                        (symbol method-str)))]
                  (if sci-method
                    (m/push-value machine (apply sci-method obj args))
-                   (let [method (gobject/get obj method-str)]
+                   (let [method (unchecked-get obj method-str)]
                      (if (fn? method)
                        (m/push-value machine (.apply method obj (to-array args)))
                        (throw (ex-info (str "No matching method " method-str
