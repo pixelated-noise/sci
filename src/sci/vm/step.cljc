@@ -211,17 +211,39 @@
                       type-obj
                 ;; Try as Java static field/method
                       #?(:clj
-                         (if-let [klass (or (try-resolve-class sym-ns)
-                                            ;; Check :classes config for the class
-                                            (let [classes (:classes machine)
-                                                  class-entry (when (map? classes) (get classes (symbol sym-ns)))]
-                                              (cond
-                                                (class? class-entry) class-entry
-                                                (and (map? class-entry) (:class class-entry)) (:class class-entry)
-                                                :else nil)))]
-                           (resolve-static-member klass sym-name)
-                           (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                           {:type :sci/error :sym sym :phase "analysis"})))
+                         (let [classes (:classes machine)
+                               ;; Find matching :classes config entry by symbol or class name
+                               class-config (when (map? classes)
+                                              (let [entry (get classes (symbol sym-ns))]
+                                                (cond
+                                                  (map? entry) entry
+                                                  :else (some (fn [[k v]]
+                                                                (when (and (map? v)
+                                                                           (let [cls (:class v)]
+                                                                             (and (class? cls)
+                                                                                  (or (= sym-ns (.getName ^Class cls))
+                                                                                      (= sym-ns (.getSimpleName ^Class cls))))))
+                                                                  v))
+                                                              classes))))
+                               custom-static (when (map? class-config)
+                                               (or (get-in class-config [:static-methods (symbol sym-name)])
+                                                   (get-in class-config [:static-fields (symbol sym-name)])))]
+                           (if custom-static
+                             (if (fn? custom-static)
+                               (let [klass (or (:class class-config)
+                                               (try-resolve-class sym-ns))]
+                                 ;; Match Clojure semantics: zero-arg static methods invoke immediately
+                                 (try
+                                   (custom-static klass)
+                                   (catch #?(:clj clojure.lang.ArityException :cljs :default) _
+                                     (fn [& args] (apply custom-static klass args)))))
+                               custom-static)
+                             (if-let [klass (or (try-resolve-class sym-ns)
+                                                (when (map? class-config) (:class class-config))
+                                                (when (class? (get classes (symbol sym-ns))) (get classes (symbol sym-ns))))]
+                               (resolve-static-member klass sym-name)
+                               (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                               {:type :sci/error :sym sym :phase "analysis"})))))
                          :cljs
                          (throw (ex-info (str "Unable to resolve symbol: " sym)
                                          {:type :sci/error :sym sym :phase "analysis"})))))))
