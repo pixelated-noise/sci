@@ -203,9 +203,19 @@
            (instance? clojure.lang.Namespace x)
            {:type :ns-ref :name (str (.getName ^clojure.lang.Namespace x))}
 
-           ;; SCI Type (deftype/defrecord) — serialize by name for heap lookup
+           ;; SCI Type (deftype/defrecord) — serialize with full info
            (instance? sci.lang.Type x)
-           {:type :sci-type-ref :name (str x)}
+           (let [methods (.-methods ^sci.lang.Type x)
+                 opts (.-opts ^sci.lang.Type x)]
+             (merge {:type :sci-type-ref
+                     :name (str x)
+                     :fields (mapv str (.-fields ^sci.lang.Type x))}
+                    (when (seq methods)
+                      {:methods (reduce-kv (fn [acc k v]
+                                             (assoc acc (str k) (replace-unserializable v inverse-reg seen)))
+                                           {} methods)})
+                    (when (seq opts)
+                      {:opts (select-keys opts [:record? :mutable-fields])})))
 
            ;; Sorted set — preserve ordering by serializing as sorted vector
            (instance? clojure.lang.PersistentTreeSet x)
@@ -381,12 +391,18 @@
             :deftype-method x
             :deftype-multi-method x
 
-            ;; SCI Type — create or reuse from type registry
+            ;; SCI Type — create with fields/opts, store raw methods for later wrapping
             :sci-type-ref
-            (let [type-name (:name x)]
+            (let [type-name (:name x)
+                  fields (mapv symbol (or (:fields x) []))
+                  opts (or (:opts x) {})
+                  ;; Store raw method maps (still tagged, will be wrapped later)
+                  methods (reduce-kv (fn [acc k v]
+                                       (assoc acc (symbol k) v))
+                                     {} (or (:methods x) {}))]
               (if-let [existing (get @type-registry type-name)]
                 existing
-                (let [t (sci.lang/->Type (symbol type-name) [] {} {} {})]
+                (let [t (sci.lang/->Type (symbol type-name) fields {} methods opts)]
                   (swap! type-registry assoc type-name t)
                   t)))
 
@@ -660,6 +676,105 @@
               x))))
       data)))
 
+#?(:clj
+   (defn- fixup-type-methods
+     "Wrap raw deftype method maps in type-registry into callable fns.
+      Returns a java.util.IdentityHashMap of old-Type → new-Type for replacement."
+     [type-registry machine]
+     (let [replacements (java.util.IdentityHashMap.)]
+       (doseq [[type-name old-type] @type-registry]
+         (let [methods (.-methods ^sci.lang.Type old-type)]
+           (when (some (fn [[_ v]] (and (map? v) (#{:deftype-method :deftype-multi-method} (:type v))))
+                       methods)
+             (let [wrapped-methods
+                   (reduce-kv
+                    (fn [acc k v]
+                      (assoc acc k
+                             (cond
+                               (and (map? v) (= :deftype-method (:type v)))
+                               (step/make-deftype-method-fn
+                                machine (symbol (:ns-sym v))
+                                (mapv symbol (:fields v))
+                                (mapv symbol (:params v))
+                                (:body v)
+                                (mapv symbol (:mutable-fields v)))
+
+                               (and (map? v) (= :deftype-multi-method (:type v)))
+                               (let [fns (mapv (fn [entry]
+                                                 (let [f (:fn entry)]
+                                                   {:fn (if (and (map? f) (= :deftype-method (:type f)))
+                                                          (step/make-deftype-method-fn
+                                                           machine (symbol (:ns-sym f))
+                                                           (mapv symbol (:fields f))
+                                                           (mapv symbol (:params f))
+                                                           (:body f)
+                                                           (mapv symbol (:mutable-fields f)))
+                                                          f)
+                                                    :arity (:arity entry)}))
+                                               (:fns v))]
+                                 (if (= 1 (count fns))
+                                   (:fn (first fns))
+                                   (fn [& args]
+                                     (let [n (count args)
+                                           match (first (filter #(= n (:arity %)) fns))]
+                                       (if match
+                                         (apply (:fn match) args)
+                                         (throw (ex-info (str "No matching arity, got " n " args")
+                                                         {:type :sci/error})))))))
+
+                               :else v)))
+                    {} methods)
+                   new-type (sci.lang/->Type
+                             (.-name ^sci.lang.Type old-type)
+                             (.-fields ^sci.lang.Type old-type)
+                             (.-protocols ^sci.lang.Type old-type)
+                             wrapped-methods
+                             (.-opts ^sci.lang.Type old-type))]
+               (.put replacements old-type new-type)
+               (swap! type-registry assoc type-name new-type)))))
+       replacements)))
+
+#?(:clj
+   (defn- replace-types
+     "Walk data replacing old Type objects with new ones (both as values, in metadata,
+      and in protocol impls atom keys)."
+     [data ^java.util.IdentityHashMap replacements]
+     (if (.isEmpty replacements)
+       data
+       (walk/postwalk
+        (fn [x]
+          (cond
+            ;; Direct Type reference (e.g. in :types map)
+            (and (instance? sci.lang.Type x) (.containsKey replacements x))
+            (.get replacements x)
+
+            ;; Type reference in metadata (e.g. deftype instances)
+            (and (instance? clojure.lang.IObj x)
+                 (some? (clojure.core/meta x)))
+            (let [m (clojure.core/meta x)
+                  t (:type m)]
+              (if (and (instance? sci.lang.Type t) (.containsKey replacements t))
+                (with-meta x (assoc m :type (.get replacements t)))
+                x))
+
+            ;; Protocol impls atom — update Type keys
+            (and (map? x) (= :sci/protocol (:type x)))
+            (when-let [impls-atom (:impls x)]
+              (when (instance? clojure.lang.Atom impls-atom)
+                (let [impls @impls-atom
+                      needs-update? (some #(.containsKey replacements %) (keys impls))]
+                  (when needs-update?
+                    (reset! impls-atom
+                            (reduce-kv (fn [acc k v]
+                                         (let [new-k (if (.containsKey replacements k)
+                                                       (.get replacements k) k)]
+                                           (assoc acc new-k v)))
+                                       {} impls)))))
+              x)
+
+            :else x))
+        data))))
+
 (defn thaw
   "Deserialize an EDN string back into a live (suspended) machine."
   [edn-str]
@@ -671,10 +786,13 @@
            ;; Rebuild the full heap: host defaults + user heap
            host-heap (host/default-heap)
            raw-user-heap (:user-heap state)
-           ;; First pass: restore host-fn-refs, var-refs, class-refs, atoms in user heap
+           ;; ---- First pass on both user-heap and state ----
            restored-user-heap (restore-serialized raw-user-heap host-heap type-registry atom-registry)
            full-heap (merge host-heap restored-user-heap)
            heap-atom (atom full-heap)
+           restored-state (-> state
+                              (dissoc :user-heap :version)
+                              (restore-serialized full-heap type-registry atom-registry))
            ;; Build a minimal machine for closure wrapping
            minimal-machine {:heap full-heap
                             :heap-atom heap-atom
@@ -682,17 +800,18 @@
                             :current-ns (or (:current-ns state) 'user)
                             :permissions (:permissions state)
                             :type-registry type-registry}
-           ;; Second pass on user-heap: wrap closures and protocol dispatch refs
+           ;; Fix up type methods (registry now populated from both passes)
+           type-replacements (fixup-type-methods type-registry minimal-machine)
+           ;; ---- Second pass on both ----
            wrapped-user-heap (wrap-closures restored-user-heap minimal-machine)
            full-heap (merge host-heap wrapped-user-heap)
            _ (reset! heap-atom full-heap)
            minimal-machine (assoc minimal-machine :heap full-heap)
-           ;; Restore the rest of the machine state (stack, env, bindings, etc.)
-           restored-state (-> state
-                              (dissoc :user-heap :version)
-                              (restore-serialized full-heap type-registry atom-registry))
-           ;; Second pass on state: wrap closures and protocol dispatch refs
-           restored-state (wrap-closures restored-state minimal-machine)]
+           restored-state (wrap-closures restored-state minimal-machine)
+           ;; Replace old Type refs with method-populated Types in metadata and values
+           restored-state (replace-types restored-state type-replacements)
+           full-heap (replace-types full-heap type-replacements)
+           _ (reset! heap-atom full-heap)]
        (-> restored-state
            (assoc :heap full-heap
                   :heap-atom heap-atom)))

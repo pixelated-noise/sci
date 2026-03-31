@@ -287,7 +287,7 @@
                                ([x y] (and (every? #(% x) all) (every? #(% y) all)))
                                ([x y z] (and (every? #(% x) all) (every? #(% y) all) (every? #(% z) all)))
                                ([x y z & args] (boolean (and (epn x y z)
-                                                              (every? (fn [a] (every? #(% a) all)) args)))))
+                                                             (every? (fn [a] (every? #(% a) all)) args)))))
                              {:sci/every-pred-fns (vec all)}))))
                  :meta {:name 'every-pred :doc (:doc (meta #'clojure.core/every-pred))}})
          :cljs identity)
@@ -331,7 +331,7 @@
                                ([x y] (or (some #(% x) all) (some #(% y) all)))
                                ([x y z] (or (some #(% x) all) (some #(% y) all) (some #(% z) all)))
                                ([x y z & args] (or (spn x y z)
-                                                    (some (fn [a] (some #(% a) all)) args))))
+                                                   (some (fn [a] (some #(% a) all)) args))))
                              {:sci/some-fn-fns (vec all)}))))
                  :meta {:name 'some-fn :doc (:doc (meta #'clojure.core/some-fn))}})
          :cljs identity)
@@ -377,6 +377,47 @@
                              ([a b c & ds] (apply f (if (nil? a) x a) (if (nil? b) y b) (if (nil? c) z c) ds)))
                            {:sci/fnil-f f :sci/fnil-defaults [x y z]})))
                  :meta {:name 'fnil :doc (:doc (meta #'clojure.core/fnil))}})
+         :cljs identity)
+      ;; Override str to dispatch toString for SCI deftype instances.
+      ;; The host str calls .toString on the JVM map, ignoring SCI's method overrides.
+      #?(:clj
+         (assoc 'clojure.core/str
+                {:val (let [sci-pr-str (fn sci-pr-str [x]
+                                         (cond
+                                           (nil? x) "nil"
+                                           (:sci.impl/record (clojure.core/meta x))
+                                           (let [type-obj (:type (clojure.core/meta x))]
+                                             (clojure.core/str "#" (.-name ^sci.lang.Type type-obj)
+                                                               (clojure.core/pr-str (into (sorted-map) x))))
+                                           (instance? sci.lang.Var x)
+                                           (clojure.core/str "#'" (or (:sci.impl/var-sym (.-meta-map ^sci.lang.Var x)) (.-sym ^sci.lang.Var x)))
+                                           (vector? x) (clojure.core/str "[" (clojure.string/join " " (map sci-pr-str x)) "]")
+                                           (set? x) (clojure.core/str "#{" (clojure.string/join ", " (map sci-pr-str x)) "}")
+                                           (map? x) (clojure.core/str "{" (clojure.string/join ", " (map (fn [[k v]] (clojure.core/str (sci-pr-str k) " " (sci-pr-str v))) x)) "}")
+                                           (seq? x) (clojure.core/str "(" (clojure.string/join " " (map sci-pr-str x)) ")")
+                                           :else (clojure.core/pr-str x)))]
+                        (fn [& args]
+                          (if (empty? args)
+                            ""
+                            (clojure.string/join
+                             (map (fn [x]
+                                    (if (nil? x) ""
+                                        (if-let [sci-type (when-let [m (clojure.core/meta x)]
+                                                            (when (instance? sci.lang.Type (:type m))
+                                                              (:type m)))]
+                                          (let [methods (.-methods ^sci.lang.Type sci-type)]
+                                            (if-let [toString-fn (get methods 'toString)]
+                                              (toString-fn x)
+                                              (if (:sci.impl/record (clojure.core/meta x))
+                                                (clojure.core/str "#" (.-name ^sci.lang.Type sci-type)
+                                                                  (clojure.core/pr-str (into (sorted-map) x)))
+                                                (clojure.core/str "#object[" (.-name ^sci.lang.Type sci-type) "]"))))
+                                         ;; For collections, check if they might contain SCI records
+                                          (if (coll? x)
+                                            (sci-pr-str x)
+                                            (clojure.core/str x)))))
+                                  args)))))
+                 :meta {:name 'str :doc (:doc (meta #'clojure.core/str))}})
          :cljs identity)
       ;; Override delay so the inner fn is an SCI closure (serializable for freeze/thaw).
       ;; The host delay macro expands to (new Delay (fn* [] body)) — fn* produces a JVM

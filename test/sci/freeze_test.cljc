@@ -777,11 +777,7 @@
           result (sci/resume thawed)]
       (is (= 42 result)))))
 
-;; ============================================================
-;; Known limitations — deftype Object method dispatch
-;; ============================================================
-
-(deftest ^:known-limitation freeze-thaw-deftype-object-methods
+(deftest freeze-thaw-deftype-object-methods
   (testing "deftype Object methods (toString) should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (deftype Counter [n]
