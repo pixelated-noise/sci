@@ -570,7 +570,7 @@
 ;; doesn't work yet. They are expected to FAIL.
 ;; ============================================================
 
-(deftest ^:known-limitation freeze-thaw-multimethod-destructuring
+(deftest freeze-thaw-multimethod-destructuring
   (testing "multimethod methods with destructuring params should survive freeze/thaw"
     (let [m (eval-suspend
              "(do (defmulti area :shape)

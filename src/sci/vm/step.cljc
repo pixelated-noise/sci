@@ -2337,9 +2337,10 @@
         ;; Build the fn form
         fn-form (if (vector? (first fn-parts))
                   ;; Single arity: (defmethod foo :bar [x] body)
-                  (list* 'fn* fn-parts)
+                  ;; Use 'fn (not 'fn*) so destructuring params get macro-expanded into let bindings
+                  (list* 'fn fn-parts)
                   ;; Multi-arity: (defmethod foo :bar ([x] body1) ([x y] body2))
-                  (list* 'fn* fn-parts))]
+                  (list* 'fn fn-parts))]
     ;; Evaluate the multimethod reference, dispatch-val, and the method fn
     (-> machine
         (m/replace-frame {:op :eval-args
