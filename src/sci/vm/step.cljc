@@ -1595,10 +1595,11 @@
                           :ns (symbol (namespace qualified))
                           :sci.impl/var-sym qualified
                           :file (or (:file (:meta entry)) (:current-file machine))})
-            var-obj (sci.lang/->Var (symbol (name qualified))
-                                    (:val entry)
-                                    (merge (:meta entry) extra-meta)
-                                    (:dynamic? entry))]
+            var-obj (or (:var-obj entry)
+                       (sci.lang/->Var (symbol (name qualified))
+                                       (:val entry)
+                                       (merge (:meta entry) extra-meta)
+                                       (:dynamic? entry)))]
         (m/push-value machine var-obj)))))
 
 ;; ============================================================
@@ -1951,6 +1952,10 @@
   ;; (defprotocol Name :extend-via-metadata true (method1 [this]) (method2 [this x]))
   (let [[_ proto-name & method-defs] (:expr frame)
         ns-sym (:current-ns machine)
+        ;; Extract optional docstring
+        [proto-doc method-defs] (if (string? (first method-defs))
+                                  [(first method-defs) (rest method-defs)]
+                                  [nil method-defs])
         ;; Parse options like :extend-via-metadata true
         [opts method-defs] (loop [opts {} remaining method-defs]
                              (if (keyword? (first remaining))
@@ -1981,6 +1986,11 @@
         protocol (assoc (make-protocol proto-name method-sigs ns-sym opts)
                         :sigs sigs-map)
         qualified (symbol (str ns-sym) (str proto-name))
+        ;; Create a SCI Var for the protocol so #'ProtoName works
+        proto-var (sci.lang/->Var qualified protocol
+                                   {:name proto-name :ns (symbol (str ns-sym))
+                                    :doc proto-doc :sci.impl/var-sym qualified}
+                                   false)
         ;; Create dispatch functions for each protocol method
         machine (reduce
                  (fn [m [mname {:keys [arglists]}]]
@@ -1988,19 +1998,21 @@
                          mname-qualified (symbol (str ns-sym) (str mname))
                          method-fn (fn protocol-dispatch [& args]
                                      (let [target (first args)
-                                           ;; extend-via-metadata: check target's metadata first
-                                           meta-fn (when extend-via-meta?
+                                           ;; For SCI type instances (maps with :type meta), use SCI type
+                                           sci-type (when (map? target) (:type (clojure.core/meta target)))
+                                           target-type (or sci-type (type target))
+                                           impls @(:impls protocol)
+                                           ;; Check for direct type implementation first (defrecord takes priority)
+                                           direct-impl (get impls target-type)
+                                           ;; extend-via-metadata: check target's metadata only if no direct impl
+                                           meta-fn (when (and extend-via-meta? (not direct-impl))
                                                      (when-let [m (clojure.core/meta target)]
                                                        (or (get m mname-qualified)
                                                            (get m (symbol (name mname))))))]
                                        (if meta-fn
                                          (apply meta-fn args)
-                                     (let [;; For SCI type instances (maps with :type meta), use SCI type
-                                           sci-type (when (map? target) (:type (clojure.core/meta target)))
-                                           target-type (or sci-type (type target))
-                                           impls @(:impls protocol)
-                                           ;; Look up implementation: exact type, then IRecord, then interfaces, then Object
-                                           impl (or (get impls target-type)
+                                     (let [;; Look up implementation: exact type, then IRecord, then interfaces, then Object
+                                           impl (or direct-impl
                                                     ;; SCI records: check IRecord/IPersistentMap before Object
                                                     (when (:sci.impl/record (clojure.core/meta target))
                                                       (or (get impls clojure.lang.IRecord)
@@ -2021,8 +2033,8 @@
                                                            (get impl (keyword mname))
                                                            (get impl (symbol mname)))]
                                          (apply f args)
-                                         (throw (ex-info (str "No implementation of method: " mname
-                                                              " of protocol: " proto-name
+                                         (throw (ex-info (str "No implementation of method: :" mname
+                                                              " of protocol: #'" ns-sym "/" proto-name
                                                               " found for: " (type target))
                                                          {:type :sci/error})))))))
                          mq (symbol (str ns-sym) (str mname))
@@ -2030,15 +2042,17 @@
                          ;; Find docstring for this method (immediately after the method-name in the definition)
                          method-doc (some (fn [md]
                                             (when (and (seq? md) (= mname (first md)))
-                                              (let [second-el (second md)]
-                                                (when (string? second-el) second-el))))
+                                              (let [parts (rest md)]
+                                                (or (when (string? (last parts)) (last parts))
+                                                    (when (string? (first parts)) (first parts))))))
                                           method-defs)
                          entry {:val method-fn
-                                :meta {:protocol protocol
-                                       :name mname
-                                       :ns (symbol (str ns-sym))
-                                       :arglists (vec method-arglists)
-                                       :doc method-doc}
+                                :meta (merge {:protocol proto-var
+                                              :name mname
+                                              :ns (symbol (str ns-sym))
+                                              :doc method-doc}
+                                             (when (seq method-arglists)
+                                               {:arglists (apply list method-arglists)}))
                                 :dynamic? false}]
                      (when-let [a (:heap-atom m)]
                        (swap! a assoc mq entry))
@@ -2047,8 +2061,11 @@
                          (update :env assoc mname method-fn))))
                  machine
                  method-sigs)
-        ;; Store the protocol itself
-        proto-entry {:val protocol :meta {} :dynamic? false}]
+        ;; Store the protocol itself (include :var-obj so #'ProtoName returns identical? obj)
+        proto-entry {:val protocol
+                     :meta {:name proto-name :ns (symbol (str ns-sym)) :doc proto-doc}
+                     :var-obj proto-var
+                     :dynamic? false}]
     (when-let [a (:heap-atom machine)]
       (swap! a assoc qualified proto-entry))
     (-> machine

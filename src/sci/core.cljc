@@ -1436,10 +1436,17 @@
                     (symbol "clojure.core" "meta")
                     {:val (fn [obj]
                             (let [m (clojure.core/meta obj)]
-                              (if (and m (or (contains? m :type) (contains? m :sci.impl/record)))
+                              (cond
+                                ;; SCI closure — strip implementation keys, keep user metadata
+                                (:sci/closure m)
+                                (let [cleaned (dissoc m :sci/closure :type :sci.impl/record
+                                                      :ns :env :arities :file :name :line :column)]
+                                  (when (seq cleaned) cleaned))
+                                ;; SCI type/record — strip type identity keys
+                                (and m (or (contains? m :type) (contains? m :sci.impl/record)))
                                 (let [cleaned (dissoc m :type :sci.impl/record)]
                                   (when (seq cleaned) cleaned))
-                                m)))
+                                :else m)))
                      :meta {:name 'meta :doc #?(:clj (:doc (meta #'clojure.core/meta)) :cljs nil)}}
                     ;; class? — true for SCI types too
                     (symbol "clojure.core" "class?")
