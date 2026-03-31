@@ -15,6 +15,7 @@
   #?(:cljs (:require-macros [sci.core])))
 
 (declare read-eval)
+(declare out print-fn)
 
 (defn- type-methods
   "Get the methods map from a sci.lang.Type instance.
