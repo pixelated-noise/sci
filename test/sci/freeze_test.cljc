@@ -491,12 +491,7 @@
       (is (= 55 result)))))
 
 ;; ============================================================
-;; Known limitations — these document current freeze/thaw boundaries
-;; ============================================================
-
-;; ============================================================
-;; Known limitations — these tests document desired behavior
-;; that doesn't work yet. They are expected to FAIL.
+;; Multimethod, protocol, comp, partial, and loop freeze/thaw
 ;; ============================================================
 
 (deftest freeze-thaw-multimethod
@@ -527,7 +522,7 @@
           result (sci/resume thawed)]
       (is (= "Hello, Alice" result)))))
 
-(deftest ^:known-limitation freeze-thaw-comp
+(deftest freeze-thaw-comp
   (testing "comp should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [f (comp str inc)]
@@ -538,7 +533,7 @@
           result (sci/resume thawed)]
       (is (= "42" result)))))
 
-(deftest ^:known-limitation freeze-thaw-partial
+(deftest freeze-thaw-partial
   (testing "partial should survive freeze/thaw"
     (let [m (eval-suspend
              "(let [add5 (partial + 5)]
@@ -560,7 +555,7 @@
           result (sci/resume thawed)]
       (is (= {:source :test} result)))))
 
-(deftest ^:known-limitation freeze-thaw-suspend-inside-loop-body
+(deftest freeze-thaw-suspend-inside-loop-body
   (testing "suspend inside a loop body should resume to the correct value"
     (let [m (eval-suspend
              "(loop [i 0 acc 0]
