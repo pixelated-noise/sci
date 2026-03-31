@@ -1950,12 +1950,27 @@
                        {}
                        (:dynamic-bindings machine))
                  :cljs nil)
-              has-thread-bindings? #?(:clj (seq thread-bindings) :cljs false)]
+              has-thread-bindings? #?(:clj (seq thread-bindings) :cljs false)
+              ;; Also update SCI atom vars (for host wrappers that read @sci/out etc.)
+              atom-vars (:atom-vars machine)
+              saved-atoms
+              #?(:clj (when atom-vars
+                        (reduce-kv
+                         (fn [acc qualified val]
+                           (if-let [atm (get atom-vars qualified)]
+                             (let [old (deref atm)]
+                               (reset! atm val)
+                               (assoc acc atm old))
+                             acc))
+                         {} (:dynamic-bindings machine)))
+                 :cljs nil)]
           (when has-thread-bindings?
             #?(:clj (clojure.core/push-thread-bindings thread-bindings)))
           (if (empty? body)
             (do (when has-thread-bindings?
                   #?(:clj (clojure.core/pop-thread-bindings)))
+                ;; Restore atoms
+                (doseq [[atm old-val] saved-atoms] (reset! atm old-val))
                 (-> machine
                     (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
                     (m/push-value nil)))
@@ -1963,7 +1978,8 @@
                 (m/replace-frame {:op :binding-body
                                   :body (vec body)
                                   :saved-dynamic-bindings (:saved-dynamic-bindings frame)
-                                  :has-thread-bindings? has-thread-bindings?})
+                                  :has-thread-bindings? has-thread-bindings?
+                                  :saved-atoms saved-atoms})
                 (m/push-frame {:op :eval :expr (first body)}))))
         (let [[sym expr] (nth pairs idx)]
           (-> machine
@@ -1977,6 +1993,8 @@
     (if (empty? body)
       (do (when (:has-thread-bindings? frame)
             #?(:clj (clojure.core/pop-thread-bindings)))
+          ;; Restore SCI atoms
+          (doseq [[atm old-val] (:saved-atoms frame)] (reset! atm old-val))
           (-> machine
               (assoc :dynamic-bindings (:saved-dynamic-bindings frame))
               (m/pop-frame)))

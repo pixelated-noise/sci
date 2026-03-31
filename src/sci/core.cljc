@@ -1864,7 +1864,15 @@
                 (:reify-fn ctx) (assoc :reify-fn (:reify-fn ctx))
                 true (as-> m' m'
                       (let [f (or (:file ctx) @(clojure.core/resolve 'sci.core/file))]
-                        (if f (assoc m' :current-file f) m'))))]
+                        (if f (assoc m' :current-file f) m')))
+                ;; Add atom-vars mapping for binding mechanism
+                true (assoc :atom-vars
+                       (let [resolve-atom (fn [s] (some-> (clojure.core/find-var s) deref))]
+                         {'clojure.core/*out*                 (resolve-atom 'sci.core/out)
+                          'clojure.core/*in*                  (resolve-atom 'sci.core/in)
+                          'clojure.core/*err*                 (resolve-atom 'sci.core/err)
+                          'clojure.core/*print-length*        (resolve-atom 'sci.core/print-length)
+                          'clojure.core/*print-namespace-maps* (resolve-atom 'sci.core/print-namespace-maps)})))]
       (reset! heap-atom heap)
       (machine/push-frame m {:op :eval :expr expr}))))
 
@@ -2061,7 +2069,8 @@
   {'sci.core/out       #'*out*
    'sci.core/in        #'*in*
    'sci.core/err       #'*err*
-   'sci.core/print-length #'*print-length*})
+   'sci.core/print-length #'*print-length*
+   'sci.core/print-namespace-maps #'*print-namespace-maps*})
 
 (defmacro binding
   "Dynamic binding form for SCI vars.
