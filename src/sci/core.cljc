@@ -406,6 +406,7 @@
      :ns-atom (atom ns-table)
      :ns-objects (atom {})
      :current-ns-atom (atom (or initial-ns 'user))
+     :hierarchy-atom hierarchy-atom
      :classes (or classes {})
      :features (or features #{:clj})
      :load-fn load-fn
@@ -493,7 +494,8 @@
                (:current-ns-atom ctx) (assoc :current-ns-atom (:current-ns-atom ctx)
                                              :current-ns @(:current-ns-atom ctx))
                (:load-fn ctx) (assoc :load-fn (:load-fn ctx))
-               (:classes ctx) (assoc :classes (:classes ctx)))
+               (:classes ctx) (assoc :classes (:classes ctx))
+               (:hierarchy-atom ctx) (assoc :hierarchy-atom (:hierarchy-atom ctx)))
           m2 (machine/push-frame m2 {:op :eval :expr form})]
       (step/run m2))))
 
@@ -1440,11 +1442,16 @@
                                 ;; SCI closure — strip implementation keys, keep user metadata
                                 (:sci/closure m)
                                 (let [cleaned (dissoc m :sci/closure :type :sci.impl/record
-                                                      :ns :env :arities :file :name :line :column)]
+                                                      :ns :env :arities :file :name :line :column
+                                                      :sci.impl/var-sym)]
                                   (when (seq cleaned) cleaned))
                                 ;; SCI type/record — strip type identity keys
                                 (and m (or (contains? m :type) (contains? m :sci.impl/record)))
-                                (let [cleaned (dissoc m :type :sci.impl/record)]
+                                (let [cleaned (dissoc m :type :sci.impl/record :sci.impl/var-sym)]
+                                  (when (seq cleaned) cleaned))
+                                ;; Any map with :sci.impl/var-sym — strip it
+                                (contains? m :sci.impl/var-sym)
+                                (let [cleaned (dissoc m :sci.impl/var-sym)]
                                   (when (seq cleaned) cleaned))
                                 :else m)))
                      :meta {:name 'meta :doc #?(:clj (:doc (meta #'clojure.core/meta)) :cljs nil)}}
@@ -1497,6 +1504,7 @@
                 (:ns-aliases ctx) (assoc :ns-aliases (:ns-aliases ctx))
                 (:classes ctx) (assoc :classes (:classes ctx))
                 (:inverse-registry ctx) (assoc :inverse-registry (:inverse-registry ctx))
+                (:hierarchy-atom ctx) (assoc :hierarchy-atom (:hierarchy-atom ctx))
                 true (as-> m' m'
                       (let [f (or (:file ctx) @(clojure.core/resolve 'sci.core/file))]
                         (if f (assoc m' :current-file f) m'))))]

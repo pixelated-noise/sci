@@ -1850,18 +1850,30 @@
 
 (defn- make-multimethod
   "Create a multimethod: a callable fn that dispatches based on a dispatch-fn."
-  [mm-name dispatch-fn]
+  [mm-name dispatch-fn hierarchy-atom]
   (let [methods-atom (atom {})
         prefer-table (atom {})
+        isa?-fn (if hierarchy-atom
+                  (fn [child parent] (isa? @hierarchy-atom child parent))
+                  isa?)
         mm (fn multimethod [& args]
              (let [dispatch-val (apply dispatch-fn args)
                    methods @methods-atom
+                   prefs @prefer-table
+                   ;; Find matching methods via isa?
+                   matches (filter (fn [[k _]] (isa?-fn dispatch-val k)) methods)
                    method (or (get methods dispatch-val)
-                              ;; Check hierarchy (isa?)
-                              (first (filter some?
-                                             (map (fn [[k v]]
-                                                    (when (isa? dispatch-val k) v))
-                                                  methods)))
+                              ;; Check hierarchy with prefer-method disambiguation
+                              (when (seq matches)
+                                (let [best (reduce (fn [a b]
+                                                     (cond
+                                                       (isa?-fn (key a) (key b)) a
+                                                       (isa?-fn (key b) (key a)) b
+                                                       (get (get prefs (key a)) (key b)) a
+                                                       (get (get prefs (key b)) (key a)) b
+                                                       :else a))
+                                                   matches)]
+                                  (val best)))
                               (get methods :default))]
                (if method
                  (apply method args)
@@ -1884,7 +1896,7 @@
 (defn step-defmulti-apply [machine frame]
   (let [dispatch-fn (:result machine)
         mm-name (:mm-name frame)
-        mm (make-multimethod mm-name dispatch-fn)
+        mm (make-multimethod mm-name dispatch-fn (:hierarchy-atom machine))
         ns-sym (:current-ns machine)
         qualified (symbol (str ns-sym) (str mm-name))
         entry {:val mm :meta {} :dynamic? false}]
@@ -2348,7 +2360,7 @@
                 ;; Don't load the namespace if only :as-alias is used
                 machine (if (and as-alias-sym (not (:as opts)) (not refers))
                           machine  ;; :as-alias only — skip loading
-                          (load-ns-if-needed machine ns-sym (dissoc opts :as :refer :rename :as-alias)))
+                          (load-ns-if-needed machine ns-sym opts))
                 alias-sym (or (:as opts) as-alias-sym)]
             (cond-> machine
               alias-sym (update-in [:ns current-ns :aliases] assoc alias-sym ns-sym)
