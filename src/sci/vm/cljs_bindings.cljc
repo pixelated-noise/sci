@@ -400,25 +400,27 @@
      (def ~name ~expr)))
 
 (defn- doseq-impl [_ _ seq-exprs & body]
-  ;; Simple single-binding doseq
-  (if (= 2 (count seq-exprs))
-    (let [[bind expr] seq-exprs]
-      `(loop [s# (seq ~expr)]
-         (when s#
-           (let [~bind (first s#)]
-             ~@body)
-           (recur (next s#)))))
-    ;; Multi-binding: expand recursively
+  (cond
+    (empty? seq-exprs)
+    `(do ~@body)
+
+    (keyword? (first seq-exprs))
+    (let [[kw expr & more] seq-exprs]
+      (case kw
+        :let  `(let ~expr (doseq ~(vec more) ~@body))
+        :when `(when ~expr (doseq ~(vec more) ~@body))
+        :while `(if ~expr (doseq ~(vec more) ~@body) nil)))
+
+    :else
     (let [[bind expr & more] seq-exprs]
-      (if (keyword? bind)
-        ;; :let, :when, :while modifiers
-        (cond
-          (= :let bind)
-          `(let ~expr (doseq ~(vec more) ~@body))
-          (= :when bind)
-          `(when ~expr (doseq ~(vec more) ~@body))
-          (= :while bind)
-          `(if ~expr (doseq ~(vec more) ~@body) nil))
+      (if (empty? more)
+        ;; Last binding — simple loop
+        `(loop [s# (seq ~expr)]
+           (when s#
+             (let [~bind (first s#)]
+               ~@body)
+             (recur (next s#))))
+        ;; More bindings remain — recurse
         `(loop [s# (seq ~expr)]
            (when s#
              (let [~bind (first s#)]
@@ -426,20 +428,23 @@
              (recur (next s#))))))))
 
 (defn- for-impl [_ _ seq-exprs body-expr]
-  ;; Simplified for — single binding only
-  (let [[bind expr & more] seq-exprs]
-    (if (and (nil? more) (not (keyword? bind)))
-      `(map (fn [~bind] ~body-expr) ~expr)
-      ;; Complex for with multiple bindings/modifiers — basic recursive expansion
-      (if (keyword? bind)
-        (cond
-          (= :let bind)
-          `(let ~expr (for ~(vec more) ~body-expr))
-          (= :when bind)
-          `(if ~expr (for ~(vec more) ~body-expr) ())
-          (= :while bind)
-          `(if ~expr (for ~(vec more) ~body-expr) ()))
-        `(mapcat (fn [~bind] (for ~(vec more) ~body-expr)) ~expr)))))
+  (if (empty? seq-exprs)
+    ;; Base case: no more bindings, just produce the body in a list
+    (list 'list body-expr)
+    (let [[bind expr & more] seq-exprs]
+      (if (and (nil? more) (not (keyword? bind)))
+        ;; Last binding — simple map
+        `(map (fn [~bind] ~body-expr) ~expr)
+        ;; Complex for with multiple bindings/modifiers
+        (if (keyword? bind)
+          (cond
+            (= :let bind)
+            `(let ~expr (for ~(vec more) ~body-expr))
+            (= :when bind)
+            `(if ~expr (for ~(vec more) ~body-expr) ())
+            (= :while bind)
+            `(if ~expr (for ~(vec more) ~body-expr) ()))
+          `(mapcat (fn [~bind] (for ~(vec more) ~body-expr)) ~expr))))))
 
 (defn- comment-impl [_ _ & _body] nil)
 
