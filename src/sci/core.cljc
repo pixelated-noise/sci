@@ -1111,7 +1111,7 @@
 (def ns (atom #?(:clj (clojure.core/find-ns 'user) :cljs 'user)))
 (def read-eval (atom false))
 (def assert (atom true))
-(def ^:dynamic file nil)
+(def file (atom nil))
 
 ;; ============================================================
 
@@ -1862,7 +1862,7 @@
                             (let [pr-str-fn (:val (get @heap-atom (symbol "clojure.core" "pr-str")))
                                   s (apply pr-str-fn args)]
                               #?(:clj (.write ^java.io.Writer *out* ^String s)
-                                 :cljs (if-let [w @out] (-write w s) (when *print-fn* (*print-fn* s))))))
+                                 :cljs (if-let [w @out] (-write w s) (if-let [pf @print-fn] (pf s) (when *print-fn* (*print-fn* s)))))))
                      :meta {:name 'pr :doc #?(:clj (:doc (meta #'clojure.core/pr)) :cljs (existing-doc (symbol "clojure.core" "pr")))}}
                     ;; prn — pr followed by newline
                     (symbol "clojure.core" "prn")
@@ -1871,7 +1871,7 @@
                               (apply pr-fn args)
                               #?(:clj (do (.write ^java.io.Writer *out* "\n")
                                           (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
-                                 :cljs (if-let [w @out] (-write w "\n") (when *print-fn* (*print-fn* "\n"))))))
+                                 :cljs (if-let [w @out] (-write w "\n") (if-let [pf @print-fn] (pf "\n") (when *print-fn* (*print-fn* "\n")))))))
                      :meta {:name 'prn :doc #?(:clj (:doc (meta #'clojure.core/prn)) :cljs (existing-doc (symbol "clojure.core" "prn")))}}
                     ;; print — like pr but uses print-str (human-readable)
                     (symbol "clojure.core" "print")
@@ -1879,7 +1879,7 @@
                             (let [print-str-fn (:val (get @heap-atom (symbol "clojure.core" "print-str")))
                                   s (apply print-str-fn args)]
                               #?(:clj (.write ^java.io.Writer *out* ^String s)
-                                 :cljs (if-let [w @out] (-write w s) (when *print-fn* (*print-fn* s))))))
+                                 :cljs (if-let [w @out] (-write w s) (if-let [pf @print-fn] (pf s) (when *print-fn* (*print-fn* s)))))))
                      :meta {:name 'print :doc #?(:clj (:doc (meta #'clojure.core/print)) :cljs (existing-doc (symbol "clojure.core" "print")))}}
                     ;; println — print followed by newline
                     (symbol "clojure.core" "println")
@@ -1888,7 +1888,7 @@
                               (apply print-fn args)
                               #?(:clj (do (.write ^java.io.Writer *out* "\n")
                                           (when *flush-on-newline* (.flush ^java.io.Writer *out*)))
-                                 :cljs (if-let [w @out] (-write w "\n") (when *print-fn* (*print-fn* "\n"))))))
+                                 :cljs (if-let [w @out] (-write w "\n") (if-let [pf @print-fn] (pf "\n") (when *print-fn* (*print-fn* "\n")))))))
                      :meta {:name 'println :doc #?(:clj (:doc (meta #'clojure.core/println)) :cljs (existing-doc (symbol "clojure.core" "println")))}}
                     ;; print-str — like pr-str for print-str
                     (symbol "clojure.core" "print-str")
@@ -1962,7 +1962,7 @@
               (:deftype-fn ctx) (assoc :deftype-fn (:deftype-fn ctx))
               (:reify-fn ctx) (assoc :reify-fn (:reify-fn ctx))
               true (as-> m' m'
-                     (let [f (or (:file ctx) #?(:clj @(clojure.core/resolve 'sci.core/file) :cljs nil))]
+                     (let [f (or (:file ctx) #?(:clj @@(clojure.core/resolve 'sci.core/file) :cljs @file))]
                        (if f (assoc m' :current-file f) m')))
                 ;; Add atom-vars mapping for binding mechanism
               true (assoc :atom-vars
