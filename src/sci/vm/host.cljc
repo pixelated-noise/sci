@@ -129,7 +129,7 @@
                           (if (seq clj-bindings)
                             (clojure.core/with-bindings* clj-bindings f)
                             (apply f args))))
-                 :meta {:name 'with-bindings*}})
+                 :meta {:name 'with-bindings* :doc #?(:clj (:doc (meta #'clojure.core/with-bindings*)) :cljs nil)}})
          :cljs identity)
       ;; Override assert with a runtime check so (set! *assert* false) takes effect.
       ;; The host clojure.core/assert macro checks *assert* at expansion time, not runtime.
@@ -148,7 +148,7 @@
                             `(when *assert*
                                (when-not ~expr
                                  (throw (new AssertionError (str "Assert failed: " (pr-str '~expr)))))))))
-                 :meta {:name 'assert :macro true}
+                 :meta {:name 'assert :macro true :doc #?(:clj (:doc (meta #'clojure.core/assert)) :cljs nil)}
                  :macro? true
                  :host-macro? true})
          :cljs identity)))

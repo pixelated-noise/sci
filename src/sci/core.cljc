@@ -72,7 +72,19 @@
                                     "L" (.getName ^Class klass) ";"))))
                    ;; Not resolvable as array type → keep as-is
                    sym))
-               sym))
+               ;; Not array notation → resolve namespace aliases
+               (or (when ns-atom
+                     (let [aliases (get-in @ns-atom [current-ns :aliases])
+                           resolved-ns (get aliases (symbol ns-part))]
+                       (when resolved-ns
+                         (symbol (str resolved-ns) name-part))))
+                   ;; Check if ns-part is a known namespace in the heap
+                   (when heap-atom
+                     (let [h @heap-atom
+                           ;; Check if any var exists with this namespace
+                           qualified (symbol ns-part name-part)]
+                       (when (get h qualified) qualified)))
+                   sym)))
            :cljs sym)
 
         ;; Special forms → keep as-is
@@ -112,14 +124,19 @@
                        (symbol (namespace orig) sym-name)))
                    ;; defined in current ns
                    (symbol (str current-ns) sym-name)))))
-         ;; Java class?
-         (sq-resolve-class sym)
+         ;; Java class? (but not if explicitly unmapped)
+         (when-not (and ns-atom
+                        (contains? (get-in @ns-atom [current-ns :unmapped]) sym))
+           (sq-resolve-class sym))
          ;; Host Clojure var from standard namespaces (clojure.core etc.) only.
          ;; We restrict to standard namespaces to avoid picking up host-level vars
          ;; that happen to shadow SCI user-defined symbols (e.g. sci.copy-ns-test-ns/bar).
-         (let [excluded? (when ns-atom
-                           (let [excludes (get-in @ns-atom [current-ns :refer-clojure-excludes])]
-                             (and excludes (contains? excludes (symbol sym-name)))))
+         (let [unmapped? (and ns-atom
+                            (contains? (get-in @ns-atom [current-ns :unmapped]) sym))
+               excluded? (or unmapped?
+                             (when ns-atom
+                               (let [excludes (get-in @ns-atom [current-ns :refer-clojure-excludes])]
+                                 (and excludes (contains? excludes (symbol sym-name))))))
                resolved (when-not excluded?
                           #?(:clj (clojure.core/resolve sym) :cljs nil))]
            (when resolved
@@ -219,7 +236,7 @@
                                (clojure.core/deref ref)))
                             ([ref timeout-ms timeout-val]
                              (clojure.core/deref ref timeout-ms timeout-val)))
-                     :meta {:name 'deref}
+                     :meta {:name 'deref :doc #?(:clj (:doc (meta #'clojure.core/deref)) :cljs nil)}
                      :dynamic? false})
         ;; Override swap! and reset! to handle SCI type instances with swap/reset methods
         heap (assoc heap (symbol "clojure.core" "swap!")
@@ -264,7 +281,7 @@
                                      (apply clojure.core/swap! ref f a b args)))
                                  (apply clojure.core/swap! ref f a b args))
                                (apply clojure.core/swap! ref f a b args))))
-                     :meta {:name 'swap!}
+                     :meta {:name 'swap! :doc #?(:clj (:doc (meta #'clojure.core/swap!)) :cljs nil)}
                      :dynamic? false})
         heap (assoc heap (symbol "clojure.core" "reset!")
                     {:val (fn sci-reset! [ref v]
@@ -277,7 +294,7 @@
                                     (clojure.core/reset! ref v)))
                                 (clojure.core/reset! ref v))
                               (clojure.core/reset! ref v)))
-                     :meta {:name 'reset!}
+                     :meta {:name 'reset! :doc #?(:clj (:doc (meta #'clojure.core/reset!)) :cljs nil)}
                      :dynamic? false})
         ;; Override reset-vals! and swap-vals! to handle SCI type instances
         heap (assoc heap (symbol "clojure.core" "reset-vals!")
@@ -338,7 +355,7 @@
                (-> heap
                    (assoc (symbol "clojure.core" "make-hierarchy")
                           {:val clojure.core/make-hierarchy
-                           :meta {:name 'make-hierarchy}})
+                           :meta {:name 'make-hierarchy :doc #?(:clj (:doc (meta #'clojure.core/make-hierarchy)) :cljs nil)}})
                    (assoc (symbol "clojure.core" "derive")
                           {:val (fn sci-derive
                                   ([tag parent]
@@ -434,26 +451,38 @@
                    (update ns-table 'user assoc :aliases
                            (reduce-kv (fn [a k v] (assoc a k v)) {} aliases))
                    ns-table)]
-    {:heap heap
-     :heap-atom (atom heap)
-     :ns-table ns-table
-     :ns-atom (atom ns-table)
-     :ns-objects (atom {})
-     :current-ns-atom (atom (or initial-ns 'user))
-     :loaded-libs (atom #{})
-     :hierarchy-atom hierarchy-atom
-     :classes (or classes {})
-     :features (or features #{:clj})
-     :load-fn load-fn
-     :readers readers
-     :ns-aliases ns-aliases
-     :deny deny
-     :allow allow
-     :file file
-     :disable-arity-checks (boolean disable-arity-checks)
-     :deftype-fn deftype-fn
-     :reify-fn reify-fn
-     #?@(:clj [:inverse-registry (host/inverse-registry heap)])}))
+    (let [heap-atom (atom heap)
+          ;; Build :env for backwards compatibility — provides (-> ctx :env deref :namespaces)
+          env (atom {:namespaces
+                     (reduce-kv
+                      (fn [nss sym entry]
+                        (let [ns-sym (symbol (namespace sym))
+                              var-name (symbol (name sym))
+                              v (sci.lang.Var. sym (:val entry)
+                                               (or (:meta entry) {}) (:dynamic? entry))]
+                          (update nss ns-sym assoc var-name v)))
+                      {} heap)})]
+      {:heap heap
+       :heap-atom heap-atom
+       :ns-table ns-table
+       :ns-atom (atom ns-table)
+       :ns-objects (atom {})
+       :current-ns-atom (atom (or initial-ns 'user))
+       :loaded-libs (atom #{})
+       :hierarchy-atom hierarchy-atom
+       :classes (or classes {})
+       :features (or features #{:clj})
+       :load-fn load-fn
+       :readers readers
+       :ns-aliases ns-aliases
+       :deny deny
+       :allow allow
+       :file file
+       :disable-arity-checks (boolean disable-arity-checks)
+       :deftype-fn deftype-fn
+       :reify-fn reify-fn
+       :env env
+       #?@(:clj [:inverse-registry (host/inverse-registry heap)])})))
 
 (defn fork
   "Create a fork of a context — an independent copy."
@@ -605,6 +634,12 @@
           new-meta))
       (apply clojure.core/alter-meta! ref f args))))
 
+(def ^:private vm-special-forms
+  "Special forms handled directly by the VM step dispatcher — macroexpand-1 must not expand these."
+  #{'ns 'in-ns 'def 'do 'if 'let 'let* 'fn 'fn* 'quote 'var 'try 'catch 'finally
+    'throw 'loop 'loop* 'recur 'new 'set! 'import* 'deftype* 'reify*
+    '. 'binding 'case 'case*})
+
 (defn- make-macroexpand-1-fn [heap-atom]
   (fn sci-macroexpand-1
     ([form]
@@ -612,7 +647,10 @@
        form
        (let [head (first form)
              n    (name head)]
-         (cond
+         ;; Don't expand VM special forms
+         (if (contains? vm-special-forms head)
+           form
+           (cond
            (and #?(:clj  (.startsWith ^String n ".")
                    :cljs (= "." (subs n 0 1)))
                 (not= n "..")
@@ -653,7 +691,7 @@
                    (apply mf form {} (rest form))
                    ;; Internal SCI functions (not closures): just args
                    (apply mf (rest form))))
-               form))))))
+               form)))))))
     ([env form]
      (if (and (seq? form) (symbol? (first form)) (contains? env (first form)))
        form
@@ -1168,12 +1206,14 @@
                                   qualified (symbol (str ns-sym) (str sym))]
                               (swap! heap-atom dissoc qualified)
                               ;; Also remove from imports, types, refers in ns-atom
+                              ;; and track in :unmapped so syntax-quote resolver knows
                               (when-let [ns-atom (:ns-atom ctx)]
                                 (swap! ns-atom (fn [ns-table]
                                                  (-> ns-table
                                                      (update-in [ns-sym :imports] dissoc sym)
                                                      (update-in [ns-sym :types] dissoc sym)
-                                                     (update-in [ns-sym :refers] dissoc sym)))))
+                                                     (update-in [ns-sym :refers] dissoc sym)
+                                                     (update-in [ns-sym :unmapped] (fnil conj #{}) sym)))))
                               nil))
                      :meta {:name 'ns-unmap :doc #?(:clj (:doc (meta #'clojure.core/ns-unmap)) :cljs nil)}}
                     (symbol "clojure.core" "ns-imports")
