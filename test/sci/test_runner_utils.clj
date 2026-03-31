@@ -34,7 +34,16 @@
     sci.hierarchies-test
     sci.repl-test])
 
+(defn- reload-sci-deps!
+  "Reload SCI implementation namespaces in dependency order to avoid
+   classloader identity issues (sci.lang.Var from DynamicClassLoader)."
+  []
+  (doseq [ns-sym '[sci.lang sci.impl.types sci.vm.step sci.core]]
+    (when (find-ns ns-sym)
+      (require ns-sym :reload))))
+
 (defn- require-ns [ns-sym]
+  (reload-sci-deps!)
   (try
     (require ns-sym :reload)
     true
