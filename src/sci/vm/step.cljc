@@ -10,11 +10,9 @@
 (declare match-arity bind-params run check-permission form-location do-extend try-resolve-sci-type)
 
 (defn- type-methods
-  "Get the methods map from a sci.lang.Type instance.
-   Works around CLJS field munging where `methods` becomes `methods$`."
+  "Get the methods map from a sci.lang.Type instance."
   [^sci.lang.Type type-obj]
-  #?(:clj (.-methods type-obj)
-     :cljs (unchecked-get type-obj "methods$")))
+  (.-method-map type-obj))
 
 ;; Thread-local dynamic bindings for closures called from host code (e.g. via map).
 ;; Using a dynamic var ensures each thread (future/test) has isolated bindings.

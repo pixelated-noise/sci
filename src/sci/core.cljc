@@ -18,11 +18,9 @@
 (declare out print-fn)
 
 (defn- type-methods
-  "Get the methods map from a sci.lang.Type instance.
-   Works around CLJS field munging where `methods` becomes `methods$`."
+  "Get the methods map from a sci.lang.Type instance."
   [^sci.lang.Type type-obj]
-  #?(:clj (.-methods type-obj)
-     :cljs (unchecked-get type-obj "methods$")))
+  (.-method-map type-obj))
 
 (defn- type-name
   "Get the name from a sci.lang.Type instance.

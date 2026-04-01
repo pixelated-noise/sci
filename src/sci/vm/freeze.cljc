@@ -230,14 +230,11 @@
 
         ;; SCI Type (deftype/defrecord) — serialize with full info
         (instance? sci.lang.Type x)
-        (let [methods #?(:clj (.-methods ^sci.lang.Type x)
-                         :cljs (unchecked-get x "methods$"))
-              opts #?(:clj (.-opts ^sci.lang.Type x)
-                      :cljs (unchecked-get x "opts$"))]
+        (let [methods (.-method-map ^sci.lang.Type x)
+              opts (.-opts ^sci.lang.Type x)]
           (merge {:type :sci-type-ref
                   :name (str x)
-                  :fields (mapv str #?(:clj (.-fields ^sci.lang.Type x)
-                                       :cljs (unchecked-get x "fields$")))}
+                  :fields (mapv str (.-fields ^sci.lang.Type x))}
                  (when (seq methods)
                    {:methods (reduce-kv (fn [acc k v]
                                           (assoc acc (str k) (replace-unserializable v inverse-reg seen)))
@@ -711,8 +708,7 @@
   [type-registry machine]
   (let [replacements (id-map-new)]
     (doseq [[type-name old-type] @type-registry]
-      (let [methods #?(:clj (.-methods ^sci.lang.Type old-type)
-                       :cljs (unchecked-get old-type "methods$"))]
+      (let [methods (.-method-map ^sci.lang.Type old-type)]
         (when (some (fn [[_ v]] (and (map? v) (#{:deftype-method :deftype-multi-method} (:type v))))
                     methods)
           (let [wrapped-methods
@@ -754,15 +750,11 @@
                             :else v)))
                  {} methods)
                 new-type (sci.lang/->Type
-                          #?(:clj (.-name ^sci.lang.Type old-type)
-                             :cljs (unchecked-get old-type "name$"))
-                          #?(:clj (.-fields ^sci.lang.Type old-type)
-                             :cljs (unchecked-get old-type "fields$"))
-                          #?(:clj (.-protocols ^sci.lang.Type old-type)
-                             :cljs (unchecked-get old-type "protocols$"))
+                          (.-name ^sci.lang.Type old-type)
+                          (.-fields ^sci.lang.Type old-type)
+                          (.-protocols ^sci.lang.Type old-type)
                           wrapped-methods
-                          #?(:clj (.-opts ^sci.lang.Type old-type)
-                             :cljs (unchecked-get old-type "opts$")))]
+                          (.-opts ^sci.lang.Type old-type))]
             (id-map-put! replacements old-type new-type)
             (swap! type-registry assoc type-name new-type)))))
     replacements))

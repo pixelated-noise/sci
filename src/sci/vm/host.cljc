@@ -13,11 +13,9 @@
             #?(:cljs [sci.vm.cljs-bindings :as cljs-bindings])))
 
 (defn- type-methods
-  "Get the methods map from a sci.lang.Type instance.
-   Works around CLJS field munging where `methods` becomes `methods$`."
+  "Get the methods map from a sci.lang.Type instance."
   [^sci.lang.Type type-obj]
-  #?(:clj (.-methods type-obj)
-     :cljs (unchecked-get type-obj "methods$")))
+  (.-method-map type-obj))
 
 (defn- type-name
   "Get the name from a sci.lang.Type instance."
@@ -444,7 +442,7 @@
                                         (if-let [sci-type (when-let [m (clojure.core/meta x)]
                                                             (when (instance? sci.lang.Type (:type m))
                                                               (:type m)))]
-                                          (let [methods (unchecked-get sci-type "methods$")]
+                                          (let [methods (.-method-map ^sci.lang.Type sci-type)]
                                             (if-let [toString-fn (get methods 'toString)]
                                               (toString-fn x)
                                               (if (:sci.impl/record (clojure.core/meta x))

@@ -823,8 +823,8 @@
                 'dec dec 'dedupe dedupe
                 'deref (fn sci-deref [ref]
                          (if-let [type-obj (:type (clojure.core/meta ref))]
-                           (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
-                             (let [methods (unchecked-get type-obj "methods$")
+                           (if (and (some? type-obj) (.-method-map ^sci.lang.Type type-obj))
+                             (let [methods (.-method-map ^sci.lang.Type type-obj)
                                    deref-fn (or (get methods 'deref) (get methods '-deref))]
                                (if deref-fn (deref-fn ref) (deref ref)))
                              (deref ref))
@@ -892,8 +892,8 @@
                 'random-sample random-sample 'repeat repeat
                 'reset! (fn sci-reset! [ref v]
                           (if-let [type-obj (:type (clojure.core/meta ref))]
-                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
-                              (let [methods (unchecked-get type-obj "methods$")
+                            (if (and (some? type-obj) (.-method-map ^sci.lang.Type type-obj))
+                              (let [methods (.-method-map ^sci.lang.Type type-obj)
                                     reset-fn (or (get methods 'reset) (get methods '-reset!))]
                                 (if reset-fn (reset-fn ref v) (reset! ref v)))
                               (reset! ref v))
@@ -910,32 +910,32 @@
                 'swap! (fn sci-swap!
                          ([ref f]
                           (if-let [type-obj (:type (clojure.core/meta ref))]
-                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
-                              (let [methods (unchecked-get type-obj "methods$")
+                            (if (and (some? type-obj) (.-method-map ^sci.lang.Type type-obj))
+                              (let [methods (.-method-map ^sci.lang.Type type-obj)
                                     swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                 (if swap-fn (swap-fn ref f) (swap! ref f)))
                               (swap! ref f))
                             (swap! ref f)))
                          ([ref f a]
                           (if-let [type-obj (:type (clojure.core/meta ref))]
-                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
-                              (let [methods (unchecked-get type-obj "methods$")
+                            (if (and (some? type-obj) (.-method-map ^sci.lang.Type type-obj))
+                              (let [methods (.-method-map ^sci.lang.Type type-obj)
                                     swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                 (if swap-fn (swap-fn ref f a) (swap! ref f a)))
                               (swap! ref f a))
                             (swap! ref f a)))
                          ([ref f a b]
                           (if-let [type-obj (:type (clojure.core/meta ref))]
-                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
-                              (let [methods (unchecked-get type-obj "methods$")
+                            (if (and (some? type-obj) (.-method-map ^sci.lang.Type type-obj))
+                              (let [methods (.-method-map ^sci.lang.Type type-obj)
                                     swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                 (if swap-fn (swap-fn ref f a b) (swap! ref f a b)))
                               (swap! ref f a b))
                             (swap! ref f a b)))
                          ([ref f a b & args]
                           (if-let [type-obj (:type (clojure.core/meta ref))]
-                            (if (and (some? type-obj) (unchecked-get type-obj "methods$"))
-                              (let [methods (unchecked-get type-obj "methods$")
+                            (if (and (some? type-obj) (.-method-map ^sci.lang.Type type-obj))
+                              (let [methods (.-method-map ^sci.lang.Type type-obj)
                                     swap-fn (or (get methods 'swap) (get methods '-swap!))]
                                 (if swap-fn (apply swap-fn ref f a b args) (apply swap! ref f a b args)))
                               (apply swap! ref f a b args))
