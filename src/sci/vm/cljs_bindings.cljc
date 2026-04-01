@@ -732,7 +732,7 @@
   (if forms
     (let [expanded (reduce (fn [acc form]
                              (if (seq? form)
-                               (list* '. acc form)
+                               (list '. acc form)
                                (list '. acc form)))
                            x forms)]
       expanded)
