@@ -7,11 +7,7 @@
 
 **Small Clojure Interpreter**
 
-<blockquote class="twitter-tweet" data-lang="en">
-    <p lang="en" dir="ltr">I want a limited dialect of Clojure for a single-purpose, scripted application. SCI will fit nicely.</p>
-    &mdash;
-    <a href="https://twitter.com/tiagoluchini/status/1193144124142211073">@tiagoluchini</a>
-</blockquote>
+This is a fork of [babashka/sci](https://github.com/babashka/sci) that adds an explicit stack VM with suspend/resume, freeze/thaw, and single-step execution capabilities.
 
 ## Quickstart
 
@@ -30,13 +26,22 @@ For usage with GraalVM `native-image` check [here](#graalvm).
 ## Why
 
 You want to evaluate code from user input, or use Clojure for a DSL inside your
-project, but `eval` isn't safe or simply doesn't work.
+project, but `eval` isn't safe or simply doesn't work. You may also need to
+suspend a running computation, serialize its entire state to disk, and resume it
+later -- possibly on a different machine or even a different runtime (JVM vs
+Node.js).
 
 This library works with:
 
 - Clojure on the JVM
 - Clojure compiled with GraalVM native
 - ClojureScript, even when compiled with `:advanced`, and JavaScript
+
+The explicit stack VM in this fork additionally supports:
+
+- **Suspend/resume**: pause execution at any point via `suspend!` and continue later with `resume`
+- **Freeze/thaw**: serialize a suspended (or running) machine to an EDN string and restore it, even across JVM and Node.js runtimes
+- **Single-step execution**: advance evaluation one operation at a time for debugging, budgeted execution, or building custom schedulers
 
 ## API docs
 
@@ -138,6 +143,88 @@ Providing a list of disallowed symbols has the opposite effect:
 ``` clojure
 user=> (sci/eval-string "(inc 1)" {:deny '[inc]})
 ExceptionInfo inc is not allowed! [at line 1, column 2]  clojure.core/ex-info (core.clj:4739)
+```
+
+### Suspend, Resume, Freeze & Thaw
+
+SCI programs can suspend themselves by calling `suspend!`. The host receives a
+suspended machine that can be resumed immediately, or frozen to an EDN string
+for later (even on a different runtime).
+
+#### Basic suspend/resume
+
+``` clojure
+(require '[sci.core :as sci])
+
+;; suspend! pauses execution and optionally carries data out
+(let [machine (sci/eval-string "(let [x (suspend! {:progress 42})]
+                                  (+ x 10))")]
+  (:status machine)       ;=> :suspend
+  (:suspend-data machine) ;=> {:progress 42}
+  ;; resume with a value -- it becomes the return value of suspend!
+  (sci/resume machine 5)) ;=> 15
+```
+
+#### Freeze and thaw
+
+Freeze serializes the entire machine state to an EDN string. Thaw
+restores it. The EDN is portable across JVM and Node.js as long as
+the SCI program doesn't use host interop.
+
+``` clojure
+(require '[sci.core :as sci]
+         '[sci.vm.freeze :as freeze])
+
+(let [machine (sci/eval-string "(do (defn greet [x] (str \"hi \" x))
+                                    (let [rv (suspend!)]
+                                      (greet rv)))")
+      ;; serialize to EDN string
+      frozen  (freeze/freeze machine)
+      ;; ... write to disk, send over the network, store in a database ...
+      ;; restore from EDN string
+      thawed  (freeze/thaw frozen)]
+  (sci/resume thawed "world")) ;=> "hi world"
+```
+
+#### Single-step execution
+
+For debugging or budgeted execution, you can advance the VM one
+operation at a time:
+
+``` clojure
+(require '[sci.core :as sci])
+
+(let [machine (sci/prepare "(+ 1 (* 2 3))")]
+  (:status machine) ;=> :running
+  ;; step 5 times
+  (let [m (nth (iterate sci/step machine) 5)]
+    (:status m) ;=> :running (not done yet)
+    ;; run to completion
+    (loop [m m]
+      (if (= :running (:status m))
+        (recur (sci/step m))
+        (:result m))))) ;=> 7
+```
+
+`sci/inspect` returns a summary of the machine state (current op,
+expression, stack depth, namespace, env) which is useful for building
+debuggers or execution visualizers.
+
+#### Combining freeze with single-step
+
+You can freeze a `:running` machine (not just a `:suspend`ed one),
+thaw it later, and continue stepping:
+
+``` clojure
+(let [m       (sci/prepare "(+ 1 (* 2 3))")
+      m       (nth (iterate sci/step m) 3)  ;; partially evaluate
+      frozen  (freeze/freeze m)
+      thawed  (freeze/thaw frozen)]
+  ;; continue from where we left off
+  (loop [m thawed]
+    (if (= :running (:status m))
+      (recur (sci/step m))
+      (:result m)))) ;=> 7
 ```
 
 ### Macros
