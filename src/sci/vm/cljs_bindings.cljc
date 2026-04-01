@@ -984,7 +984,7 @@
                 'add-watch add-watch 'remove-watch remove-watch
                 ;; Lazy seqs
                 'lazy-seq* (fn [thunk] (lazy-seq (thunk)))
-                'delay* (fn [thunk] (delay (thunk)))
+                'delay* (fn [thunk] (cljs.core/Delay. thunk nil))
                 'force force 'delay? delay?
                 'realized? realized?
                 ;; Collections

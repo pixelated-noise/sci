@@ -183,10 +183,10 @@
 (deftest freeze-thaw-try-catch
   (testing "suspend inside try body survives freeze/thaw"
     (let [m (eval-suspend
-             "(try
+             (str "(try
                 (suspend!)
                 42
-                (catch Exception e :error))")
+                (catch " #?(:clj "Exception" :cljs "js/Error") " e :error))"))
           frozen (freeze/freeze m)
           thawed (freeze/thaw frozen)
           result (sci/resume thawed)]
@@ -195,13 +195,13 @@
 (deftest freeze-thaw-try-catch-exception
   (testing "suspend before exception in try survives freeze/thaw"
     (let [m (eval-suspend
-             "(try
+             (str "(try
                 (let [x (suspend!)]
                   (if (= x :throw)
                     (throw (ex-info \"boom\" {:val x}))
                     x))
-                (catch Exception e
-                  (str \"caught: \" (.getMessage e))))")
+                (catch " #?(:clj "Exception" :cljs "js/Error") " e
+                  (str \"caught: \" " #?(:clj "(.getMessage e)" :cljs "(.-message e)") ")))"))
           frozen (freeze/freeze m)
           thawed (freeze/thaw frozen)
           result (sci/resume thawed :throw)]
