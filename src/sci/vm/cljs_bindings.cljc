@@ -499,11 +499,13 @@
                               [(last args) (butlast args)]
                               [nil args])
         ;; fn body — single arity or multi-arity
+        ;; Don't pass name to fn — Clojure's defn expands to (def name (fn ([args] body)))
+        ;; without the fn name. Including it would add the name to &env in macros.
         fn-form (if (vector? (first args))
                   ;; single arity: (defn name [params] body...)
-                  `(fn ~name ~@args)
+                  `(fn ~@args)
                   ;; multi-arity: (defn name ([p1] b1) ([p2 p3] b2) ...)
-                  `(fn ~name ~@args))
+                  `(fn ~@args))
         meta-map (merge (when docstring {:doc docstring})
                         attr-map
                         trailing-map)]
@@ -571,7 +573,7 @@
           ;; Last binding — lazy-seq loop (matches Clojure's for expansion shape)
           ;; Use clojure.core/let so macroexpand recognizes it as a macro
           (let [iter (gensym "iter__") s (gensym "s__")
-                let-sym (symbol "clojure.core" "let")]
+                let-sym (symbol #?(:clj "clojure.core" :cljs "cljs.core") "let")]
             (list let-sym [iter (list 'fn iter [s]
                                       (list 'lazy-seq
                                             (list 'when-let [s (list 'seq s)]
@@ -858,6 +860,7 @@
                 'merge merge 'merge-with merge-with
                 'min min 'min-key min-key 'munge munge 'mod mod
                 'make-array make-array 'name name
+                'ns-name (fn [ns-sym] (if (symbol? ns-sym) ns-sym (symbol (str ns-sym))))
                 'namespace namespace 'newline newline
                 'nfirst nfirst 'not not 'not= not=
                 'not-every? not-every? 'neg? neg? 'neg-int? neg-int?
@@ -1023,12 +1026,23 @@
                 (fn [[_ old-print-fn old-print-err-fn]]
                   (set! *print-fn* old-print-fn)
                   (set! *print-err-fn* old-print-err-fn))}]
-       (let [var-meta (clj-docstrings)]
+       (let [var-meta (clj-docstrings)
+             ;; Override JVM-specific docstrings with CLJS-appropriate versions
+             cljs-doc-overrides
+             {'inc {:doc "Returns a number one greater than num."}
+              'dec {:doc "Returns a number one less than num."}
+              'byte {:doc "Coerce to byte."}
+              'short {:doc "Coerce to short."}
+              'float {:doc "Coerce to float."}
+              'long {:doc "Coerce to long."}
+              'double {:doc "Coerce to double."}
+              'int {:doc "Coerce to int."}}]
          (reduce-kv
           (fn [acc sym v]
             (assoc acc (symbol "clojure.core" (str sym))
                    {:val v :meta (merge {:name sym}
-                                        (get var-meta sym))}))
+                                        (get var-meta sym)
+                                        (get cljs-doc-overrides sym))}))
           {} fns)))))
 
 ;; ============================================================

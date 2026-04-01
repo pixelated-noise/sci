@@ -101,7 +101,20 @@
                             qualified (symbol ns-part name-part)]
                         (when (get h qualified) qualified)))
                     sym)))
-            :cljs sym)
+            :cljs
+            (let [ns-part (namespace sym)
+                  name-part (name sym)]
+              (or (when ns-atom
+                    (let [aliases (get-in @ns-atom [current-ns :aliases])
+                          resolved-ns (get aliases (symbol ns-part))]
+                      (when resolved-ns
+                        (symbol (str resolved-ns) name-part))))
+                  ;; Check if ns-part is a known namespace in the heap
+                  (when heap-atom
+                    (let [h @heap-atom
+                          qualified (symbol ns-part name-part)]
+                      (when (get h qualified) qualified)))
+                  sym)))
 
         ;; Special forms → keep as-is
          (contains? special-forms-sq sym) sym

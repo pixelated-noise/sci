@@ -1837,8 +1837,16 @@
         ;; If the value is a closure (IFn with :sci/closure meta), update its name.
         ;; Use :sci/def-named true to mark that this name came from def (not fn-name form),
         ;; so it won't be added to &env for recursion (matching Clojure behavior).
-        val (if (and (fn? val) (:sci/closure (meta val)) (nil? (:name (meta val))))
-              (vary-meta val assoc :name sym :ns ns-sym :sci/def-named true)
+        val (if (and (fn? val) (:sci/closure (meta val)))
+              (if (nil? (:name (meta val)))
+                (vary-meta val assoc :name sym :ns ns-sym :sci/def-named true)
+                ;; fn already has a name (e.g. defn expands to (def foo (fn foo ...)))
+                ;; Only suppress self-reference in &env when def name matches fn name,
+                ;; i.e. (def foo (fn foo ...)) from defn. For (def f (fn foo ...)),
+                ;; the fn name foo must stay in &env for self-recursion.
+                (if (= sym (:name (meta val)))
+                  (vary-meta val assoc :sci/def-named true)
+                  val))
               val)
         meta-map (:meta-map frame)
         ;; Preserve :arglists/:doc from existing entry — deftype* constructors set these
