@@ -5,7 +5,8 @@
             [sci.vm.freeze :as freeze]
             [clojure.string :as str]
             #?(:clj [clojure.edn :as edn]
-               :cljs [cljs.reader :as edn])))
+               :cljs [cljs.reader :as edn])
+            #?(:clj [clojure.java.shell :as shell])))
 
 ;; Helper: eval-string that returns the machine (not the result) when suspended
 (defn eval-suspend
@@ -1031,9 +1032,7 @@
         (is (= (expected-result :disk) result)
             "computation resumes correctly from disk")))))
 
-;; Freeze-to-file for cross-platform testing.  Writes EDN and expected values
-;; so that the orchestration script (script/test/cross-freeze) can verify
-;; thaw on the other runtime.
+;; Freeze-to-file helpers for cross-platform testing.
 (defn freeze-to-file!
   "Eval the comprehensive program, freeze the suspended machine, write EDN to
    `path`.  Returns the suspend-data for verification."
@@ -1049,3 +1048,76 @@
   (let [frozen (read-file path)
         thawed (freeze/thaw frozen)]
     (sci/resume thawed rv)))
+
+;; ============================================================
+;; Cross-platform freeze/thaw (JVM ↔ Node.js)
+;;
+;; JVM-only test: freezes/thaws on JVM, shells out to Node for
+;; the CLJS side.  Compiles the CLJS entry point on first run;
+;; subsequent runs reuse the compiled JS.
+;; ============================================================
+
+#?(:clj
+   (defn- node-available? []
+     (try (zero? (:exit (shell/sh "node" "--version")))
+          (catch Exception _ false))))
+
+#?(:clj
+   (defn- ensure-cljs-entry-point!
+     "Compile the CLJS cross-freeze entry point if not already present.
+      Returns the path to main.js."
+     []
+     (let [out-dir ".cross-freeze-out"
+           main-js (str out-dir "/main.js")]
+       (when-not (.exists (java.io.File. main-js))
+         (let [result (shell/sh "clojure" "-M:test" "-m" "cljs.main"
+                                "-co" "{:npm-deps false}"
+                                "-t" "node"
+                                "-d" out-dir
+                                "-o" main-js
+                                "-O" "none"
+                                "-c" "sci.freeze-cross")]
+           (when-not (zero? (:exit result))
+             (throw (ex-info "CLJS compilation failed" {:err (:err result)})))))
+       main-js)))
+
+#?(:clj
+   (defn- node-run
+     "Run the CLJS cross-freeze entry point with the given args.
+      Returns stdout (trimmed). Throws on non-zero exit."
+     [main-js & args]
+     (let [result (apply shell/sh "node" main-js (map str args))]
+       (when-not (zero? (:exit result))
+         (throw (ex-info (str "node failed: " (str/trim (:err result)))
+                         {:exit (:exit result)
+                          :err  (:err result)
+                          :out  (:out result)})))
+       (str/trim (:out result)))))
+
+#?(:clj
+   (deftest cross-platform-freeze-thaw
+     (if-not (node-available?)
+       (println "  SKIP cross-platform-freeze-thaw: node not on PATH")
+       (let [main-js (ensure-cljs-entry-point!)
+             jvm-edn (temp-path "sci-cross-jvm.edn")
+             node-edn (temp-path "sci-cross-node.edn")]
+
+         (testing "JVM → JVM"
+           (freeze-to-file! jvm-edn)
+           (is (= (expected-result :cross)
+                  (thaw-from-file! jvm-edn :cross))))
+
+         (testing "JVM → Node"
+           (is (str/includes?
+                (node-run main-js "thaw-verify" jvm-edn "cross")
+                "THAW_VERIFY_PASS")))
+
+         (testing "Node → Node"
+           (node-run main-js "freeze" node-edn)
+           (is (str/includes?
+                (node-run main-js "thaw-verify" node-edn "cross")
+                "THAW_VERIFY_PASS")))
+
+         (testing "Node → JVM"
+           (is (= (expected-result :cross)
+                  (thaw-from-file! node-edn :cross))))))))
