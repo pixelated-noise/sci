@@ -585,13 +585,13 @@
 
 (defn- assert-impl
   ([_ _ x]
-   `(when clojure.core/*assert*
-      (when-not ~x
-        (throw (ex-info (str "Assert failed: " '~x) {})))))
+   (list 'when (symbol "clojure.core" "*assert*")
+         (list 'when-not x
+               (list 'throw (list 'ex-info (list 'str "Assert failed: " (list 'quote x)) {})))))
   ([_ _ x message]
-   `(when clojure.core/*assert*
-      (when-not ~x
-        (throw (ex-info (str "Assert failed: " ~message "\n" '~x) {}))))))
+   (list 'when (symbol "clojure.core" "*assert*")
+         (list 'when-not x
+               (list 'throw (list 'ex-info (list 'str "Assert failed: " message "\n" (list 'quote x)) {}))))))
 
 (defn- if-not-impl
   ([_ _ test then] `(if (not ~test) ~then nil))
