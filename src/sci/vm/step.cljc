@@ -3192,7 +3192,18 @@
                                                                         (update :env assoc short sci-type)
                                                                         (update-in [:ns ns-sym :types] assoc short sci-type)
                                                                         (update-in [:ns ns-sym :imports] assoc short sci-type))
-                                                                    m'')))))
+                                                                    (let [ref-loc (form-location ref)]
+                                                                      (throw (ex-info (str "Unable to resolve classname: " fqn)
+                                                                                      (merge {:type :sci/error
+                                                                                              :sci.impl/callstack (when ref-loc
+                                                                                                                    [{:ns (:current-ns m'')
+                                                                                                                      :name (:current-fn-name m'')
+                                                                                                                      :line (:line ref-loc)
+                                                                                                                      :column (:column ref-loc)
+                                                                                                                      :file (:current-file m'')}])}
+                                                                                             (when ref-loc
+                                                                                               {:line (:line ref-loc)
+                                                                                                :column (:column ref-loc)}))))))))))
                                                          m' classes))
                                                m'))
                                            m ref-specs)
@@ -4393,7 +4404,13 @@
                                                                  :status :running)
                                                           (m/push-frame {:op :eval :expr class-sym}))
                                           result (run eval-machine)]
-                                      (resolve-class-sym result)))))))
+                                      ;; Result is an actual constructor/class — use instance? check
+                                      (if (fn? result)
+                                        (instance? result ex)
+                                        ;; If result is a symbol, resolve it; otherwise false
+                                        (if (or (symbol? result) (keyword? result))
+                                          (resolve-class-sym result)
+                                          false))))))))
                          catches))]
       (if match
         (let [[_ catch-class-sym binding-sym & body] match
