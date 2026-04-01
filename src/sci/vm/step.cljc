@@ -1952,7 +1952,19 @@
                 (when (and (symbol? class-sym)
                            (not (try-resolve-class (str class-sym))))
                   (throw (ex-info (str "Unable to resolve classname: " class-sym)
-                                  {:type :sci/error}))))))
+                                  {:type :sci/error})))))
+       :cljs (doseq [c catches]
+               (let [[_ class-sym] c]
+                 (when (and (symbol? class-sym)
+                            (not (#{:default 'js/Error 'js/Object 'js/RangeError 'js/TypeError
+                                    'js/SyntaxError 'js/ReferenceError 'js/URIError 'js/EvalError
+                                    'ExceptionInfo 'cljs.core/ExceptionInfo} class-sym))
+                            ;; Check if it's a class from the :classes config
+                            (not (when-let [classes (:classes machine)]
+                                   (or (get classes class-sym)
+                                       (get classes (symbol (name class-sym)))))))
+                   (throw (ex-info (str "Unable to resolve classname: " class-sym)
+                                   {:type :sci/error}))))))
     (let [m (m/replace-frame machine {:op :try
                                       :catches catches
                                       :finally finally-form
@@ -4295,23 +4307,40 @@
           match (first
                  (filter (fn [catch-form]
                            (let [[_ class-sym _binding & _body] catch-form]
-                             ;; Resolve the class
+                             ;; Resolve the class and check if exception matches
                              #?(:clj
                                 (when-let [klass (try-resolve-class (str class-sym))]
                                   ;; Check both the exception and its cause (for wrapped exceptions)
                                   (or (instance? klass ex)
                                       (when-let [cause (ex-cause ex)]
                                         (instance? klass cause))))
-                                :cljs true)))
+                                :cljs
+                                (cond
+                                  ;; :default catches everything (CLJS-specific)
+                                  (= :default class-sym) true
+                                  ;; js/Error — check instance
+                                  (= 'js/Error class-sym) (instance? js/Error ex)
+                                  ;; js/Object — catches everything (like :default)
+                                  (= 'js/Object class-sym) true
+                                  ;; ExceptionInfo
+                                  (or (= 'ExceptionInfo class-sym)
+                                      (= 'cljs.core/ExceptionInfo class-sym))
+                                  (instance? ExceptionInfo ex)
+                                  ;; Other js/ types
+                                  (and (symbol? class-sym) (= "js" (namespace class-sym)))
+                                  (let [class-name (name class-sym)
+                                        klass (unchecked-get js/globalThis class-name)]
+                                    (and klass (instance? klass ex)))
+                                  ;; Unknown — doesn't match
+                                  :else false))))
                          catches))]
       (if match
         (let [[_ catch-class-sym binding-sym & body] match
               ;; Truncate stack to the try frame
               new-stack (subvec (vec (:stack machine)) 0 idx)
               ;; ^:sci/error on catch class: bind the SCI-wrapped exception using last-loc
-              sci-error? #?(:clj (and (symbol? catch-class-sym)
-                                      (:sci/error (meta catch-class-sym)))
-                            :cljs false)
+              sci-error? (and (symbol? catch-class-sym)
+                              (:sci/error (meta catch-class-sym)))
               bound-ex (if sci-error?
                          ;; Wrap exception as SCI error using last-loc for accurate location
                          (let [loc (or (:last-loc machine) (:top-loc machine)

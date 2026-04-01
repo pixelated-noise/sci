@@ -1070,7 +1070,11 @@
      :cljs (do (sci-write-line "-------------------------")
                (sci-write-line (str (:name m)))
                (when-let [arglists (:arglists m)]
-                 (sci-write-line (pr-str arglists)))
+                 ;; arglists may be (quote ([x])) from macro output; unwrap
+                 (let [arglists (if (and (seq? arglists) (= 'quote (first arglists)))
+                                  (second arglists)
+                                  arglists)]
+                   (sci-write-line (pr-str arglists))))
                (when (:macro m)
                  (sci-write-line "Macro"))
                (when-let [doc (:doc m)]
@@ -2105,7 +2109,18 @@
              ns-atom (or (:ns-atom ctx) (atom {}))
              ns-info (get @ns-atom current-ns)
              aliases (:aliases ns-info)
-             read-opts (merge (make-reader-opts current-ns aliases (:heap-atom ctx) ns-atom) reader-extra {:eof eof})
+             base-opts (make-reader-opts current-ns aliases (:heap-atom ctx) ns-atom)
+             ;; Compose user :readers with built-in :readers so both work
+             reader-extra (if-let [user-readers (:readers reader-extra)]
+                            (let [builtin-readers (:readers base-opts)]
+                              (assoc reader-extra :readers
+                                     (if (map? user-readers)
+                                       (fn [tag]
+                                         (or (get user-readers tag)
+                                             (when (fn? builtin-readers) (builtin-readers tag))))
+                                       user-readers)))
+                            reader-extra)
+             read-opts (merge base-opts reader-extra {:eof eof})
              form (edamame/parse-next reader read-opts)]
          (if (identical? form eof)
            (if (and (map? result) (= :suspend (:status result)))

@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [clojure.set :as set]
             [clojure.walk :as walk]
+            [sci.lang]
             #?(:cljs [cljs.reader :as edn]))
   #?(:cljs (:require-macros [sci.vm.cljs-bindings :refer [clj-docstrings]])))
 
@@ -27,38 +28,23 @@
 #?(:clj
    (defmacro ^:private clj-docstrings
      "Compile-time macro: generates a map of {symbol -> {:doc d :arglists al}} for all
-      public vars in clojure.core (CLJ) or cljs.core (CLJS). Uses CLJS analyzer data
-      when compiling for CLJS so docstrings match the target platform."
+      public vars in clojure.core. Uses CLJ metadata which is available at compile time
+      on both platforms."
      []
-     (let [clj-meta (into {}
-                         (keep (fn [[sym v]]
-                                 (let [m (meta v)
-                                       doc (:doc m)
-                                       arglists (:arglists m)]
-                                   (when (or doc arglists)
-                                     [(list 'quote sym)
-                                      (cond-> {}
-                                        doc (assoc :doc doc)
-                                        arglists (assoc :arglists (list 'quote arglists)))]))))
-                         (ns-publics 'clojure.core))]
-       (if (:ns &env)
-         ;; CLJS compilation — use CLJS analyzer metadata, with CLJ as fallback
-         (do (require 'cljs.analyzer.api)
-             (let [ns-publics-fn (resolve 'cljs.analyzer.api/ns-publics)
-                   cljs-meta (into {}
-                                   (keep (fn [[sym info]]
-                                           (let [doc (:doc info)
-                                                 arglists (:arglists info)]
-                                             (when (or doc arglists)
-                                               [(list 'quote sym)
-                                                (cond-> {}
-                                                  doc (assoc :doc doc)
-                                                  arglists (assoc :arglists (list 'quote arglists)))]))))
-                                   (ns-publics-fn 'cljs.core))]
-               ;; CLJS-specific metadata takes priority over CLJ
-               (merge clj-meta cljs-meta)))
-         ;; CLJ compilation
-         clj-meta))))
+     (into {}
+           (keep (fn [[sym v]]
+                   (let [m (meta v)
+                         doc (:doc m)
+                         arglists (:arglists m)]
+                     (when (or doc arglists)
+                       ;; Strip metadata from sym — some symbols (e.g. inst-ms*) carry
+                       ;; {:protocol #'clojure.core/Inst} which is not a valid CLJS constant
+                       [(list 'quote (with-meta sym nil))
+                        (merge
+                         (when doc {:doc doc})
+                         (when arglists
+                           {:arglists (list 'quote (mapv vec arglists))}))]))))
+           (ns-publics 'clojure.core))))
 
 (defn- dynamic-entry
   "Create a heap entry for a dynamic var."
@@ -1212,7 +1198,14 @@
                     :meta {:name 'IReset}}
                    (symbol "clojure.core" "IWriter")
                    {:val (make-sci-protocol 'clojure.core/IWriter ['-write '-flush])
-                    :meta {:name 'IWriter}}}]
+                    :meta {:name 'IWriter}}
+                   (symbol "clojure.core" "IRecord")
+                   {:val (make-sci-protocol 'clojure.core/IRecord [])
+                    :meta {:name 'IRecord}}
+                   ;; sci.lang.Type — expose for instance? checks
+                   (symbol "sci.lang" "Type")
+                   {:val sci.lang/Type
+                    :meta {:name 'Type}}}]
        (-> (merge (cljs-core-functions)
                   (cljs-core-macros)
                   (cljs-string-ns)

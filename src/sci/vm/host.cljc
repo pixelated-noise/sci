@@ -435,7 +435,44 @@
                                             (clojure.core/str x)))))
                                   args)))))
                  :meta {:name 'str :doc (:doc (meta #'clojure.core/str))}})
-         :cljs identity)
+         :cljs
+         (assoc 'clojure.core/str
+                {:val (let [sci-pr-str (fn sci-pr-str [x]
+                                         (cond
+                                           (nil? x) "nil"
+                                           (:sci.impl/record (clojure.core/meta x))
+                                           (let [type-obj (:type (clojure.core/meta x))]
+                                             (clojure.core/str "#" (sci.impl.types/getName type-obj)
+                                                               (clojure.core/pr-str (into (sorted-map) x))))
+                                           (instance? sci.lang.Var x)
+                                           (clojure.core/str x)
+                                           (vector? x) (clojure.core/str "[" (clojure.string/join " " (map sci-pr-str x)) "]")
+                                           (set? x) (clojure.core/str "#{" (clojure.string/join ", " (map sci-pr-str x)) "}")
+                                           (map? x) (clojure.core/str "{" (clojure.string/join ", " (map (fn [[k v]] (clojure.core/str (sci-pr-str k) " " (sci-pr-str v))) x)) "}")
+                                           (seq? x) (clojure.core/str "(" (clojure.string/join " " (map sci-pr-str x)) ")")
+                                           :else (clojure.core/pr-str x)))]
+                        (fn [& args]
+                          (if (empty? args)
+                            ""
+                            (clojure.string/join
+                             (map (fn [x]
+                                    (if (nil? x) ""
+                                        (if-let [sci-type (when-let [m (clojure.core/meta x)]
+                                                            (when (instance? sci.lang.Type (:type m))
+                                                              (:type m)))]
+                                          (let [methods (unchecked-get sci-type "methods$")]
+                                            (if-let [toString-fn (get methods 'toString)]
+                                              (toString-fn x)
+                                              (if (:sci.impl/record (clojure.core/meta x))
+                                                (clojure.core/str "#" (sci.impl.types/getName sci-type)
+                                                                  (clojure.core/pr-str (into (sorted-map) x)))
+                                                (clojure.core/str "#object[" (sci.impl.types/getName sci-type) "]"))))
+                                         ;; For collections, check if they might contain SCI records
+                                          (if (coll? x)
+                                            (sci-pr-str x)
+                                            (clojure.core/str x)))))
+                                  args)))))
+                 :meta {:name 'str}}))
       ;; Override delay so the inner fn is an SCI closure (serializable for freeze/thaw).
       ;; The host delay macro expands to (new Delay (fn* [] body)) — fn* produces a JVM
       ;; closure that freeze can't serialize. Using fn instead creates an SCI closure.
