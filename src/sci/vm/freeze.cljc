@@ -314,6 +314,23 @@
 ;; Thaw — EDN string → live machine
 ;; ============================================================
 
+;; Cross-platform polyfills for JVM-only host functions used in destructuring.
+;; When thawing JVM-frozen EDN on CLJS (or vice versa), the target platform
+;; may not have these functions. Provide pure-Clojure implementations.
+(def ^:private cross-platform-fns
+  {"clojure.lang.PersistentHashMap/create"
+   (fn [& args]
+     (if (and (= 1 (count args))
+              (sequential? (first args))
+              (= 1 (count (first args)))
+              (map? (first (first args))))
+       (first (first args))
+       (apply hash-map (first args))))
+
+   "clojure.lang.PersistentArrayMap/createAsIfByAssoc"
+   (fn [& args]
+     (apply array-map (first args)))})
+
 (defn- restore-serialized
   "Walk a data structure, replacing tagged maps back to live objects.
    type-registry is an atom mapping type-name strings to shared sci.lang.Type objects.
@@ -328,8 +345,10 @@
          (let [sym (symbol (:id x))]
            (if-let [entry (get full-heap sym)]
              (:val entry)
-             (throw (ex-info (str "Cannot resolve host fn: " (:id x))
-                             {:type :sci/error}))))
+             (if-let [polyfill (get cross-platform-fns (:id x))]
+               polyfill
+               (throw (ex-info (str "Cannot resolve host fn: " (:id x))
+                               {:type :sci/error})))))
 
          :var-ref
          (let [sym (symbol (:id x))]

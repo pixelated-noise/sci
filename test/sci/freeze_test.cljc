@@ -2,7 +2,10 @@
   (:require [clojure.test :refer [deftest is testing]]
             [sci.core :as sci]
             [sci.vm.machine :as m]
-            [sci.vm.freeze :as freeze]))
+            [sci.vm.freeze :as freeze]
+            [clojure.string :as str]
+            #?(:clj [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])))
 
 ;; Helper: eval-string that returns the machine (not the result) when suspended
 (defn eval-suspend
@@ -79,7 +82,7 @@
     (let [m (eval-suspend "(do (def x 42) (suspend!))")
           frozen (freeze/freeze m)]
       (is (string? frozen))
-      (is (map? (clojure.edn/read-string frozen))))))
+      (is (map? (edn/read-string frozen))))))
 
 (deftest freeze-excludes-host-fns
   (testing "frozen output does NOT contain clojure.core entries"
@@ -891,3 +894,158 @@
           info (sci/inspect m)]
       (is (= :suspend (:status info)))
       (is (nil? (:op info))))))
+
+;; ============================================================
+;; Portable freeze: comprehensive language features + disk I/O
+;; ============================================================
+
+;; A rich SCI program that exercises many language features, suspends in the
+;; middle, and produces a deterministic result after resume.  Platform-neutral:
+;; no Java interop, no JS interop, so the frozen EDN is valid on any runtime.
+(def ^:private comprehensive-program
+  "(do
+     ;; --- definitions & closures ---
+     (def pi 3.14159)
+     (defn factorial [n]
+       (loop [i n acc 1]
+         (if (<= i 1) acc (recur (dec i) (* acc i)))))
+     (defn fibonacci [n]
+       (loop [i 0 a 0 b 1 result []]
+         (if (= i n) result (recur (inc i) b (+ a b) (conj result a)))))
+     (def make-adder (fn [n] (fn [x] (+ x n))))
+     (def add-10 (make-adder 10))
+
+     ;; --- protocols & records ---
+     (defprotocol Shape
+       (area [this])
+       (perimeter [this]))
+     (defrecord Circle [radius]
+       Shape
+       (area [_] (* pi radius radius))
+       (perimeter [_] (* 2 pi radius)))
+     (defrecord Rect [w h]
+       Shape
+       (area [_] (* w h))
+       (perimeter [_] (* 2 (+ w h))))
+
+     ;; --- state ---
+     (def log (atom []))
+     (swap! log conj :init)
+     (def shapes [(->Circle 5) (->Rect 3 4)])
+     (def areas  (mapv area shapes))
+     (swap! log conj :shapes-done)
+
+     ;; --- destructuring & HOFs ---
+     (let [{:keys [w h]} (->Rect 10 20)
+           [a b & more] (fibonacci 8)
+           evens (filterv even? (range 1 11))
+           grade (cond (> (factorial 5) 200) :high
+                       (> (factorial 5) 50)  :medium
+                       :else                 :low)]
+
+       ;; *** SUSPEND – checkpoint computed state ***
+       (let [rv (suspend! {:areas       areas
+                           :fact-5      (factorial 5)
+                           :fib-8       (fibonacci 8)
+                           :add-10-of-5 (add-10 5)
+                           :log         @log
+                           :grade       grade
+                           :dims        [w h]
+                           :fib-rest    (vec more)
+                           :evens       evens})]
+
+         ;; --- post-resume computation ---
+         (swap! log conj :resumed)
+         (swap! log conj (keyword (str \"with-\" rv)))
+         {:result       (str \"done-\" rv)
+          :post-areas   (mapv area [(->Circle 10) (->Rect 5 6)])
+          :post-fact    (factorial 7)
+          :post-fib     (fibonacci 6)
+          :post-filter  (filterv odd? (range 1 11))
+          :post-reduce  (reduce + (range 1 6))
+          :post-log     @log
+          :post-closure (add-10 100)})))")
+
+(def ^:private expected-suspend-data
+  {:areas       [78.53975 12]
+   :fact-5      120
+   :fib-8       [0 1 1 2 3 5 8 13]
+   :add-10-of-5 15
+   :log         [:init :shapes-done]
+   :grade       :medium
+   :dims        [10 20]
+   :fib-rest    [1 2 3 5 8 13]
+   :evens       [2 4 6 8 10]})
+
+(defn expected-result
+  "Expected result after resuming with `rv`."
+  [rv]
+  {:result       (str "done-" rv)
+   :post-areas   [314.159 30]
+   :post-fact    5040
+   :post-fib     [0 1 1 2 3 5]
+   :post-filter  [1 3 5 7 9]
+   :post-reduce  15
+   :post-log     [:init :shapes-done :resumed (keyword (str "with-" rv))]
+   :post-closure 110})
+
+(defn- write-file [path content]
+  #?(:clj  (spit path content)
+     :cljs (let [fs (js/require "fs")]
+             (.call (unchecked-get fs "writeFileSync") fs path content "utf8"))))
+
+(defn- read-file [path]
+  #?(:clj  (slurp path)
+     :cljs (let [fs (js/require "fs")]
+             (.call (unchecked-get fs "readFileSync") fs path "utf8"))))
+
+(defn- temp-path [name]
+  (str #?(:clj  (System/getProperty "java.io.tmpdir")
+          :cljs (let [os (js/require "os")]
+                  (.call (unchecked-get os "tmpdir") os)))
+       "/" name))
+
+(deftest freeze-thaw-comprehensive-language-features
+  (testing "rich program: suspend data is correct"
+    (let [m (eval-suspend comprehensive-program)]
+      (is (= expected-suspend-data (:suspend-data m)))))
+
+  (testing "rich program: in-memory freeze/thaw roundtrip"
+    (let [m       (eval-suspend comprehensive-program)
+          frozen  (freeze/freeze m)
+          thawed  (freeze/thaw frozen)
+          result  (sci/resume thawed :ok)]
+      (is (= (expected-result :ok) result))))
+
+  (testing "rich program: freeze to disk, thaw from disk (same runtime)"
+    (let [m      (eval-suspend comprehensive-program)
+          frozen (freeze/freeze m)
+          path   (temp-path (str "sci-freeze-"
+                                 #?(:clj "jvm" :cljs "cljs")
+                                 ".edn"))]
+      (write-file path frozen)
+      (let [from-disk (read-file path)
+            thawed    (freeze/thaw from-disk)
+            result    (sci/resume thawed :disk)]
+        (is (= frozen from-disk) "EDN survives disk round-trip unchanged")
+        (is (= (expected-result :disk) result)
+            "computation resumes correctly from disk")))))
+
+;; Freeze-to-file for cross-platform testing.  Writes EDN and expected values
+;; so that the orchestration script (script/test/cross-freeze) can verify
+;; thaw on the other runtime.
+(defn freeze-to-file!
+  "Eval the comprehensive program, freeze the suspended machine, write EDN to
+   `path`.  Returns the suspend-data for verification."
+  [path]
+  (let [m      (eval-suspend comprehensive-program)
+        frozen (freeze/freeze m)]
+    (write-file path frozen)
+    (:suspend-data m)))
+
+(defn thaw-from-file!
+  "Read frozen EDN from `path`, thaw, resume with `rv`, return the result."
+  [path rv]
+  (let [frozen (read-file path)
+        thawed (freeze/thaw frozen)]
+    (sci/resume thawed rv)))

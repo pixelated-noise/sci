@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# Cross-platform freeze/thaw test: verifies that a machine frozen on one
+# runtime can be thawed and resumed on another.
+#
+# Tests:  JVM → JVM,  JVM → Node,  Node → Node,  Node → JVM
+
+set -euo pipefail
+
+TMPDIR="${TMPDIR:-/tmp}"
+cd "$(dirname "$0")/../.."
+CLJS_OUT=".cross-freeze-out"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+pass=0
+fail=0
+
+check_output() {
+  local label="$1" output="$2"
+  if echo "$output" | grep -q "PASS"; then
+    echo -e "  ${GREEN}✓${RESET} $label"
+    pass=$((pass + 1))
+  else
+    echo -e "  ${RED}✗${RESET} $label"
+    echo "$output" | sed 's/^/    /'
+    fail=$((fail + 1))
+  fi
+}
+
+# --- Compile CLJS entry point ------------------------------------------------
+echo -e "${BOLD}Compiling CLJS entry point…${RESET}"
+rm -rf "$CLJS_OUT"
+clojure -M:test -m cljs.main \
+  -co "{:npm-deps false}" \
+  -t node \
+  -d "$CLJS_OUT" \
+  -o "$CLJS_OUT/main.js" \
+  -O none \
+  -c sci.freeze-cross 2>&1 | grep -v '^$'
+
+node_cmd() {
+  node "$CLJS_OUT/main.js" "$@"
+}
+
+jvm_cmd() {
+  clojure -M:test -e "$1"
+}
+
+JVM_EDN="$TMPDIR/sci-freeze-jvm.edn"
+NODE_EDN="$TMPDIR/sci-freeze-node.edn"
+
+# --- JVM freeze ---------------------------------------------------------------
+echo -e "\n${BOLD}Freezing on JVM…${RESET}"
+jvm_cmd "
+(do (require '[sci.freeze-test :as ft])
+    (ft/freeze-to-file! \"$JVM_EDN\")
+    (println \"FREEZE_OK\"))
+"
+
+# --- Test 1: JVM → JVM -------------------------------------------------------
+echo -e "\n${BOLD}Test 1: JVM → JVM${RESET}"
+RESULT=$(jvm_cmd "
+(do (require '[sci.freeze-test :as ft])
+    (let [r (ft/thaw-from-file! \"$JVM_EDN\" :cross)
+          e (ft/expected-result :cross)]
+      (if (= e r)
+        (println \"THAW_VERIFY_PASS\")
+        (do (println \"THAW_VERIFY_FAIL\")
+            (println \"expected:\" (pr-str e))
+            (println \"actual:  \" (pr-str r))))))
+")
+check_output "JVM thaw of JVM-frozen EDN" "$RESULT"
+
+# --- Test 2: JVM → Node ------------------------------------------------------
+echo -e "\n${BOLD}Test 2: JVM → Node${RESET}"
+RESULT=$(node_cmd thaw-verify "$JVM_EDN" cross)
+check_output "Node thaw of JVM-frozen EDN" "$RESULT"
+
+# --- Node freeze --------------------------------------------------------------
+echo -e "\n${BOLD}Freezing on Node…${RESET}"
+node_cmd freeze "$NODE_EDN"
+
+# --- Test 3: Node → Node -----------------------------------------------------
+echo -e "\n${BOLD}Test 3: Node → Node${RESET}"
+RESULT=$(node_cmd thaw-verify "$NODE_EDN" cross)
+check_output "Node thaw of Node-frozen EDN" "$RESULT"
+
+# --- Test 4: Node → JVM ------------------------------------------------------
+echo -e "\n${BOLD}Test 4: Node → JVM${RESET}"
+RESULT=$(jvm_cmd "
+(do (require '[sci.freeze-test :as ft])
+    (let [r (ft/thaw-from-file! \"$NODE_EDN\" :cross)
+          e (ft/expected-result :cross)]
+      (if (= e r)
+        (println \"THAW_VERIFY_PASS\")
+        (do (println \"THAW_VERIFY_FAIL\")
+            (println \"expected:\" (pr-str e))
+            (println \"actual:  \" (pr-str r))))))
+")
+check_output "JVM thaw of Node-frozen EDN" "$RESULT"
+
+# --- Summary ------------------------------------------------------------------
+echo ""
+total=$((pass + fail))
+echo -e "${BOLD}$total checks: ${GREEN}$pass passed${RESET}${BOLD}, ${RED}$fail failed${RESET}"
+[ "$fail" -eq 0 ] || exit 1
