@@ -361,8 +361,18 @@
                                         (let [js-obj (or (get classes 'js)
                                                          js/globalThis)]
                                           (when js-obj
-                                            (gobject/get js-obj sym-name))))
-                               class-val (when (and (nil? js-val) (map? classes))
+                                            (if (clojure.string/includes? sym-name ".")
+                                              ;; Dotted path: js/Object.create → walk Object → .create
+                                              (let [parts (clojure.string/split sym-name #"\.")
+                                                    result (reduce (fn [obj part]
+                                                                     (if (some? obj)
+                                                                       (gobject/get obj part)
+                                                                       (reduced nil)))
+                                                                   js-obj parts)]
+                                                result)
+                                              (gobject/get js-obj sym-name)))))
+                               class-val (when (and (nil? js-val) (map? classes)
+                                                    (not= (str resolved-ns) "js"))
                                            (or (get classes (symbol sym-ns))
                                                (get classes qualified)))]
                            (cond
@@ -3352,10 +3362,11 @@
         is-record?    (:sci.impl/record (meta form))
         ns-sym        (:current-ns machine)
         type-name     (symbol (name qualified-sym))
-        ;; Detect mutable fields (^:volatile-mutable or ^:unsynchronized-mutable)
+        ;; Detect mutable fields (^:volatile-mutable, ^:unsynchronized-mutable, or ^:mutable for CLJS)
         mutable-fields (set (keep (fn [f]
                                     (when (or (:volatile-mutable (meta f))
-                                              (:unsynchronized-mutable (meta f)))
+                                              (:unsynchronized-mutable (meta f))
+                                              (:mutable (meta f)))
                                       (with-meta f nil)))
                                   fields-vec))
         clean-fields  (mapv #(with-meta % nil) fields-vec)

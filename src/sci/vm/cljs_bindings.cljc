@@ -719,8 +719,27 @@
 
 (defn- exists?-impl [_ _ sym]
   ;; exists? checks if a symbol is defined (not nil/undefined)
-  ;; In SCI context, try to resolve it and check
-  (list 'clojure.core/some? (list 'try sym (list 'catch 'js/Error '_ nil))))
+  ;; For dotted js/ paths like js/foo.bar, walk the property chain
+  (let [s (str sym)]
+    (if (and (clojure.string/starts-with? s "js/")
+             (clojure.string/includes? (subs s 3) "."))
+      ;; Dotted path: js/foo.bar.baz → check each step
+      (let [parts (clojure.string/split (subs s 3) #"\.")
+            ;; First part is looked up via js/
+            first-sym (symbol "js" (first parts))
+            rest-parts (rest parts)
+            ;; Build a chain of property accesses
+            g (gensym "obj__")]
+        (list 'clojure.core/some?
+              (list 'try
+                    (list 'let [g first-sym]
+                          (reduce (fn [expr part]
+                                    (list 'when (list 'clojure.core/some? expr)
+                                          (list '. expr (symbol (str "-" part)))))
+                                  g rest-parts))
+                    (list 'catch :default '_ nil))))
+      ;; Simple symbol: just try to resolve it
+      (list 'clojure.core/some? (list 'try sym (list 'catch :default '_ nil))))))
 
 (defn- time-impl [_ _ expr]
   ;; (time expr) → prints elapsed time, returns value
