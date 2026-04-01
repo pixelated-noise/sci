@@ -41,7 +41,7 @@
 (def special-forms
   '#{if do let* fn* def quote var loop* recur try
      throw set! new . defmacro case* import*
-     ns in-ns require letfn* binding
+     ns in-ns require refer-global require-global letfn* binding
      defmulti defmethod remove-method prefer-method
      defprotocol extend extend-type extend-protocol
      deftype* reify* monitor-enter monitor-exit
@@ -422,17 +422,17 @@
                                                             {:type :sci/error :sym sym :phase "analysis"})))
                                    :cljs (or
                                          ;; Try dotted SCI type (e.g. foo.Foo → ns foo, type Foo)
-                                         (try-resolve-sci-type machine sym-name)
+                                          (try-resolve-sci-type machine sym-name)
                                          ;; Check imports in current namespace
-                                         (get-in machine [:ns ns-sym :imports (symbol sym-name)])
+                                          (get-in machine [:ns ns-sym :imports (symbol sym-name)])
                                          ;; Check :classes config (user-provided classes)
-                                         (let [classes (:classes machine)
-                                               class-entry (when (map? classes) (get classes (symbol sym-name)))]
-                                           (cond
-                                             (some? class-entry) class-entry
-                                             :else nil))
-                                         (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                                         {:type :sci/error :sym sym :phase "analysis"})))))))))))))))))
+                                          (let [classes (:classes machine)
+                                                class-entry (when (map? classes) (get classes (symbol sym-name)))]
+                                            (cond
+                                              (some? class-entry) class-entry
+                                              :else nil))
+                                          (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                          {:type :sci/error :sym sym :phase "analysis"})))))))))))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
@@ -3113,6 +3113,82 @@
         machine (dissoc machine :force-reload :reload-all)]
     (m/push-value (sync-ns-atom! machine) nil)))
 
+(defn- process-global-directive
+  "Process :refer-global or :require-global ns directive. On JVM, returns machine unchanged."
+  [m ns-sym directive ref-specs]
+  #?(:cljs
+     (let [js-obj (or (get (:classes m) 'js) js/globalThis)]
+       (if (= directive :refer-global)
+         (let [opts (apply hash-map ref-specs)
+               only-syms (:only opts)
+               rename-map (or (:rename opts) {})]
+           (reduce (fn [m' sym]
+                     (let [global-val (unchecked-get js-obj (str sym))
+                           local-name (or (get rename-map sym) sym)]
+                       (if (some? global-val)
+                         (-> m'
+                             (update-in [:ns ns-sym :imports] assoc local-name global-val)
+                             (update :env assoc local-name global-val))
+                         m')))
+                   m only-syms))
+         (reduce (fn [m' rg-spec]
+                   (let [rg-spec (if (sequential? rg-spec) rg-spec [rg-spec])
+                         raw-name (first rg-spec)
+                         global-name (str raw-name)
+                         rg-opts (apply hash-map (rest rg-spec))
+                         alias-sym (or (:as rg-opts) (symbol global-name))
+                         global-val (unchecked-get js-obj global-name)]
+                     (if (some? global-val)
+                       (-> m'
+                           (update-in [:ns ns-sym :imports] assoc alias-sym global-val)
+                           (update :env assoc alias-sym global-val))
+                       m')))
+                 m ref-specs)))
+     :clj m))
+
+#?(:cljs
+   (defn step-eval-refer-global [machine frame]
+     (let [args (rest (:expr frame))
+           args (map (fn [s] (if (and (seq? s) (= 'quote (first s))) (second s) s)) args)
+           opts (apply hash-map args)
+           only-syms (:only opts)
+           rename-map (or (:rename opts) {})
+           classes (:classes machine)
+           js-obj (or (get classes 'js) js/globalThis)
+           ns-sym (:current-ns machine)
+           machine (reduce (fn [m sym]
+                             (let [global-val (gobject/get js-obj (str sym))
+                                   local-name (or (get rename-map sym) sym)]
+                               (if (some? global-val)
+                                 (-> m
+                                     (update-in [:ns ns-sym :imports] assoc local-name global-val)
+                                     (update :env assoc local-name global-val))
+                                 m)))
+                           machine only-syms)]
+       (m/push-value (sync-ns-atom! machine) nil))))
+
+#?(:cljs
+   (defn step-eval-require-global [machine frame]
+     (let [specs (rest (:expr frame))
+           specs (map (fn [s] (if (and (seq? s) (= 'quote (first s))) (second s) s)) specs)
+           classes (:classes machine)
+           js-obj (or (get classes 'js) js/globalThis)
+           ns-sym (:current-ns machine)
+           machine (reduce (fn [m spec]
+                             (let [spec (if (sequential? spec) spec [spec])
+                                   raw-name (first spec)
+                                   global-name (str raw-name)
+                                   opts (apply hash-map (rest spec))
+                                   alias-sym (or (:as opts) (symbol global-name))
+                                   global-val (gobject/get js-obj global-name)]
+                               (if (some? global-val)
+                                 (-> m
+                                     (update-in [:ns ns-sym :imports] assoc alias-sym global-val)
+                                     (update :env assoc alias-sym global-val))
+                                 m)))
+                           machine specs)]
+       (m/push-value (sync-ns-atom! machine) nil))))
+
 (defn step-eval-ns [machine frame]
   ;; (ns name docstring? attr-map? & references)
   ;; Simplified: switch namespace + process :require, :import etc.
@@ -3274,6 +3350,8 @@
                                                       m''))
                                                   m' heap)))
                                    m ref-specs)
+                           :refer-global (process-global-directive m ns-sym :refer-global ref-specs)
+                           :require-global (process-global-directive m ns-sym :require-global ref-specs)
                            m))
                        ;; Non-list refs that aren't vectors (libspecs) are unsupported
                        (if (or (vector? ref) (symbol? ref))
@@ -3781,6 +3859,10 @@
           ns       (step-eval-ns machine frame)
           in-ns    (step-eval-in-ns machine frame)
           require  (step-eval-require machine frame)
+          refer-global #?(:cljs (step-eval-refer-global machine frame)
+                          :clj (m/push-value machine nil))
+          require-global #?(:cljs (step-eval-require-global machine frame)
+                            :clj (m/push-value machine nil))
           defmacro (step-eval-defmacro machine frame)
           defmulti (step-eval-defmulti machine frame)
           defmethod (step-eval-defmethod machine frame)
@@ -4408,9 +4490,9 @@
                                     (resolve-class-sym class-sym)
                                     ;; Computed catch class expression — evaluate it
                                     (let [eval-machine (-> machine
-                                                          (assoc :stack []
-                                                                 :status :running)
-                                                          (m/push-frame {:op :eval :expr class-sym}))
+                                                           (assoc :stack []
+                                                                  :status :running)
+                                                           (m/push-frame {:op :eval :expr class-sym}))
                                           result (run eval-machine)]
                                       ;; Result is an actual constructor/class — use instance? check
                                       (if (fn? result)
