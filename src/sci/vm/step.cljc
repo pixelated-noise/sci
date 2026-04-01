@@ -2275,13 +2275,17 @@
               ;; User-defined dynamic var: set! outside binding is an error (Clojure semantics)
                 (throw (ex-info (str "Can't set! root binding of dynamic var: " qualified)
                                 {:type :sci/error}))
-              ;; Non-dynamic var: update root binding in heap
-                (let [new-entry (assoc entry :val val)]
-                  (when-let [a (:heap-atom machine)]
-                    (swap! a assoc qualified new-entry))
-                  (-> machine
-                      (assoc-in [:heap qualified] new-entry)
-                      (m/push-value val)))))))))))
+              ;; Check for built-in var protection
+                (if (:sci/built-in entry)
+                  (throw (ex-info (str "Built-in var " qualified " cannot be redefined")
+                                  {:type :sci/error}))
+                ;; Non-dynamic var: update root binding in heap
+                  (let [new-entry (assoc entry :val val)]
+                    (when-let [a (:heap-atom machine)]
+                      (swap! a assoc qualified new-entry))
+                    (-> machine
+                        (assoc-in [:heap qualified] new-entry)
+                        (m/push-value val))))))))))))
 
 ;; ============================================================
 ;; new

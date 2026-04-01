@@ -492,6 +492,12 @@
             (throw (ex-info (str "Parameter declaration should be a vector") {})))
         _ (when (and (not (vector? (first args))) (not (seq? (first args))))
             (throw (ex-info (str "Parameter declaration should be a vector") {})))
+        ;; Check for trailing attr-map in multi-arity form
+        [trailing-map args] (if (and (not (vector? (first args)))
+                                     (map? (last args))
+                                     (> (count args) 1))
+                              [(last args) (butlast args)]
+                              [nil args])
         ;; fn body — single arity or multi-arity
         fn-form (if (vector? (first args))
                   ;; single arity: (defn name [params] body...)
@@ -499,7 +505,8 @@
                   ;; multi-arity: (defn name ([p1] b1) ([p2 p3] b2) ...)
                   `(fn ~name ~@args))
         meta-map (merge (when docstring {:doc docstring})
-                        attr-map)]
+                        attr-map
+                        trailing-map)]
     (if (seq meta-map)
       `(def ~(with-meta name (merge (meta name) meta-map)) ~fn-form)
       `(def ~name ~fn-form))))
