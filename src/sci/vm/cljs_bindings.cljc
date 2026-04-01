@@ -43,7 +43,9 @@
                         (merge
                          (when doc {:doc doc})
                          (when arglists
-                           {:arglists (list 'quote (mapv vec arglists))}))]))))
+                           ;; Keep outer as list (for display as ([x]) not [[x]])
+                           ;; but convert inner to vectors to strip metadata
+                           {:arglists (list 'quote (apply list (mapv vec arglists)))}))]))))
            (ns-publics 'clojure.core))))
 
 (defn- dynamic-entry

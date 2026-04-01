@@ -291,6 +291,7 @@
                                                   clojure.core/IReset (clojure.core/satisfies? IReset x)
                                                   clojure.core/IWriter (clojure.core/satisfies? IWriter x)
                                                   clojure.core/IPrintWithWriter (clojure.core/satisfies? IPrintWithWriter x)
+                                                  clojure.core/IRecord (boolean (:sci.impl/record (clojure.core/meta x)))
                                                   false))
                                         :clj nil))))
                               ;; Host protocol wrapped in a map (from sci/new-var)
