@@ -568,8 +568,16 @@
       (list 'list body-expr)
       (let [[bind expr & more] seq-exprs]
         (if (and (nil? more) (not (keyword? bind)))
-          ;; Last binding — simple map
-          `(map (fn [~bind] ~body-expr) ~expr)
+          ;; Last binding — lazy-seq loop (matches Clojure's for expansion shape)
+          ;; Use clojure.core/let so macroexpand recognizes it as a macro
+          (let [iter (gensym "iter__") s (gensym "s__")
+                let-sym (symbol "clojure.core" "let")]
+            (list let-sym [iter (list 'fn iter [s]
+                                      (list 'lazy-seq
+                                            (list 'when-let [s (list 'seq s)]
+                                                  (list 'cons (list let-sym [bind (list 'first s)] body-expr)
+                                                        (list iter (list 'rest s))))))]
+                  (list iter expr)))
           ;; Complex for with multiple bindings/modifiers
           (if (keyword? bind)
             (cond
