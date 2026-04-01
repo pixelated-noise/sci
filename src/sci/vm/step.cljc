@@ -62,7 +62,8 @@
     #?@(:clj  [(char? form) :literal])
     (symbol? form)  :symbol
     (vector? form)  :vector
-    #?@(:clj [(record? form) :literal])
+    #?@(:clj  [(record? form) :literal]
+        :cljs [(instance? cljs.core/PersistentQueue form) :literal])
     (map? form)     :map
     (set? form)     :set
     (seq? form)
@@ -357,10 +358,10 @@
                                ;; js/* prefix → look up in the js object from :classes config
                                ;; Default to js/globalThis when no :classes config or :allow :all
                                js-val (when (= (str resolved-ns) "js")
-                                         (let [js-obj (or (get classes 'js)
-                                                          js/globalThis)]
-                                           (when js-obj
-                                             (gobject/get js-obj sym-name))))
+                                        (let [js-obj (or (get classes 'js)
+                                                         js/globalThis)]
+                                          (when js-obj
+                                            (gobject/get js-obj sym-name))))
                                class-val (when (and (nil? js-val) (map? classes))
                                            (or (get classes (symbol sym-ns))
                                                (get classes qualified)))]
@@ -408,8 +409,19 @@
                                                 :else nil))
                                             (throw (ex-info (str "Unable to resolve symbol: " sym)
                                                             {:type :sci/error :sym sym :phase "analysis"})))
-                                   :cljs (throw (ex-info (str "Unable to resolve symbol: " sym)
-                                                         {:type :sci/error :sym sym :phase "analysis"}))))))))))))))))
+                                   :cljs (or
+                                         ;; Try dotted SCI type (e.g. foo.Foo → ns foo, type Foo)
+                                         (try-resolve-sci-type machine sym-name)
+                                         ;; Check imports in current namespace
+                                         (get-in machine [:ns ns-sym :imports (symbol sym-name)])
+                                         ;; Check :classes config (user-provided classes)
+                                         (let [classes (:classes machine)
+                                               class-entry (when (map? classes) (get classes (symbol sym-name)))]
+                                           (cond
+                                             (some? class-entry) class-entry
+                                             :else nil))
+                                         (throw (ex-info (str "Unable to resolve symbol: " sym)
+                                                         {:type :sci/error :sym sym :phase "analysis"})))))))))))))))))
 
 ;; ============================================================
 ;; Literals, symbols, collections
@@ -2362,19 +2374,22 @@
   "Try to resolve a dotted class-name string as an SCI type from another namespace.
    E.g. 'bar.Foo' → looks up [:ns 'bar :types 'Foo]. Returns type-obj or nil."
   [machine class-name]
-  #?(:clj
-     (let [idx (.lastIndexOf ^String class-name ".")]
-       (when (> idx 0)
-         (let [ns-str (subs class-name 0 idx)
-               type-str (subs class-name (inc idx))
-               ns-str-unm (clojure.string/replace ns-str "_" "-")
-               ;; Check both machine :ns and ns-atom
-               ns-table (or (when-let [a (:ns-atom machine)] @a) (:ns machine))]
-           (or (get-in ns-table [(symbol ns-str) :types (symbol type-str)])
-               (get-in ns-table [(symbol ns-str-unm) :types (symbol type-str)])
-               (get-in machine [:ns (symbol ns-str) :types (symbol type-str)])
-               (get-in machine [:ns (symbol ns-str-unm) :types (symbol type-str)])))))
-     :cljs nil))
+  (let [idx #?(:clj (.lastIndexOf ^String class-name ".")
+               :cljs (.lastIndexOf class-name "."))]
+    (when (> idx 0)
+      (let [ns-str (subs class-name 0 idx)
+            type-str (subs class-name (inc idx))
+            ns-str-unm (clojure.string/replace ns-str "_" "-")
+            ;; Check both machine :ns and ns-atom
+            ns-table (or (when-let [a (:ns-atom machine)] @a) (:ns machine))
+            heap (:heap machine)]
+        (or (get-in ns-table [(symbol ns-str) :types (symbol type-str)])
+            (get-in ns-table [(symbol ns-str-unm) :types (symbol type-str)])
+            (get-in machine [:ns (symbol ns-str) :types (symbol type-str)])
+            (get-in machine [:ns (symbol ns-str-unm) :types (symbol type-str)])
+            ;; Check heap for entries like sci.lang/Type
+            (when-let [entry (get heap (symbol ns-str type-str))]
+              (:val entry)))))))
 
 (defn step-eval-import [machine frame]
   ;; (import* "fully.qualified.ClassName")
@@ -4270,17 +4285,22 @@
                  (assoc :result (or adapted val))))
            :cljs (m/pop-frame machine))
         :throw           (let [v (:result machine)]
-                           (if (instance? #?(:clj Throwable :cljs js/Error) v)
-                             ;; Rethrow as-is (preserve user's ex-info data)
-                             (throw v)
-                             (let [loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
-                               (throw (ex-info (str v)
-                                               (merge {:type :sci/error
-                                                       :sci.impl/callstack (:callstack machine)}
-                                                      (when loc
-                                                        {:line (:line loc)
-                                                         :column (:column loc)
-                                                         :file (:file loc)})))))))
+                           #?(:clj
+                              (if (instance? Throwable v)
+                                ;; Rethrow as-is (preserve user's ex-info data)
+                                (throw v)
+                                (let [loc (or (:top-loc machine) (last (:callstack machine)) (:last-loc machine))]
+                                  (throw (ex-info (str v)
+                                                  (merge {:type :sci/error
+                                                          :sci.impl/callstack (:callstack machine)}
+                                                         (when loc
+                                                           {:line (:line loc)
+                                                            :column (:column loc)
+                                                            :file (:file loc)}))))))
+                              :cljs
+                              ;; In CLJS, you can throw anything — throw raw value
+                              ;; so catch clause matching works correctly (strings aren't js/Error)
+                              (throw v)))
         (throw (ex-info (str "Unknown op: " (:op frame))
                         {:type :sci/error}))))))
 
