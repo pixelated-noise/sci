@@ -1151,7 +1151,9 @@
                            (:tag (meta form)) (assoc :invoke-tag (:tag (meta form)))
                            ;; Preserve :param-tags from head symbol for ^[Runnable] notation
                            (and (symbol? f-expr) (:param-tags (meta f-expr)))
-                           (assoc :invoke-param-tags (:param-tags (meta f-expr)))))
+                           (assoc :invoke-param-tags (:param-tags (meta f-expr)))
+                           ;; Carry function symbol for built-in callstack entries
+                           (symbol? f-expr) (assoc :f-sym f-expr)))
         (m/push-frame {:op :eval :expr f-expr}))))
 
 (defn step-eval-args [machine frame]
@@ -1275,8 +1277,9 @@
                :cljs
                (throw (ex-info "new not supported in CLJS" {}))))
           :else
-          (m/replace-frame machine {:op :apply :f f :args []
-                                    :pre-call-depth (:pre-call-depth frame)}))
+          (m/replace-frame machine (cond-> {:op :apply :f f :args []
+                                            :pre-call-depth (:pre-call-depth frame)}
+                                     (:f-sym frame) (assoc :f-sym (:f-sym frame)))))
         (-> machine
             (m/replace-frame (assoc frame :f f :phase :eval-arg
                                     :pending (subvec pending 1)))
@@ -1482,8 +1485,9 @@
                        (vec (cons target adapted-method-args)))
                      done)
                    :cljs done)]
-            (m/replace-frame machine {:op :apply :f (:f frame) :args adapted-args
-                                      :pre-call-depth (:pre-call-depth frame)})))
+            (m/replace-frame machine (cond-> {:op :apply :f (:f frame) :args adapted-args
+                                              :pre-call-depth (:pre-call-depth frame)}
+                                       (:f-sym frame) (assoc :f-sym (:f-sym frame))))))
         (-> machine
             (m/replace-frame (assoc frame :done done
                                     :pending (subvec pending 1)))
@@ -1548,8 +1552,12 @@
     (cond
       ;; SCI Var — deref and re-apply with the var's value
       (instance? sci.lang.Var f)
-      (m/replace-frame machine {:op :apply :f (.-val ^sci.lang.Var f) :args args
-                                :pre-call-depth (:pre-call-depth frame)})
+      (let [var-sym (.-sym ^sci.lang.Var f)
+            f-sym (or (:f-sym frame)
+                      (when var-sym var-sym))]
+        (m/replace-frame machine (cond-> {:op :apply :f (.-val ^sci.lang.Var f) :args args
+                                          :pre-call-depth (:pre-call-depth frame)}
+                                   f-sym (assoc :f-sym f-sym))))
 
       ;; SCI closure wrapped as IFn — unwrap and use VM stack path
       (and (fn? f) (:sci/closure (meta f)))
@@ -4363,24 +4371,29 @@
                                       (when-let [cause (ex-cause ex)]
                                         (instance? klass cause))))
                                 :cljs
-                                (cond
-                                  ;; :default catches everything (CLJS-specific)
-                                  (= :default class-sym) true
-                                  ;; js/Error — check instance
-                                  (= 'js/Error class-sym) (instance? js/Error ex)
-                                  ;; js/Object — catches everything (like :default)
-                                  (= 'js/Object class-sym) true
-                                  ;; ExceptionInfo
-                                  (or (= 'ExceptionInfo class-sym)
-                                      (= 'cljs.core/ExceptionInfo class-sym))
-                                  (instance? ExceptionInfo ex)
-                                  ;; Other js/ types
-                                  (and (symbol? class-sym) (= "js" (namespace class-sym)))
-                                  (let [class-name (name class-sym)
-                                        klass (unchecked-get js/globalThis class-name)]
-                                    (and klass (instance? klass ex)))
-                                  ;; Unknown — doesn't match
-                                  :else false))))
+                                (let [resolve-class-sym
+                                      (fn [sym]
+                                        (cond
+                                          (= :default sym) true
+                                          (= 'js/Error sym) (instance? js/Error ex)
+                                          (= 'js/Object sym) true
+                                          (or (= 'ExceptionInfo sym)
+                                              (= 'cljs.core/ExceptionInfo sym))
+                                          (instance? ExceptionInfo ex)
+                                          (and (symbol? sym) (= "js" (namespace sym)))
+                                          (let [class-name (name sym)
+                                                klass (unchecked-get js/globalThis class-name)]
+                                            (and klass (instance? klass ex)))
+                                          :else false))]
+                                  (if (or (symbol? class-sym) (keyword? class-sym))
+                                    (resolve-class-sym class-sym)
+                                    ;; Computed catch class expression — evaluate it
+                                    (let [eval-machine (-> machine
+                                                          (assoc :stack []
+                                                                 :status :running)
+                                                          (m/push-frame {:op :eval :expr class-sym}))
+                                          result (run eval-machine)]
+                                      (resolve-class-sym result)))))))
                          catches))]
       (if match
         (let [[_ catch-class-sym binding-sym & body] match
@@ -4488,7 +4501,7 @@
                                   callstack)
                             callstack)
               ;; Prepend built-in host function frame when the top stack frame is :apply
-              ;; with a known host fn (looked up via inverse-registry)
+              ;; with a known host fn (looked up via inverse-registry or :f-sym)
                 builtin-frame #?(:clj
                                  (when-let [ir (:inverse-registry machine)]
                                    (let [tf (peek (vec (:stack machine)))]
@@ -4501,7 +4514,32 @@
                                             :file (:file m)
                                             :line (:line m)
                                             :column (or (:column m) 1)})))))
-                                 :cljs nil)
+                                 :cljs
+                                 (let [tf (peek (vec (:stack machine)))]
+                                   (when (and (= :apply (:op tf)) (:f-sym tf)
+                                              (fn? (:f tf))
+                                              (not (:sci/closure (meta (:f tf)))))
+                                     (let [f-sym (:f-sym tf)
+                                           heap (if-let [a (:heap-atom machine)] @a (:heap machine))
+                                           sym-ns (namespace f-sym)
+                                           sym-name (name f-sym)
+                                           qualified (if sym-ns
+                                                       (symbol sym-ns sym-name)
+                                                       (let [ns-sym (:current-ns machine)
+                                                             ns-q (symbol (str ns-sym) sym-name)
+                                                             core-q (symbol "clojure.core" sym-name)]
+                                                         (cond
+                                                           (contains? heap ns-q) ns-q
+                                                           (contains? heap core-q) core-q
+                                                           :else nil)))]
+                                       (when qualified
+                                         (let [heap-entry (get heap qualified)
+                                               m (or (:meta heap-entry) {})]
+                                           {:ns (symbol (namespace qualified))
+                                            :name (symbol (name qualified))
+                                            :file (or (:file m) "cljs/core.cljs")
+                                            :line (or (:line m) 1)
+                                            :column (or (:column m) 1)}))))))
                 callstack (if builtin-frame
                             (into [builtin-frame] callstack)
                             callstack)
