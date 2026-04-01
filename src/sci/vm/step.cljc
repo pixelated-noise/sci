@@ -3021,7 +3021,7 @@
           ;; Normal: [ns-sym :as alias :refer [syms] :as-alias alias]
           (let [ns-sym first-elem
                 opts (apply hash-map (rest spec))
-                refers (:refer opts)
+                refers (or (:refer opts) (:refer-macros opts))
                 rename-map (or (:rename opts) {})
                 _ (when (and refers (not= refers :all) (not (sequential? refers)))
                     (throw (ex-info (str ":refer must be a sequential collection, got: " (pr-str refers))
@@ -3063,8 +3063,12 @@
                                     (when-let [a (:heap-atom m)]
                                       (swap! a assoc target-sym entry'))
                                     (assoc-in m [:heap target-sym] entry'))
-                                  (throw (ex-info (str sym " does not exist in " ns-sym)
-                                                  {:type :sci/error})))))
+                                  ;; For self-referencing :require-macros (ns foo (:require-macros [foo :refer [x]])),
+                                  ;; skip missing symbols since they'll be defined later
+                                  (if (= ns-sym current-ns)
+                                    m
+                                    (throw (ex-info (str sym " does not exist in " ns-sym)
+                                                    {:type :sci/error}))))))
                             m
                             refers))))))
 
@@ -3140,7 +3144,7 @@
                        (let [ref-type (first ref)
                              ref-specs (rest ref)]
                          (case ref-type
-                           :require (reduce process-require-spec m ref-specs)
+                           (:require :require-macros) (reduce process-require-spec m ref-specs)
                            :import (reduce (fn [m' imp-spec]
                                              (if (sequential? imp-spec)
                                                (let [pkg (first imp-spec)
