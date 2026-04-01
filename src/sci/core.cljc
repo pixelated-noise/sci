@@ -214,14 +214,27 @@
                                               entry (get @heap-atom map-ctor-sym)]
                                           (when entry (:val entry)))))))
                          :cljs (fn [tag]
-                                 (when (= 'js tag)
+                                 (cond
+                                   (= 'js tag)
                                    (fn [v]
                                      (if (map? v)
                                        (apply list 'js-obj
                                               (mapcat (fn [[k val]]
                                                         [(if (keyword? k) (name k) (str k)) val])
                                                       v))
-                                       (apply list 'array (seq v)))))))))))
+                                       (apply list 'array (seq v))))
+                                   (= 'queue tag)
+                                   (fn [v] (into cljs.core/PersistentQueue.EMPTY v))
+                                   :else
+                                  ;; SCI record tagged literal readers (e.g. #foo.A{...})
+                                   (let [tag-str (str tag)
+                                         idx (.lastIndexOf tag-str ".")]
+                                     (when (> idx 0)
+                                       (let [ns-str (subs tag-str 0 idx)
+                                             type-str (subs tag-str (inc idx))
+                                             map-ctor-sym (symbol ns-str (str "map->" type-str))
+                                             entry (get @heap-atom map-ctor-sym)]
+                                         (when entry (:val entry))))))))))))
 
 (defn read-all
   "Read all forms from a string."
@@ -1166,7 +1179,9 @@
                                    (let [entry (get @heap-atom sym)]
                                      (if entry (:val entry) (.-val ^sci.lang.Var v)))))
                                #?(:clj (var-get v)
-                                  :cljs (throw (ex-info "var-get not supported for host vars in CLJS" {:type :sci/error})))))
+                                  :cljs (if (satisfies? IDeref v)
+                                          @v
+                                          (throw (ex-info "var-get not supported for host vars in CLJS" {:type :sci/error}))))))
                       :meta {:name 'var-get :doc #?(:clj (:doc (meta #'clojure.core/var-get)) :cljs (existing-doc (symbol "clojure.core" "var-get")))}}
                      (symbol "clojure.core" "thread-bound?")
                      {:val (fn sci-thread-bound? [& vars]
@@ -1551,7 +1566,8 @@
                      {:val (let [sci-tag-reader (fn [tag]
                                                 ;; Look up SCI record constructor for tagged literal like #foo.A{...}
                                                   (let [tag-str (str tag)
-                                                        idx #?(:clj (.lastIndexOf ^String tag-str ".") :cljs -1)]
+                                                        idx #?(:clj (.lastIndexOf ^String tag-str ".")
+                                                               :cljs (.lastIndexOf tag-str "."))]
                                                     (when (> idx 0)
                                                       (let [ns-str (subs tag-str 0 idx)
                                                             type-str (subs tag-str (inc idx))
@@ -1572,7 +1588,19 @@
                                                                    (or (get clojure.core/default-data-readers tag)
                                                                        (sci-tag-reader tag)
                                                                        (when default-fn (fn [val] (default-fn tag val)))))
-                                                            :cljs nil))
+                                                            :cljs (fn [tag]
+                                                                    (cond
+                                                                      (= 'js tag)
+                                                                      (fn [v]
+                                                                        (if (map? v)
+                                                                          (apply list 'js-obj
+                                                                                 (mapcat (fn [[k val]]
+                                                                                           [(if (keyword? k) (name k) (str k)) val])
+                                                                                         v))
+                                                                          (apply list 'array (seq v))))
+                                                                      (= 'queue tag)
+                                                                      (fn [v] (into cljs.core/PersistentQueue.EMPTY v))
+                                                                      :else (sci-tag-reader tag)))))
                                              resolver  (assoc :auto-resolve
                                                               #?(:clj (fn [alias]
                                                                         (if (= alias :current)
@@ -2057,7 +2085,7 @@
          ;; Use find-var for runtime lookup to avoid compile-time "No such var: sci.core/ns"
          ;; (sci.core/ns is defined later in this file)
          sci-ns-val #?(:clj (some-> (clojure.core/find-var 'sci.core/ns) deref deref)
-                       :cljs nil)
+                       :cljs @ns)
          initial-ns (when (symbol? sci-ns-val) sci-ns-val)
          ctx (if (and opts (:heap opts))
                opts  ;; already initialized

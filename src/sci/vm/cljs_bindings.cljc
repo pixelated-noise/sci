@@ -26,14 +26,39 @@
 
 #?(:clj
    (defmacro ^:private clj-docstrings
-     "Compile-time macro: generates a map of {symbol -> docstring} for all public
-      vars in clojure.core. Runs on JVM at compile time, available in CLJS at runtime."
+     "Compile-time macro: generates a map of {symbol -> {:doc d :arglists al}} for all
+      public vars in clojure.core (CLJ) or cljs.core (CLJS). Uses CLJS analyzer data
+      when compiling for CLJS so docstrings match the target platform."
      []
-     (into {}
-           (keep (fn [[sym v]]
-                   (when-let [doc (:doc (meta v))]
-                     [(list 'quote sym) doc])))
-           (ns-publics 'clojure.core))))
+     (let [clj-meta (into {}
+                         (keep (fn [[sym v]]
+                                 (let [m (meta v)
+                                       doc (:doc m)
+                                       arglists (:arglists m)]
+                                   (when (or doc arglists)
+                                     [(list 'quote sym)
+                                      (cond-> {}
+                                        doc (assoc :doc doc)
+                                        arglists (assoc :arglists (list 'quote arglists)))]))))
+                         (ns-publics 'clojure.core))]
+       (if (:ns &env)
+         ;; CLJS compilation — use CLJS analyzer metadata, with CLJ as fallback
+         (do (require 'cljs.analyzer.api)
+             (let [ns-publics-fn (resolve 'cljs.analyzer.api/ns-publics)
+                   cljs-meta (into {}
+                                   (keep (fn [[sym info]]
+                                           (let [doc (:doc info)
+                                                 arglists (:arglists info)]
+                                             (when (or doc arglists)
+                                               [(list 'quote sym)
+                                                (cond-> {}
+                                                  doc (assoc :doc doc)
+                                                  arglists (assoc :arglists (list 'quote arglists)))]))))
+                                   (ns-publics-fn 'cljs.core))]
+               ;; CLJS-specific metadata takes priority over CLJ
+               (merge clj-meta cljs-meta)))
+         ;; CLJ compilation
+         clj-meta))))
 
 (defn- dynamic-entry
   "Create a heap entry for a dynamic var."
@@ -673,6 +698,11 @@
 
 (defn- with-local-vars-impl [_ _ bindings & body]
   ;; (with-local-vars [x 1 y 2] body) — create locally-scoped vars
+  (when-not (vector? bindings)
+    (throw (ex-info "with-local-vars requires a vector for its bindings" {:type :sci/error})))
+  (when (odd? (count bindings))
+    (throw (ex-info "with-local-vars requires an even number of forms in binding vector"
+                    {:type :sci/error})))
   (let [pairs (partition 2 bindings)
         let-bindings (mapcat (fn [[sym val]]
                                [sym (list 'atom val)])
@@ -710,9 +740,9 @@
         ret (gensym "ret__")]
     (list 'let* [start (list 'cljs.core/system-time)
                  ret expr]
-          (list 'prn (list 'str "\"Elapsed time: \""
+          (list 'prn (list 'str "Elapsed time: "
                            (list '- (list 'cljs.core/system-time) start)
-                           "\" msecs\""))
+                           " msecs"))
           ret)))
 
 (defn- memfn-impl [_ _ method-name & args]
@@ -965,13 +995,12 @@
                 (fn [[_ old-print-fn old-print-err-fn]]
                   (set! *print-fn* old-print-fn)
                   (set! *print-err-fn* old-print-err-fn))}]
-       (let [docs (clj-docstrings)]
+       (let [var-meta (clj-docstrings)]
          (reduce-kv
           (fn [acc sym v]
             (assoc acc (symbol "clojure.core" (str sym))
                    {:val v :meta (merge {:name sym}
-                                        (when-let [d (get docs sym)]
-                                          {:doc d}))}))
+                                        (get var-meta sym))}))
           {} fns)))))
 
 ;; ============================================================
@@ -1030,14 +1059,13 @@
                    'with-out-str with-out-str-impl
                    'areduce areduce-impl
                    '.. ..-impl}]
-       (let [docs (clj-docstrings)]
+       (let [var-meta (clj-docstrings)]
          (reduce-kv
           (fn [acc sym v]
             (assoc acc (symbol "clojure.core" (str sym))
                    {:val v
                     :meta (merge {:name sym :macro true}
-                                 (when-let [d (get docs sym)]
-                                   {:doc d}))
+                                 (get var-meta sym))
                     :macro? true
                     :host-macro? true}))
           {} macros)))))
