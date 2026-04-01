@@ -486,6 +486,12 @@
         [attr-map args] (if (map? (first args))
                           [(first args) (rest args)]
                           [nil args])
+        _ (when (empty? args)
+            (throw (ex-info (str "Parameter declaration missing") {})))
+        _ (when (and (seq? (first args)) (not (vector? (first (first args)))))
+            (throw (ex-info (str "Parameter declaration should be a vector") {})))
+        _ (when (and (not (vector? (first args))) (not (seq? (first args))))
+            (throw (ex-info (str "Parameter declaration should be a vector") {})))
         ;; fn body — single arity or multi-arity
         fn-form (if (vector? (first args))
                   ;; single arity: (defn name [params] body...)

@@ -64,6 +64,7 @@
     (vector? form)  :vector
     #?@(:clj  [(record? form) :literal]
         :cljs [(instance? cljs.core/PersistentQueue form) :literal])
+    #?@(:cljs [(record? form) :literal])
     (map? form)     :map
     (set? form)     :set
     (seq? form)
@@ -2208,7 +2209,15 @@
          (let [[_ obj-expr field-sym val-expr] form
                field-name (let [s (name field-sym)]
                             (if (clojure.string/starts-with? s "-")
-                              (subs s 1) s))]
+                              (subs s 1) s))
+               ;; If obj-expr is a dotted symbol like x.a, resolve it via dot navigation
+               obj-expr (if (and (symbol? obj-expr)
+                                 (clojure.string/includes? (str obj-expr) "."))
+                          (let [parts (clojure.string/split (str obj-expr) #"\.")
+                                obj-sym (symbol (first parts))]
+                            (reduce (fn [acc part] (list '. acc (symbol (str "-" part))))
+                                    obj-sym (rest parts)))
+                          obj-expr)]
            ;; Eval obj first, then val, then apply
            (-> machine
                (m/replace-frame {:op :eval-args :pending [val-expr] :done []
